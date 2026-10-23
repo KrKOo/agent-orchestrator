@@ -4,3 +4,4 @@ data
 *.sqlite
 .DS_Store
 orch.server.json
+orch.runner.json
