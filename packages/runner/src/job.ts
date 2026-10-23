@@ -137,9 +137,18 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
   }
   try {
     await resolveAllowedPath(def.workspace.path, deps.config.allowedRoots);
-    for (const step of def.steps) {
-      if (step.kind === "skill") deps.library.getSkill(step.skill);
-      if (step.kind === "command") deps.library.getCommand(step.command);
+    const lookupAll = () => {
+      for (const step of def.steps) {
+        if (step.kind === "skill") deps.library.getSkill(step.skill);
+        if (step.kind === "command") deps.library.getCommand(step.command);
+      }
+    };
+    try {
+      lookupAll();
+    } catch {
+      // The periodic rescan may not have seen a newly added skill/command yet.
+      await deps.library.scan();
+      lookupAll();
     }
   } catch (err) {
     return errorText(err);
@@ -257,6 +266,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     sessionPrompted = true;
     activeStep = { id: step.id };
     let output = "";
+    let afterToolCall = false;
     let grace: ReturnType<typeof setTimeout> | undefined;
     const onAbort = () => {
       void h.cancel();
@@ -269,7 +279,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     abort.addEventListener("abort", onAbort, { once: true });
     try {
       const { stopReason } = await h.prompt(text, (update) => {
-        if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") output += update.content.text;
+        if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+          // Text resumed after a tool call starts a new paragraph instead of running on.
+          if (afterToolCall && output) output += "\n\n";
+          afterToolCall = false;
+          output += update.content.text;
+        } else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+          afterToolCall = true;
+        }
         emit({ type: "acp.update", payload: { update } }, step.id);
       });
       const structured = activeStep.structured;

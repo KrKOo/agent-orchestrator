@@ -4,7 +4,7 @@
   "type": "module",
   "version": "0.1.0",
   "scripts": {
-    "dev": "bun --watch src/main.ts"
+    "dev": "ORCH_SERVER_CONFIG=../../orch.server.json bun --watch src/main.ts"
   },
   "dependencies": {
     "@orch/protocol": "workspace:*",

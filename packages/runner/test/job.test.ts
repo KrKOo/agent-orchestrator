@@ -194,7 +194,8 @@ describe("runJob", () => {
     expect(req.stepId).toBe("p");
     expect(req.payload.options.map((o) => o.optionId)).toEqual(["allow", "reject"]);
     expect(ofType(events, "acp.permission_resolved")[0]!.payload).toEqual({ requestId: req.payload.requestId, optionId: "allow" });
-    expect(ofType(events, "step.finished")[0]!.payload.output).toBe("Hello, world allow");
+    // Text after the permission-gated tool call starts a new paragraph.
+    expect(ofType(events, "step.finished")[0]!.payload.output).toBe("Hello, world\n\n allow");
   });
 
   test("cancel ends the step and the run cancelled", async () => {
