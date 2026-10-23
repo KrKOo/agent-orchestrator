@@ -118,3 +118,52 @@ describe("validateFlow", () => {
     expect(res.ok).toBe(false);
   });
 });
+
+const prFlow = {
+  name: "pr-check",
+  inputs: [],
+  workspace: { kind: "github_checkout" },
+  harness: { id: "omp", model: "anthropic/claude-sonnet-4-5" },
+  trigger: { kind: "github_pull_request", repos: ["o/r"] },
+  steps: [{ id: "review", name: "Review", kind: "prompt", prompt: "Review {{inputs.pr.title}} using {{inputs.pr.diffPath}}" }],
+};
+
+describe("validateFlow for github_pull_request flows", () => {
+  test("accepts a PR check flow and applies trigger defaults", () => {
+    const res = validateFlow(prFlow);
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.trigger).toEqual({
+      kind: "github_pull_request",
+      repos: ["o/r"],
+      events: ["opened", "synchronize", "reopened", "ready_for_review"],
+      forkPolicy: "require_approval",
+      postReview: true,
+    });
+  });
+
+  test("rejects local workspaces, action steps, ask approval, open network, inputs and unknown pr fields", () => {
+    const res = validateFlow({
+      ...prFlow,
+      workspace: { kind: "local_path", path: "/repo" },
+      approval: "ask",
+      sandbox: { network: { mode: "open", allow: [] } },
+      inputs: [{ key: "x", label: "X", type: "text" }],
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "{{inputs.pr.author}}" },
+        { id: "c", name: "C", kind: "git_commit", messageFrom: "a" },
+      ],
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    const all = res.errors.join("\n");
+    for (const needle of ["github_checkout", 'approval "auto"', '"open"', "take no inputs", "inputs.pr exposes only", "cannot contain git_commit"]) {
+      expect(all).toContain(needle);
+    }
+  });
+
+  test("rejects github_checkout on manual flows", () => {
+    const res = validateFlow({ ...prFlow, trigger: { kind: "manual" }, steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }] });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.errors.join()).toContain("requires a github_pull_request trigger");
+  });
+});

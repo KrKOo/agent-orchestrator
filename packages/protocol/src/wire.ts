@@ -25,6 +25,10 @@ export const AssignedRun = z.object({
   definition: FlowDefinition,
   /** Resolved inputs: `github_issue` inputs are `GitHubIssueInput` objects. */
   inputs: z.record(z.string(), z.unknown()),
+  /** Present for `github_pull_request` runs; the runner checks out `headSha` on the host. */
+  github: z
+    .object({ repo: z.string(), number: z.number().int(), headSha: z.string(), baseSha: z.string() })
+    .optional(),
 });
 export type AssignedRun = z.infer<typeof AssignedRun>;
 

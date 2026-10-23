@@ -89,3 +89,15 @@ export interface ApiError {
   error?: string;
   errors?: string[];
 }
+
+/** `GET /api/me`. With `authMode: "none"` there is no user. */
+export interface MeResponse {
+  authMode: "none" | "github";
+  user: { id: string; login: string } | null;
+}
+
+/** `POST /api/runners` `{name, labels?}` → the token is shown once. */
+export interface CreateRunnerTokenResponse {
+  runnerId: string;
+  token: string;
+}
