@@ -3,6 +3,9 @@
   "private": true,
   "type": "module",
   "version": "0.1.0",
+  "scripts": {
+    "dev": "bun src/main.ts"
+  },
   "dependencies": {
     "@agentclientprotocol/sdk": "^2.0.2",
     "@modelcontextprotocol/sdk": "^1.32.2",

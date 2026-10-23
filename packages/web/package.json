@@ -3,6 +3,10 @@
   "private": true,
   "type": "module",
   "version": "0.1.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
   "dependencies": {
     "@orch/protocol": "workspace:*",
     "@tanstack/react-query": "^5.104.5",
