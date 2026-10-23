@@ -2,9 +2,41 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { z } from "zod";
 
-const AuthConfig = z.discriminatedUnion("mode", [z.object({ mode: z.literal("none") })]);
+const AuthConfig = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("none") }),
+  z.object({
+    mode: z.literal("github"),
+    /** GitHub logins allowed to sign in (compared case-insensitively). */
+    allowedLogins: z.array(z.string().min(1)).min(1, "list at least one login"),
+    /** HMAC-SHA256 key for the `orch_session` cookie. */
+    sessionSecret: z.string().min(32, "sessionSecret must be at least 32 characters"),
+  }),
+]);
 
-const GitHubConfig = z.discriminatedUnion("kind", [z.object({ kind: z.literal("pat"), token: z.string().min(1) })]);
+const trimSlash = (u: string): string => u.replace(/\/+$/, "");
+
+/** Shared by every credential kind; the base URLs exist so tests and smokes can point at a fake GitHub. */
+const GitHubCommon = {
+  apiBaseUrl: z.url().default("https://api.github.com").transform(trimSlash),
+  webBaseUrl: z.url().default("https://github.com").transform(trimSlash),
+  /** At most this many non-terminal GitHub-triggered runs per repo are assigned at once. */
+  maxConcurrentPerRepo: z.number().int().min(1).default(2),
+};
+
+const GitHubConfig = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("pat"), token: z.string().min(1), ...GitHubCommon }),
+  z.object({
+    kind: z.literal("app"),
+    appId: z.number().int().positive(),
+    /** PEM private key of the App; relative paths resolve against the config file's directory. */
+    privateKeyPath: z.string().min(1),
+    /** The App's user-authorization (OAuth) client credentials, used for login. */
+    clientId: z.string().min(1),
+    clientSecret: z.string().min(1),
+    webhookSecret: z.string().min(1),
+    ...GitHubCommon,
+  }),
+]);
 
 export const ServerConfigFile = z.object({
   bind: z
@@ -20,6 +52,8 @@ export const ServerConfigFile = z.object({
 export type AuthConfig = z.infer<typeof AuthConfig>;
 export type GitHubConfig = z.infer<typeof GitHubConfig>;
 
+export const DEFAULT_MAX_CONCURRENT_PER_REPO = 2;
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -28,6 +62,7 @@ export interface ServerConfig {
   /** Normalised origin form, no trailing slash. */
   publicUrl: string;
   auth: AuthConfig;
+  /** `privateKeyPath` is absolute. */
   github: GitHubConfig | null;
 }
 
@@ -38,6 +73,9 @@ export function parseServerConfig(raw: unknown, baseDir: string): ServerConfig {
     throw new Error(`Invalid server config: ${msg}`);
   }
   const cfg = parsed.data;
+  if (cfg.auth.mode === "github" && cfg.github?.kind !== "app") {
+    throw new Error('Invalid server config: auth.mode "github" requires github.kind "app" (its clientId/clientSecret are used for login)');
+  }
   const sep = cfg.bind.lastIndexOf(":");
   return {
     host: cfg.bind.slice(0, sep),
@@ -45,7 +83,7 @@ export function parseServerConfig(raw: unknown, baseDir: string): ServerConfig {
     dataDir: resolve(baseDir, cfg.dataDir),
     publicUrl: new URL(cfg.publicUrl).origin,
     auth: cfg.auth,
-    github: cfg.github,
+    github: cfg.github?.kind === "app" ? { ...cfg.github, privateKeyPath: resolve(baseDir, cfg.github.privateKeyPath) } : cfg.github,
   };
 }
 

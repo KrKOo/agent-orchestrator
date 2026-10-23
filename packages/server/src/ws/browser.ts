@@ -5,6 +5,7 @@ import { upgradeWebSocket } from "hono/bun";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
 import { eventRow } from "../rows";
+import { sessionUser } from "../auth/session";
 
 const { runEvents } = schema;
 
@@ -19,10 +20,9 @@ export function eventsAfter(deps: Pick<AppDeps, "db">, runId: string, afterSeq: 
     .map(eventRow);
 }
 
-/** With `auth.mode === "none"` only same-origin browsers (or clients sending no Origin) may subscribe. */
+/** Only same-origin browsers (or clients sending no Origin) may subscribe, in every auth mode. */
 export function originAllowed(deps: Pick<AppDeps, "config">, origin: string | undefined): boolean {
-  if (deps.config.auth.mode !== "none" || origin === undefined) return true;
-  return origin === deps.config.publicUrl;
+  return origin === undefined || origin === deps.config.publicUrl;
 }
 
 export function registerBrowserWs(app: Hono, deps: AppDeps): void {
@@ -32,11 +32,16 @@ export function registerBrowserWs(app: Hono, deps: AppDeps): void {
       const runId = c.req.param("id")!;
       const afterSeq = Math.max(0, Number(c.req.query("afterSeq") ?? 0) || 0);
       const allowed = originAllowed(deps, c.req.header("origin"));
+      const authorized = deps.config.auth.mode === "none" || sessionUser(deps, c) !== null;
       let unsubscribe: (() => void) | null = null;
       return {
         onOpen(_evt, ws) {
           if (!allowed) {
             ws.close(4403, "origin not allowed");
+            return;
+          }
+          if (!authorized) {
+            ws.close(4401, "unauthorized");
             return;
           }
           if (!deps.runs.get(runId)) {

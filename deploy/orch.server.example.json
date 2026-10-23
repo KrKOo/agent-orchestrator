@@ -1,0 +1,19 @@
+{
+  "bind": "0.0.0.0:7800",
+  "dataDir": "/data",
+  "publicUrl": "https://orch.example.com",
+  "auth": {
+    "mode": "github",
+    "allowedLogins": ["your-github-login"],
+    "sessionSecret": "<random, e.g. `openssl rand -base64 48`>"
+  },
+  "github": {
+    "kind": "app",
+    "appId": 123456,
+    "privateKeyPath": "/data/github-app.pem",
+    "clientId": "Iv23li0000000000000",
+    "clientSecret": "<GitHub App client secret>",
+    "webhookSecret": "<GitHub App webhook secret>",
+    "maxConcurrentPerRepo": 2
+  }
+}

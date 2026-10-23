@@ -1,8 +1,23 @@
 // Small shared presentational helpers.
+import type { RunGitHubInfo } from "@orch/protocol";
 import { type ReactNode, useEffect, useState } from "react";
 
 export function StatusChip({ status }: { status: string }) {
-  return <span className={`chip chip-${status}`}>{status.replace("_", " ")}</span>;
+  return <span className={`chip chip-${status}`}>{status.replaceAll("_", " ")}</span>;
+}
+
+/** `owner/name#123` linked to the pull request, plus the short head sha. */
+export function PrLink({ github }: { github: RunGitHubInfo }) {
+  return (
+    <span className="pr-link">
+      <a href={`https://github.com/${github.repo}/pull/${github.number}`} target="_blank" rel="noreferrer">
+        {github.repo}#{github.number}
+      </a>{" "}
+      <span className="mono muted" title={github.headSha}>
+        @{github.headSha.slice(0, 7)}
+      </span>
+    </span>
+  );
 }
 
 export function formatTime(ts: number | null | undefined): string {

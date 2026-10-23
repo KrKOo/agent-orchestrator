@@ -59,9 +59,19 @@ export async function commitAll(
 }
 
 /**
- * Pushes HEAD to `branch` on GitHub. The token is passed as an `http.extraheader` through
- * `GIT_CONFIG_*` env, so it never touches disk, argv, or the sandbox.
+ * Env that passes the token as an `http.extraheader` through `GIT_CONFIG_*`, so it never
+ * touches disk, argv, or the sandbox.
  */
+function tokenEnv(token: string): Record<string, string> {
+  const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+  return {
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "http.extraheader",
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+  };
+}
+
+/** Pushes HEAD to `branch` on GitHub, authenticated with `token` (see `tokenEnv`). */
 export async function pushBranch(
   worktree: string,
   repo: { owner: string; name: string },
@@ -69,17 +79,17 @@ export async function pushBranch(
   token: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
   await gitOk(
     worktree,
     ["-c", "credential.helper=", "push", `https://github.com/${repo.owner}/${repo.name}.git`, `HEAD:refs/heads/${branch}`],
-    {
-      signal,
-      env: {
-        GIT_CONFIG_COUNT: "1",
-        GIT_CONFIG_KEY_0: "http.extraheader",
-        GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
-      },
-    },
+    { signal, env: tokenEnv(token) },
   );
+}
+
+/** Shallow-fetches `shas` from `url` into the repo at `dir`, authenticated with `token` (see `tokenEnv`). */
+export async function fetchShas(dir: string, url: string, shas: string[], token: string, depth: number, signal?: AbortSignal): Promise<void> {
+  await gitOk(dir, ["-c", "credential.helper=", "fetch", "--quiet", "--no-tags", `--depth=${depth}`, url, ...shas], {
+    signal,
+    env: tokenEnv(token),
+  });
 }

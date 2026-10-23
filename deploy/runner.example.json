@@ -1,0 +1,11 @@
+{
+  "serverUrl": "wss://orch.example.com/runner/ws",
+  "token": "<token from: runner-token create --name vps --labels pr-checker --owner <login>>",
+  "runnerId": "<runnerId printed by runner-token create>",
+  "labels": ["pr-checker"],
+  "maxConcurrentJobs": 2,
+  "acceptUntrusted": true,
+  "allowedRoots": [],
+  "dataDir": "/var/lib/orch/runner",
+  "hostBind": "172.17.0.1"
+}

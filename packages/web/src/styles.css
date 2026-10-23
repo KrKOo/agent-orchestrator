@@ -934,3 +934,40 @@ textarea:focus {
 .log-err {
   color: var(--danger);
 }
+
+/* M2/M3 additions */
+.user-menu {
+  font-size: 13px;
+}
+.hint-list {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+.check.inline-check {
+  margin-bottom: 0;
+}
+.pr-link {
+  white-space: nowrap;
+  margin-left: 4px;
+}
+.token-panel {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.token-form input {
+  min-width: 220px;
+}
+.token-result {
+  margin-top: 10px;
+  max-width: 720px;
+}
+.token-snippet {
+  margin: 0 0 6px;
+  padding: 8px 10px;
+  background: var(--code-bg);
+  border-radius: 4px;
+  overflow: auto;
+}

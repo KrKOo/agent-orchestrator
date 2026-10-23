@@ -1,0 +1,23 @@
+# Orchestrator runner on the VPS (PR checker). Install the repo at /opt/orch (`bun install`),
+# put the config at /etc/orch/runner.json (see deploy/runner.example.json), add the `orch` user
+# to the `docker` group, give it a writable dataDir (/var/lib/orch/runner), and run `omp login`
+# once as `orch` (omp must be on systemd's PATH, e.g. /usr/local/bin/omp). `hostBind` is the docker bridge gateway:
+#   docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'
+# With gVisor installed, add "dockerRuntime": "runsc" to runner.json.
+[Unit]
+Description=Agent Orchestrator runner
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=orch
+WorkingDirectory=/opt/orch
+Environment=ORCH_RUNNER_CONFIG=/etc/orch/runner.json
+ExecStart=/usr/local/bin/bun /opt/orch/packages/runner/src/main.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

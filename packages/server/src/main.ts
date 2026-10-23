@@ -1,16 +1,15 @@
-import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
+import { sql } from "drizzle-orm";
 import { websocket } from "hono/bun";
-import { ulid } from "ulid";
+import { registerRunner } from "./api/runners";
 import { createApp, createDeps } from "./app";
 import { loadServerConfig, type ServerConfig } from "./config";
 import { createDb, schema } from "./db";
-import { hashToken } from "./ws/runner";
 
 const USAGE = `Usage:
   bun packages/server/src/main.ts [serve]
-  bun packages/server/src/main.ts runner-token create --name <name> [--labels a,b]
+  bun packages/server/src/main.ts runner-token create --name <name> [--labels a,b] [--owner <github login>]
 
 Config: ORCH_SERVER_CONFIG (default ./orch.server.json)`;
 
@@ -21,7 +20,9 @@ function serve(config: ServerConfig): void {
   const server = Bun.serve({ hostname: config.host, port: config.port, fetch: app.fetch, websocket });
   deps.scheduler.start();
   deps.scheduler.kick();
-  console.log(`[server] listening on http://${config.host}:${server.port} (public ${config.publicUrl}, data ${config.dataDir})`);
+  console.log(
+    `[server] listening on http://${config.host}:${server.port} (public ${config.publicUrl}, data ${config.dataDir}, auth ${config.auth.mode})`,
+  );
   const shutdown = (): void => {
     deps.scheduler.stop();
     void server.stop(true);
@@ -35,7 +36,7 @@ function serve(config: ServerConfig): void {
 function createRunnerToken(config: ServerConfig, argv: string[]): void {
   const { values } = parseArgs({
     args: argv,
-    options: { name: { type: "string" }, labels: { type: "string" } },
+    options: { name: { type: "string" }, labels: { type: "string" }, owner: { type: "string" } },
     strict: true,
   });
   if (!values.name) {
@@ -47,12 +48,24 @@ function createRunnerToken(config: ServerConfig, argv: string[]): void {
     .map((l) => l.trim())
     .filter(Boolean);
   const db = createDb(join(config.dataDir, "orch.sqlite"));
-  const token = randomBytes(32).toString("base64url");
-  const id = ulid().toLowerCase();
-  db.insert(schema.runners).values({ id, name: values.name, tokenHash: hashToken(token), labels }).run();
+  let ownerUserId: string | null = null;
+  if (values.owner) {
+    const owner = db
+      .select()
+      .from(schema.users)
+      .where(sql`lower(${schema.users.login}) = lower(${values.owner})`)
+      .get();
+    if (!owner) {
+      console.error(`Unknown user "${values.owner}": they must log in to the web UI once before owning a runner.`);
+      db.$client.close();
+      process.exit(1);
+    }
+    ownerUserId = owner.id;
+  }
+  const { runnerId, token } = registerRunner(db, { name: values.name, labels, ownerUserId });
   db.$client.close();
   console.error(`Runner "${values.name}" registered. The token is shown only once; put both values in runner.json.`);
-  console.log(`runnerId=${id}`);
+  console.log(`runnerId=${runnerId}`);
   console.log(`token=${token}`);
 }
 

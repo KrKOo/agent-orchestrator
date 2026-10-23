@@ -29,22 +29,29 @@ export function authenticateRunner(deps: Pick<AppDeps, "db">, authorization: str
 }
 
 /**
- * Answers a runner-initiated RPC. GitHub methods are allowed only for the runner holding a
- * non-terminal owner-trust run; everything else gets `forbidden`.
+ * Answers a runner-initiated RPC; only the runner holding the (non-terminal) run may call.
+ * - `github.token` `read`: owner runs, or untrusted runs for their own PR repository.
+ * - `github.token` `write` and `github.createPullRequest`: owner runs only.
+ * Everything else gets `forbidden`.
  */
 export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: RunnerRpcCall): Promise<RpcResult> {
   const { rpcId } = call;
+  const forbidden: RpcResult = { t: "rpc.result", rpcId, ok: false, error: "forbidden" };
   const run = deps.runs.get(call.params.runId);
-  if (!run || run.runnerId !== runnerId || run.trust !== "owner" || isTerminal(run.status)) {
-    return { t: "rpc.result", rpcId, ok: false, error: "forbidden" };
-  }
+  if (!run || run.runnerId !== runnerId || isTerminal(run.status)) return forbidden;
+  const gh = run.github;
+  const ownRepo = gh !== null && call.params.repo.toLowerCase() === gh.repo.toLowerCase();
   try {
     switch (call.method) {
       case "github.token": {
-        const token = await deps.credentials.tokenFor(call.params.repo, call.params.access);
+        const { repo, access } = call.params;
+        const allowed = run.trust === "owner" || (access === "read" && ownRepo);
+        if (!allowed) return forbidden;
+        const token = await deps.credentials.tokenFor(repo, access, ownRepo ? gh?.installationId : undefined);
         return { t: "rpc.result", rpcId, ok: true, result: { token } };
       }
       case "github.createPullRequest": {
+        if (run.trust !== "owner") return forbidden;
         const { repo, head, base, title, body, draft } = call.params;
         const token = await deps.credentials.tokenFor(repo, "write");
         const result = await deps.github.createPullRequest(token, { repo, head, base, title, body, draft });

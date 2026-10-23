@@ -5,6 +5,11 @@ import { schema } from "../src/db";
 import { authenticateRunner, RunnerSession } from "../src/ws/runner";
 import { eventsAfter } from "../src/ws/browser";
 import { addRun, addRunner, caps, FakeLink, testDeps } from "./helpers";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDeps } from "../src/app";
+import { parseServerConfig } from "../src/config";
 
 function setup() {
   const deps = testDeps();
@@ -170,6 +175,39 @@ describe("RunnerSession", () => {
     await session.handle("not json");
     await session.handle(JSON.stringify({ t: "job.events", runId: "x", events: [{ seq: 0 }] }));
     expect(link.sent).toEqual([]);
+  });
+});
+
+describe("server restart", () => {
+  test("assigned/running runs survive a restart and the reconnecting runner resumes from lastAckedSeq", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "orch-restart-"));
+    try {
+      const config = parseServerConfig({ dataDir: dir }, "/");
+      const before = createDeps(config, { webDist: "/nonexistent" });
+      addRunner(before, "r1", { capabilities: caps() });
+      const running = addRun(before, { status: "running", runnerId: "r1" });
+      const assigned = addRun(before, { status: "assigned", runnerId: "r1" });
+      before.runs.ingest(running, [ev(running, 1, "run.status", { status: "running" }), ev(running, 2, "step.started", {}, "impl")]);
+      before.db.$client.close();
+
+      const after = createDeps(config, { webDist: "/nonexistent" });
+      after.scheduler.kick();
+      expect(after.runs.get(running)!.status).toBe("running");
+      expect(after.runs.get(assigned)!.status).toBe("assigned");
+      const link = new FakeLink();
+      const session = new RunnerSession(after, "r1", link);
+      await session.handle(JSON.stringify(hello));
+      expect(link.of("welcome")).toEqual([{ t: "welcome", lastAckedSeq: { [running]: 2, [assigned]: 0 } }]);
+      // The runner replays from its outbox; already-stored events are deduped, new ones appended contiguously.
+      await session.handle(
+        JSON.stringify({ t: "job.events", runId: running, events: [ev(running, 2, "step.started", {}, "impl"), ev(running, 3, "sandbox.log", { stream: "stdout", text: "x" })] }),
+      );
+      expect(eventsAfter(after, running, 0).map((e) => e.seq)).toEqual([1, 2, 3]);
+      expect(link.of("job.assign")).toEqual([]); // nothing is re-assigned
+      after.db.$client.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

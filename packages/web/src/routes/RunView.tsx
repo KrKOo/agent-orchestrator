@@ -8,7 +8,7 @@ import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON } from "../components/StepPanel";
 import { Transcript } from "../components/Transcript";
 import { applyRunEvents, initialRunViewState, type StepView } from "../runState";
-import { Collapsible, formatDuration, formatTime, StatusChip } from "../ui";
+import { Collapsible, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
 import { useRunEventStream } from "../ws";
 
 const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, subagents: [] };
@@ -31,6 +31,7 @@ function RunViewInner({ runId }: { runId: string }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState<ReadonlySet<string>>(new Set());
   const cancel = useMutation({ mutationFn: () => api.cancelRun(runId) });
+  const approve = useMutation({ mutationFn: () => api.approveRun(runId), onSuccess: () => detail.refetch() });
 
   // Pick up the final error/timestamps once the stream reports a terminal status.
   useEffect(() => {
@@ -74,6 +75,17 @@ function RunViewInner({ runId }: { runId: string }) {
           <span className="mono small muted">{run.id}</span>
           <span className={`dot ${connected ? "dot-on" : "dot-off"}`} title={connected ? "live" : "disconnected"} />
           <span className="grow" />
+          {runStatus === "awaiting_approval" && !approve.isSuccess && (
+            <button
+              type="button"
+              className="btn primary"
+              disabled={approve.isPending}
+              title="Run this untrusted pull request on a runner"
+              onClick={() => approve.mutate()}
+            >
+              {approve.isPending ? "Approving…" : "Approve"}
+            </button>
+          )}
           {!runTerminal && (
             <button
               type="button"
@@ -87,6 +99,11 @@ function RunViewInner({ runId }: { runId: string }) {
         </div>
         <div className="run-meta small">
           <span>Created {formatTime(run.createdAt)}</span>
+          {run.github && (
+            <span>
+              Pull request <PrLink github={run.github} />
+            </span>
+          )}
           <span>Duration {formatDuration(run.startedAt, run.finishedAt)}</span>
           {run.runnerId && (
             <span>
@@ -112,6 +129,7 @@ function RunViewInner({ runId }: { runId: string }) {
         </div>
         {error && <p className="error">{error}</p>}
         {cancel.error && <p className="error">{errorMessage(cancel.error)}</p>}
+        {approve.error && <p className="error">{errorMessage(approve.error)}</p>}
         {findings.length > 0 && (
           <Collapsible summary={`Findings (${findings.length})`} defaultOpen>
             <table className="table compact">

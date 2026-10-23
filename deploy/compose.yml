@@ -1,0 +1,46 @@
+# Public control plane: the orchestrator server behind Caddy (automatic TLS).
+#
+#   ORCH_DOMAIN=orch.example.com docker compose -f deploy/compose.yml up -d
+#
+# The server reads /data/orch.server.json and the GitHub App key /data/github-app.pem
+# from the orch-data volume. Put them there before the first real start, e.g.:
+#   docker compose -f deploy/compose.yml create server
+#   docker compose -f deploy/compose.yml cp deploy/orch.server.json server:/data/orch.server.json
+#   docker compose -f deploy/compose.yml cp deploy/github-app.pem server:/data/github-app.pem
+# Runner tokens are created inside the container:
+#   docker compose -f deploy/compose.yml exec server bun packages/server/src/main.ts runner-token create --name vps --labels pr-checker --owner <login>
+
+name: orch
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/server.Dockerfile
+    image: orch/server:latest
+    restart: unless-stopped
+    volumes:
+      - orch-data:/data
+    expose:
+      - "7800"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      ORCH_DOMAIN: ${ORCH_DOMAIN:?set ORCH_DOMAIN to the public domain}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  orch-data:
+  caddy_data:
+  caddy_config:

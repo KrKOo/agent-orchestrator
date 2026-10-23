@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
@@ -11,8 +11,10 @@ import {
   type GitHubTokenResult,
   type RunEventDraft,
   type RunnerMessage,
+  REPO_RE,
   type Step,
   type TemplateContext,
+  UNTRUSTED_PREAMBLE,
   isActionStep,
   isAgentStep,
   renderTemplate,
@@ -30,7 +32,7 @@ import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
 import type { Mount, Sandbox, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
-import { type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
+import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
 
 export interface JobDeps {
   config: RunnerConfig;
@@ -44,6 +46,8 @@ export interface JobDeps {
   /** job.accepted / job.rejected / job.finished */
   send(msg: RunnerMessage): void;
   rpc<T>(method: RunnerRpcMethod, params: unknown): Promise<T>;
+  /** Git origin for PR checkouts; defaults to `GITHUB_GIT_URL` (tests use a local `file://` dir). */
+  githubGitUrl?: string;
 }
 
 /** Time a user has to answer a permission or elicitation request. */
@@ -134,9 +138,15 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
     if (def.steps.some(isActionStep)) return "Untrusted runs cannot run action steps";
     if (def.approval === "ask") return "Untrusted runs cannot use approval: ask";
     if (def.sandbox.network.mode === "open") return "Untrusted runs cannot use open network";
+    if (!run.github) return "Untrusted runs require a pull request";
+    // Repo and shas become git argv and a URL path: reject anything but plain names and hex shas.
+    const sha = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+    if (!REPO_RE.test(run.github.repo) || !sha.test(run.github.headSha) || !sha.test(run.github.baseSha)) return "Invalid pull request metadata";
+  } else if (def.workspace.kind === "github_checkout") {
+    return "github_checkout requires a pull request run";
   }
   try {
-    await resolveAllowedPath(def.workspace.path, deps.config.allowedRoots);
+    if (def.workspace.kind === "local_path") await resolveAllowedPath(def.workspace.path, deps.config.allowedRoots);
     const lookupAll = () => {
       for (const step of def.steps) {
         if (step.kind === "skill") deps.library.getSkill(step.skill);
@@ -261,7 +271,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   const runAgentStep = async (step: AgentStep, abort: AbortSignal): Promise<StepOutcome> => {
     const h = harness!;
-    const text = agentPrompt(step);
+    const freshContext = !sessionPrompted || step.freshSession;
+    // Each session's first prompt carries the untrusted-data preamble (covers the first agent step).
+    const text = run.trust === "untrusted" && freshContext ? `${UNTRUSTED_PREAMBLE}\n\n${agentPrompt(step)}` : agentPrompt(step);
     if (step.freshSession && sessionPrompted) await h.newSession();
     sessionPrompted = true;
     activeStep = { id: step.id };
@@ -362,7 +374,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   try {
     try {
-      workspace = await prepareWorkspace(run, deps.config);
+      workspace = await prepareWorkspace(run, deps.config, {
+        runDir,
+        rpc: (method, params) => rejectWhenAborted(deps.rpc(method, params), signal),
+        gitUrl: deps.githubGitUrl ?? GITHUB_GIT_URL,
+        log: (text) => emit({ type: "sandbox.log", payload: { stream: "stderr", text } }),
+        signal,
+      });
       emit({
         type: "run.status",
         payload: { status: "running", workspace: { path: workspace.hostPath, ...(workspace.branch ? { branch: workspace.branch } : {}) } },
@@ -442,6 +460,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     await harness?.close().catch(() => {});
     await sandbox?.destroy().catch((err) => console.error(`[job ${runId}] sandbox destroy: ${errorText(err)}`));
     if (mcpRegistered) deps.mcp.unregisterRun(runId);
+    if (def.workspace.kind === "github_checkout") {
+      await rm(checkoutDir(deps.config, runId), { recursive: true, force: true }).catch((err) =>
+        console.error(`[job ${runId}] checkout cleanup: ${errorText(err)}`),
+      );
+    }
   }
 }
 

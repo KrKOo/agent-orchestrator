@@ -1,15 +1,24 @@
 import type {
   ApiError,
   Catalog,
+  CreateRunnerTokenResponse,
   ElicitationAction,
   FlowDefinitionInput,
   FlowRow,
   FsListResult,
+  MeResponse,
   RunDetail,
   RunEvent,
   RunnerRow,
   RunRow,
 } from "@orch/protocol";
+
+export const LOGIN_PATH = "/auth/login";
+
+/** Sends the browser through GitHub login; used when the server reports no valid session. */
+export function redirectToLogin(): void {
+  window.location.assign(LOGIN_PATH);
+}
 
 /** Non-2xx response; `errors` carries flow validation messages (HTTP 400). */
 export class ApiRequestError extends Error {
@@ -38,6 +47,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       data = undefined;
     }
   }
+  if (res.status === 401) redirectToLogin();
   if (!res.ok) {
     const err = (data ?? {}) as ApiError;
     const errors = err.errors ?? [];
@@ -49,6 +59,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 const enc = encodeURIComponent;
 
 export const api = {
+  me: () => request<MeResponse>("GET", "/api/me"),
+  logout: () => request<void>("POST", "/auth/logout"),
+
   listFlows: () => request<FlowRow[]>("GET", "/api/flows"),
   getFlow: (id: string) => request<FlowRow>("GET", `/api/flows/${enc(id)}`),
   createFlow: (def: FlowDefinitionInput) => request<FlowRow>("POST", "/api/flows", def),
@@ -62,6 +75,7 @@ export const api = {
   getRunEvents: (id: string, afterSeq = 0) =>
     request<RunEvent[]>("GET", `/api/runs/${enc(id)}/events?afterSeq=${afterSeq}`),
   cancelRun: (id: string) => request<{ ok: true }>("POST", `/api/runs/${enc(id)}/cancel`),
+  approveRun: (id: string) => request<{ ok: true }>("POST", `/api/runs/${enc(id)}/approve`),
   respondPermission: (runId: string, requestId: string, optionId: string | null) =>
     request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/permissions/${enc(requestId)}`, { optionId }),
   respondElicitation: (
@@ -72,6 +86,8 @@ export const api = {
   ) => request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/elicitations/${enc(requestId)}`, { action, content }),
 
   listRunners: () => request<RunnerRow[]>("GET", "/api/runners"),
+  createRunnerToken: (name: string, labels: string[]) =>
+    request<CreateRunnerTokenResponse>("POST", "/api/runners", { name, labels }),
   listFs: (runnerId: string, path: string) =>
     request<FsListResult>("GET", `/api/runners/${enc(runnerId)}/fs?path=${enc(path)}`),
   catalog: () => request<Catalog>("GET", "/api/catalog"),

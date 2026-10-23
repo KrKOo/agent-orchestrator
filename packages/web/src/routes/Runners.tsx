@@ -1,4 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
+import type { CreateRunnerTokenResponse } from "@orch/protocol";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { api, errorMessage } from "../api";
 import { Collapsible, formatTime } from "../ui";
 
@@ -10,10 +12,11 @@ export function Runners() {
       <div className="page-header">
         <h2>Runners</h2>
       </div>
+      <CreateRunnerToken />
       {runners.error && <p className="error">{errorMessage(runners.error)}</p>}
       {runners.data && runners.data.length === 0 && (
         <p className="muted">
-          No runners registered. Create a token with{" "}
+          No runners registered. Create a token above, or on the server host with{" "}
           <code>bun packages/server/src/main.ts runner-token create --name laptop</code>.
         </p>
       )}
@@ -93,5 +96,128 @@ function CatalogList({ title, items }: { title: string; items: { name: string; d
         ))}
       </ul>
     </div>
+  );
+}
+
+/** WebSocket URL runners connect to, derived from the page origin (the UI is served by the server). */
+function runnerServerUrl(): string {
+  return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/runner/ws`;
+}
+
+function parseLabels(text: string): string[] {
+  return text
+    .split(",")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+function CreateRunnerToken() {
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [labels, setLabels] = useState("");
+  const [created, setCreated] = useState<(CreateRunnerTokenResponse & { labels: string[] }) | null>(null);
+  const create = useMutation({
+    mutationFn: (vars: { name: string; labels: string[] }) => api.createRunnerToken(vars.name, vars.labels),
+    onSuccess: (res, vars) => {
+      setCreated({ ...res, labels: vars.labels });
+      setName("");
+      setLabels("");
+      qc.invalidateQueries({ queryKey: ["runners"] });
+    },
+  });
+  const submit = () => {
+    if (name.trim()) create.mutate({ name: name.trim(), labels: parseLabels(labels) });
+  };
+
+  const snippet =
+    created &&
+    JSON.stringify(
+      {
+        serverUrl: runnerServerUrl(),
+        runnerId: created.runnerId,
+        token: created.token,
+        labels: created.labels,
+        allowedRoots: [],
+      },
+      null,
+      2,
+    );
+
+  return (
+    <div className="token-panel">
+      <form
+        className="row gap wrap token-form"
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <strong>Create runner token</strong>
+        <input aria-label="Runner name" placeholder="name, e.g. laptop" value={name} onChange={(e) => setName(e.target.value)} />
+        <input
+          aria-label="Runner labels"
+          placeholder="labels, comma separated"
+          value={labels}
+          onChange={(e) => setLabels(e.target.value)}
+        />
+        <button type="submit" className="btn primary" disabled={!name.trim() || create.isPending}>
+          {create.isPending ? "Creating…" : "Create token"}
+        </button>
+      </form>
+      {create.error && <p className="error">{errorMessage(create.error)}</p>}
+      {created && snippet && (
+        <div className="token-result">
+          <p className="small">
+            Runner <span className="mono">{created.runnerId}</span> created. The token is shown only once; store it
+            now.
+          </p>
+          <CopyField label="Runner id" value={created.runnerId} />
+          <CopyField label="Token" value={created.token} />
+          <div className="field">
+            <span>
+              <code>~/.agent-orchestrator/runner.json</code> (add your <code>allowedRoots</code>)
+            </span>
+            <pre className="mono token-snippet">{snippet}</pre>
+            <div className="row gap">
+              <CopyButton value={snippet} />
+              <button type="button" className="btn small" onClick={() => setCreated(null)}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CopyField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="field">
+      <span>{label}</span>
+      <div className="row gap">
+        <input className="mono grow" readOnly value={value} onFocus={(e) => e.target.select()} />
+        <CopyButton value={value} />
+      </div>
+    </div>
+  );
+}
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const copy = async () => {
+    try {
+      // `navigator.clipboard` is missing outside secure contexts; the throw lands in the catch.
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+    setTimeout(() => setCopied(null), 1500);
+  };
+  return (
+    <button type="button" className="btn small" onClick={() => void copy()}>
+      {copied === null ? "Copy" : copied ? "Copied" : "Copy failed"}
+    </button>
   );
 }

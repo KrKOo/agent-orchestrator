@@ -28,6 +28,7 @@ export function Flows() {
             <tr>
               <th>Name</th>
               <th>Steps</th>
+              <th>Trigger</th>
               <th>Workspace</th>
               <th>Version</th>
               <th>Updated</th>
@@ -41,7 +42,14 @@ export function Flows() {
                   <Link to={`/flows/${f.id}`}>{f.name}</Link>
                 </td>
                 <td>{f.definition.steps.map((s) => s.kind).join(" → ")}</td>
-                <td className="mono small">{f.definition.workspace.path}</td>
+                <td className="small">
+                  {f.definition.trigger.kind === "github_pull_request"
+                    ? `PRs · ${f.definition.trigger.repos.join(", ")}`
+                    : "manual"}
+                </td>
+                <td className="mono small">
+                  {f.definition.workspace.kind === "local_path" ? f.definition.workspace.path : "PR checkout"}
+                </td>
                 <td>v{f.version}</td>
                 <td>{formatTime(f.updatedAt)}</td>
                 <td className="actions">

@@ -8,6 +8,13 @@
       "when": 1792788158062,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792789895468,
+      "tag": "0001_m2_users_webhooks",
+      "breakpoints": true
     }
   ]
 }

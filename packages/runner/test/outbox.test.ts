@@ -93,6 +93,59 @@ describe("Outbox", () => {
     expect(sentEvents().map((e) => e.seq)).toEqual([4, 5, 6, 7]);
   });
 
+  test("disconnect mid-run: server ends with contiguous seqs and the complete transcript", () => {
+    // Simulated server: persists with INSERT OR IGNORE semantics, acks after each batch.
+    const persisted = new Map<number, RunEvent>();
+    let connected = true;
+    const acks: number[] = [];
+    outbox.close();
+    outbox = new Outbox(join(dir, "outbox.sqlite"), (m) => {
+      if (!connected || m.t !== "job.events") return; // dropped on the dead link
+      for (const e of m.events) if (!persisted.has(e.seq)) persisted.set(e.seq, e);
+      acks.push(Math.max(...m.events.map((e) => e.seq)));
+    });
+    const drainAcks = () => {
+      for (const seq of acks.splice(0)) outbox.ack("r1", seq);
+    };
+    let expected = "";
+    const emit = (text: string) => {
+      expected += text;
+      outbox.append(chunk(text));
+    };
+
+    for (let i = 0; i < 10; i++) emit(`a${i} `);
+    outbox.flush();
+    drainAcks();
+    // The link drops; the job keeps streaming and every flush is lost.
+    connected = false;
+    for (let round = 0; round < 5; round++) {
+      for (let i = 0; i < 7; i++) emit(`b${round}.${i} `);
+      outbox.append(log(`log ${round}`));
+      outbox.flush();
+    }
+    // Reconnect: welcome carries the server's last persisted seq, then replay.
+    connected = true;
+    outbox.ack("r1", Math.max(...persisted.keys()));
+    outbox.replayAll();
+    drainAcks();
+    for (let i = 0; i < 3; i++) emit(`c${i} `);
+    outbox.flush();
+    drainAcks();
+
+    const seqs = [...persisted.keys()].sort((a, b) => a - b);
+    expect(seqs).toEqual(seqs.map((_, i) => i + 1));
+    const text = seqs
+      .map((s) => persisted.get(s)!)
+      .filter((e) => e.type === "acp.update")
+      .map((e) => {
+        const content = textOf(e);
+        return content && typeof content === "object" && "text" in content ? String(content.text) : "";
+      })
+      .join("");
+    expect(text).toBe(expected);
+    expect(outbox.pending("r1", 0)).toEqual([]);
+  });
+
   test("coalesces consecutive same-step text chunks within one flush window", () => {
     outbox.append(chunk("Hel"));
     outbox.append(chunk("lo "));

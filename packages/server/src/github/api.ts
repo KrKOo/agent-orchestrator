@@ -1,4 +1,6 @@
 import type { CreatePullRequestResult, GitHubIssueInput } from "@orch/protocol";
+import type { CheckAnnotation, CheckConclusion } from "./report";
+import type { ChangedFile } from "./review";
 
 export const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/;
 
@@ -22,20 +24,56 @@ export interface CreatePullRequest {
   draft: boolean;
 }
 
-/** Minimal GitHub REST client (no Octokit in M1). */
+export interface CheckRunOutput {
+  title: string;
+  summary: string;
+  annotations?: CheckAnnotation[];
+}
+
+export interface CreateCheckRun {
+  name: string;
+  head_sha: string;
+  status: "queued" | "in_progress";
+  external_id: string;
+  details_url: string;
+  output?: CheckRunOutput;
+}
+
+export interface UpdateCheckRun {
+  status?: "queued" | "in_progress" | "completed";
+  conclusion?: CheckConclusion;
+  completed_at?: string;
+  output?: CheckRunOutput;
+}
+
+export interface CreateReview {
+  commit_id: string;
+  event: "COMMENT";
+  body: string;
+  comments: { path: string; line: number; side: "RIGHT"; body: string }[];
+}
+
+/** Upper bound on `GET /pulls/{n}/files` pages (GitHub lists at most 3000 files). */
+const MAX_FILE_PAGES = 30;
+const FILES_PER_PAGE = 100;
+
+/** Minimal GitHub REST client. `baseUrl` is the REST API root, `webBaseUrl` the site root (OAuth endpoints). */
 export class GitHubApi {
   constructor(
     private readonly fetchFn: typeof fetch = fetch,
     private readonly baseUrl = "https://api.github.com",
+    private readonly webBaseUrl = "https://github.com",
   ) {}
 
-  private async request<T>(method: string, path: string, token: string | null, body?: unknown): Promise<T> {
+  private async request<T>(method: string, url: string, token: string | null, body?: unknown): Promise<T> {
+    const target = url.startsWith("/") ? `${this.baseUrl}${url}` : url;
     let res: Response;
     try {
-      res = await this.fetchFn(`${this.baseUrl}${path}`, {
+      res = await this.fetchFn(target, {
         method,
         headers: {
-          Accept: "application/vnd.github+json",
+          // The OAuth endpoint on the site answers JSON only for a plain JSON Accept.
+          Accept: url.startsWith("/") ? "application/vnd.github+json" : "application/json",
           "X-GitHub-Api-Version": "2022-11-28",
           "User-Agent": "agent-orchestrator",
           ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -50,10 +88,11 @@ export class GitHubApi {
       const text = await res.text().catch(() => "");
       let detail = text.slice(0, 500);
       try {
-        const j = JSON.parse(text) as { message?: string; errors?: { message?: string }[] };
-        detail = [j.message, ...(j.errors ?? []).map((e) => e.message)].filter(Boolean).join("; ") || detail;
+        const j = JSON.parse(text) as { message?: string; errors?: ({ message?: string } | string)[] };
+        detail =
+          [j.message, ...(j.errors ?? []).map((e) => (typeof e === "string" ? e : e.message))].filter(Boolean).join("; ") || detail;
       } catch {}
-      throw new GitHubError(`GitHub ${method} ${path} → ${res.status}${detail ? `: ${detail}` : ""}`, res.status);
+      throw new GitHubError(`GitHub ${method} ${url} → ${res.status}${detail ? `: ${detail}` : ""}`, res.status);
     }
     return (await res.json()) as T;
   }
@@ -83,5 +122,57 @@ export class GitHubApi {
       draft: pr.draft,
     });
     return { url: created.html_url, number: created.number };
+  }
+
+  async createCheckRun(token: string, repo: string, body: CreateCheckRun): Promise<{ id: number }> {
+    const created = await this.request<{ id: number }>("POST", `/repos/${repo}/check-runs`, token, body);
+    return { id: created.id };
+  }
+
+  async updateCheckRun(token: string, repo: string, checkRunId: number, body: UpdateCheckRun): Promise<void> {
+    await this.request<unknown>("PATCH", `/repos/${repo}/check-runs/${checkRunId}`, token, body);
+  }
+
+  /** All files changed by a PR (paginated). */
+  async listPullFiles(token: string, repo: string, number: number): Promise<ChangedFile[]> {
+    const files: ChangedFile[] = [];
+    for (let page = 1; page <= MAX_FILE_PAGES; page++) {
+      const batch = await this.request<{ filename: string; patch?: string }[]>(
+        "GET",
+        `/repos/${repo}/pulls/${number}/files?per_page=${FILES_PER_PAGE}&page=${page}`,
+        token,
+      );
+      for (const f of batch) files.push(f.patch === undefined ? { filename: f.filename } : { filename: f.filename, patch: f.patch });
+      if (batch.length < FILES_PER_PAGE) break;
+    }
+    return files;
+  }
+
+  async createReview(token: string, repo: string, number: number, review: CreateReview): Promise<void> {
+    await this.request<unknown>("POST", `/repos/${repo}/pulls/${number}/reviews`, token, review);
+  }
+
+  /** `GET /user` with a user access token. */
+  async getUser(token: string): Promise<{ id: number; login: string }> {
+    const user = await this.request<{ id: number; login: string }>("GET", "/user", token);
+    return { id: user.id, login: user.login };
+  }
+
+  /** The OAuth authorize URL on the GitHub site. */
+  authorizeUrl(clientId: string, redirectUri: string, state: string): string {
+    const q = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, state, allow_signup: "false" });
+    return `${this.webBaseUrl}/login/oauth/authorize?${q}`;
+  }
+
+  /** Exchanges an OAuth callback `code` for a user access token. */
+  async exchangeOAuthCode(clientId: string, clientSecret: string, code: string, redirectUri: string): Promise<string> {
+    const res = await this.request<{ access_token?: string; error?: string; error_description?: string }>(
+      "POST",
+      `${this.webBaseUrl}/login/oauth/access_token`,
+      null,
+      { client_id: clientId, client_secret: clientSecret, code, redirect_uri: redirectUri },
+    );
+    if (!res.access_token) throw new GitHubError(`OAuth code exchange failed: ${res.error_description ?? res.error ?? "no token"}`, 0);
+    return res.access_token;
   }
 }

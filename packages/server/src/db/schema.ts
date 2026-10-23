@@ -86,3 +86,16 @@ export const runners = sqliteTable("runners", {
   capabilities: text("capabilities", { mode: "json" }).$type<RunnerCapabilities>(),
   lastSeenAt: integer("last_seen_at"),
 });
+
+export const users = sqliteTable("users", {
+  /** GitHub user id (decimal string). */
+  id: text("id").primaryKey(),
+  login: text("login").notNull().unique(),
+  createdAt: integer("created_at").notNull(),
+});
+
+export const webhookDeliveries = sqliteTable("webhook_deliveries", {
+  /** `X-GitHub-Delivery`. */
+  id: text("id").primaryKey(),
+  receivedAt: integer("received_at").notNull(),
+});

@@ -2,6 +2,7 @@ import type { FlowDefinition, RunnerCapabilities } from "@orch/protocol";
 import { and, asc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { posix } from "node:path";
 import { schema } from "./db";
+import { DEFAULT_MAX_CONCURRENT_PER_REPO } from "./config";
 import type { RunService } from "./runs";
 
 const { runs, runners } = schema;
@@ -52,6 +53,11 @@ export function isEligible(run: SchedulableRun, r: RunnerState, now: number): bo
   return true;
 }
 
+export interface SchedulerOptions {
+  /** Non-terminal GitHub-triggered runs assigned at once per repository. */
+  maxConcurrentPerRepo: number;
+}
+
 export class Scheduler {
   private readonly startedAt: number;
   private timer: Timer | null = null;
@@ -60,6 +66,7 @@ export class Scheduler {
   constructor(
     private readonly runService: RunService,
     private readonly now: () => number = Date.now,
+    private readonly opts: SchedulerOptions = { maxConcurrentPerRepo: DEFAULT_MAX_CONCURRENT_PER_REPO },
   ) {
     this.startedAt = now();
   }
@@ -139,7 +146,18 @@ export class Scheduler {
   private assignQueued(states: RunnerState[], now: number): void {
     const { db, hub } = this.runService;
     const queued = db.select().from(runs).where(eq(runs.status, "queued")).orderBy(asc(runs.createdAt), asc(runs.id)).all();
+    if (queued.length === 0) return;
+    const perRepo = new Map<string, number>();
+    for (const r of db
+      .select({ github: runs.github })
+      .from(runs)
+      .where(and(eq(runs.triggerKind, "github"), inArray(runs.status, [...ACTIVE_STATUSES])))
+      .all()) {
+      if (r.github) perRepo.set(r.github.repo, (perRepo.get(r.github.repo) ?? 0) + 1);
+    }
     for (const run of queued) {
+      const repo = run.triggerKind === "github" ? run.github?.repo : undefined;
+      if (repo !== undefined && (perRepo.get(repo) ?? 0) >= this.opts.maxConcurrentPerRepo) continue;
       const target = states
         .filter((r) => isEligible(run, r, now))
         .sort((a, b) => a.running - b.running || a.id.localeCompare(b.id))[0];
@@ -151,9 +169,16 @@ export class Scheduler {
         .returning({ id: runs.id })
         .all();
       if (claimed.length === 0) continue;
+      const gh = run.github;
       const sent = hub.sendToRunner(target.id, {
         t: "job.assign",
-        run: { runId: run.id, trust: run.trust, definition: run.definition, inputs: run.inputs },
+        run: {
+          runId: run.id,
+          trust: run.trust,
+          definition: run.definition,
+          inputs: run.inputs,
+          ...(gh ? { github: { repo: gh.repo, number: gh.number, headSha: gh.headSha, baseSha: gh.baseSha } } : {}),
+        },
       });
       if (!sent) {
         db.update(runs).set({ status: "queued", runnerId: null }).where(eq(runs.id, run.id)).run();
@@ -161,6 +186,7 @@ export class Scheduler {
         continue;
       }
       target.running++;
+      if (repo !== undefined) perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
       console.log(`[scheduler] run ${run.id} assigned to runner ${target.id}`);
     }
   }

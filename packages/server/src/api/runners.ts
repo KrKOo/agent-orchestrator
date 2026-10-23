@@ -1,14 +1,37 @@
-import type { Catalog, CatalogItem, FsListResult, RunnerRow } from "@orch/protocol";
+import type { Catalog, CatalogItem, CreateRunnerTokenResponse, FsListResult, RunnerRow } from "@orch/protocol";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { schema } from "../db";
+import { randomBytes } from "node:crypto";
+import { ulid } from "ulid";
+import { z } from "zod";
+import { schema, type Db } from "../db";
 import type { AppDeps } from "../deps";
 import { RpcError } from "../hub";
 import { isOnline } from "../scheduler";
+import { hashToken } from "../ws/runner";
+import { issueMessages, readJson } from "./util";
 
 const { runners } = schema;
 
 export const FS_LIST_TIMEOUT_MS = 10_000;
+
+const CreateRunnerBody = z.object({
+  name: z.string().trim().min(1),
+  labels: z.array(z.string().trim().min(1)).default([]),
+});
+
+/** Registers a runner with a fresh 32-byte token; only its sha256 is stored, so the token is returned once. */
+export function registerRunner(
+  db: Db,
+  opts: { name: string; labels: string[]; ownerUserId: string | null },
+): CreateRunnerTokenResponse {
+  const token = randomBytes(32).toString("base64url");
+  const runnerId = ulid().toLowerCase();
+  db.insert(runners)
+    .values({ id: runnerId, name: opts.name, tokenHash: hashToken(token), labels: opts.labels, ownerUserId: opts.ownerUserId })
+    .run();
+  return { runnerId, token };
+}
 
 function runnerRows(deps: AppDeps): RunnerRow[] {
   const now = Date.now();
@@ -49,6 +72,15 @@ export function runnerRoutes(deps: AppDeps): { runners: Hono; catalog: Hono } {
   const app = new Hono();
 
   app.get("/", (c) => c.json(runnerRows(deps)));
+
+  app.post("/", async (c) => {
+    const body = await readJson(c);
+    if (!body.ok) return body.response;
+    const parsed = CreateRunnerBody.safeParse(body.value);
+    if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
+    const created = registerRunner(deps.db, { ...parsed.data, ownerUserId: c.get("user")?.id ?? null });
+    return c.json(created, 201);
+  });
 
   app.get("/:id/fs", async (c) => {
     const id = c.req.param("id");

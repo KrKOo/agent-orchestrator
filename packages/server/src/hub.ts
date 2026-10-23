@@ -29,6 +29,8 @@ type Subscriber = (event: RunEvent) => void;
 /** In-memory fan-out: browser subscribers per run, connected runners, and server→runner RPCs. */
 export class Hub {
   private readonly subscribers = new Map<string, Set<Subscriber>>();
+  /** Server-side observers of every persisted event (e.g. GitHub check reporting). */
+  private readonly listeners = new Set<Subscriber>();
   private readonly runners = new Map<string, RunnerLink>();
   private readonly rpcs = new Map<string, PendingRpc>();
 
@@ -42,10 +44,14 @@ export class Hub {
     };
   }
 
+  /** Registers an observer of every run's fresh events; returns the unregister function. */
+  onEvent(fn: Subscriber): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
   publish(event: RunEvent): void {
-    const set = this.subscribers.get(event.runId);
-    if (!set) return;
-    for (const fn of set) {
+    for (const fn of [...this.listeners, ...(this.subscribers.get(event.runId) ?? [])]) {
       try {
         fn(event);
       } catch (err) {

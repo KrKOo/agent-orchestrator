@@ -1,0 +1,9 @@
+.git
+**/node_modules
+**/dist
+data
+**/*.sqlite
+orch.server.json
+deploy/orch.server.json
+deploy/*.pem
+.DS_Store

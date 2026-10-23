@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router";
 import { api, errorMessage } from "../api";
-import { formatDuration, formatTime, StatusChip } from "../ui";
+import { formatDuration, formatTime, PrLink, StatusChip } from "../ui";
 
 export function Runs() {
   const [params, setParams] = useSearchParams();
@@ -54,7 +54,10 @@ export function Runs() {
                     {r.id}
                   </Link>
                 </td>
-                <td>{r.triggerKind}</td>
+                <td>
+                  <span className="tag">{r.triggerKind}</span>
+                  {r.github && <PrLink github={r.github} />}
+                </td>
                 <td>{formatTime(r.createdAt)}</td>
                 <td>{formatDuration(r.startedAt, r.finishedAt)}</td>
                 <td className="error small">{r.error}</td>

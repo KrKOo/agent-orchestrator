@@ -1,0 +1,3 @@
+{$ORCH_DOMAIN} {
+	reverse_proxy server:7800
+}

@@ -8,13 +8,19 @@ import { GitHubApi } from "../src/github/api";
 import type { GitHubCredentials } from "../src/github/credentials";
 import { hashToken } from "../src/ws/runner";
 
-export function testDeps(opts: { credentials?: GitHubCredentials; fetch?: typeof fetch } = {}): AppDeps {
-  const config = parseServerConfig({ dataDir: "/nonexistent" }, "/");
+export const TEST_API = "https://gh.test";
+export const TEST_WEB = "https://gh-web.test";
+
+/** `config` entries are merged into the raw server config file (e.g. `auth`, `github`). */
+export function testDeps(
+  opts: { credentials?: GitHubCredentials; fetch?: typeof fetch; config?: Record<string, unknown> } = {},
+): AppDeps {
+  const config = parseServerConfig({ dataDir: "/nonexistent", ...opts.config }, "/");
   return createDeps(config, {
     db: createDb(":memory:"),
     webDist: "/nonexistent/dist",
     ...(opts.credentials ? { credentials: opts.credentials } : {}),
-    ...(opts.fetch ? { github: new GitHubApi(opts.fetch, "https://gh.test") } : {}),
+    ...(opts.fetch ? { github: new GitHubApi(opts.fetch, TEST_API, TEST_WEB) } : {}),
   });
 }
 

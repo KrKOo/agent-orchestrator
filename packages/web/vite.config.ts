@@ -13,6 +13,10 @@ export default defineConfig({
       // The server rejects browser WebSockets whose Origin differs from its publicUrl,
       // so proxied requests (HTTP and WS upgrades) present the server's own origin.
       "/api": { target: SERVER, ws: true, headers: { origin: SERVER } },
+      "/auth": { target: SERVER, headers: { origin: SERVER } },
+      // Lets a runner use the `serverUrl` shown on the Runners page (derived from the page origin) in dev.
+      // Regex key so the `/runners` SPA route is not proxied.
+      "^/runner/ws$": { target: SERVER, ws: true },
     },
   },
 });

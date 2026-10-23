@@ -1,6 +1,8 @@
+import type { Webhooks } from "@octokit/webhooks";
 import type { ServerConfig } from "./config";
 import type { Db } from "./db";
 import type { GitHubApi } from "./github/api";
+import type { CheckReporter } from "./github/checks";
 import type { GitHubCredentials } from "./github/credentials";
 import type { Hub } from "./hub";
 import type { RunService } from "./runs";
@@ -15,6 +17,10 @@ export interface AppDeps {
   scheduler: Scheduler;
   credentials: GitHubCredentials;
   github: GitHubApi;
+  /** Check-run and review reporting for GitHub-triggered runs. */
+  checks: CheckReporter;
+  /** Webhook signature verifier; null unless a GitHub App is configured. */
+  webhooks: Webhooks | null;
   /** Absolute path of the built web UI (`packages/web/dist`). */
   webDist: string;
 }

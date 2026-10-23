@@ -1,8 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AssignedRun, FlowDefinition, type FlowDefinitionInput, type RunEventDraft, type RunnerMessage } from "@orch/protocol";
+import {
+  type AssignedRun,
+  FlowDefinition,
+  type FlowDefinitionInput,
+  type GitHubTokenParams,
+  type RunEventDraft,
+  type RunnerMessage,
+  UNTRUSTED_PREAMBLE,
+} from "@orch/protocol";
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
@@ -18,6 +26,10 @@ let root: string;
 let repo: string;
 let config: RunnerConfig;
 let library: Library;
+/** Stand-in for github.com: `<ghRoot>/acme/widget.git` is a bare repo with a base and a head commit. */
+let ghRoot: string;
+let baseSha: string;
+let headSha: string;
 
 function sh(cwd: string, ...argv: string[]): string {
   const res = Bun.spawnSync(argv, { cwd, stdout: "pipe", stderr: "pipe" });
@@ -113,6 +125,21 @@ beforeAll(() => {
     hostBind: "127.0.0.1",
     git: { authorName: "Orch Test", authorEmail: "orch@test" },
   };
+  ghRoot = join(root, "gh");
+  const work = join(root, "pr-work");
+  mkdirSync(work);
+  const commit = (msg: string) => sh(work, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", msg);
+  sh(work, "git", "init", "-q", "-b", "main");
+  writeFileSync(join(work, "app.py"), "print('hi')\n");
+  sh(work, "git", "add", ".");
+  commit("base");
+  baseSha = sh(work, "git", "rev-parse", "HEAD");
+  sh(work, "git", "checkout", "-q", "-b", "feature");
+  writeFileSync(join(work, "app.py"), "print('hi')\neval(input())\n");
+  commit("head");
+  headSha = sh(work, "git", "rev-parse", "HEAD");
+  mkdirSync(join(ghRoot, "acme"), { recursive: true });
+  sh(root, "git", "clone", "-q", "--bare", work, join(ghRoot, "acme", "widget.git"));
   return library.scan();
 });
 
@@ -232,5 +259,88 @@ describe("runJob", () => {
     const run = assigned({ workspace: { kind: "local_path", path: tmpdir() }, steps: [{ kind: "prompt", id: "p", name: "P", prompt: "x" }] });
     await runJob(run, deps, new AbortController().signal);
     expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Path outside allowedRoots" }]);
+  });
+});
+
+describe("runJob: untrusted pull request runs", () => {
+  const prFlow = (steps: FlowDefinitionInput["steps"]): Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps"> => ({
+    workspace: { kind: "github_checkout" },
+    trigger: { kind: "github_pull_request", repos: ["acme/widget"] },
+    steps,
+  });
+  const prRun = (steps: FlowDefinitionInput["steps"], trust: AssignedRun["trust"] = "untrusted"): AssignedRun => ({
+    ...assigned(prFlow(steps), trust),
+    github: { repo: "acme/widget", number: 7, headSha, baseSha },
+  });
+
+  test("checks out the PR head read-only with the diff in /orch/context", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    deps.config = { ...config, acceptUntrusted: true };
+    deps.githubGitUrl = `file://${ghRoot}`;
+    const rpcCalls: { method: string; params: unknown }[] = [];
+    deps.rpc = async <T>(method: string, params: unknown) => {
+      rpcCalls.push({ method, params });
+      return { token: "read-token" } as T;
+    };
+    const run = prRun([
+      { kind: "prompt", id: "review", name: "Review", prompt: "read app.py and echo" },
+      { kind: "prompt", id: "again", name: "Again", prompt: "echo again" },
+    ]);
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const params: GitHubTokenParams = { runId: run.runId, repo: "acme/widget", access: "read" };
+    expect(rpcCalls).toEqual([{ method: "github.token", params }]);
+
+    const checkout = join(config.dataDir, "checkouts", run.runId);
+    const contextDir = join(config.dataDir, "runs", run.runId, "context");
+    expect(ofType(events, "run.status")[0]!.payload).toEqual({ status: "running", workspace: { path: checkout } });
+    const spec = sandboxes.specs[0]!;
+    expect(spec.mounts).toContainEqual({ hostPath: checkout, containerPath: checkout, readonly: true });
+    expect(spec.mounts).toContainEqual({ hostPath: contextDir, containerPath: "/orch/context", readonly: true });
+    // No writable mount besides the omp session dir; no user agents/skills for untrusted runs.
+    expect(spec.mounts.filter((m) => !m.readonly).map((m) => m.containerPath)).toEqual(["/orch/sessions"]);
+    expect(spec.mounts.some((m) => m.containerPath.startsWith("/orch/omp-user"))).toBe(false);
+
+    const diff = readFileSync(join(contextDir, "pr.diff"), "utf8");
+    expect(diff).toContain("+eval(input())");
+    expect(diff).toContain("a/app.py");
+
+    const [first, second] = ofType(events, "step.finished").map((e) => e.payload.output ?? "");
+    // The agent ran in the checkout at the PR head.
+    expect(first).toContain("print('hi')\neval(input())\n");
+    // Only the session's first prompt carries the preamble.
+    expect(first).toContain(`\n${UNTRUSTED_PREAMBLE}\n\nread app.py and echo`);
+    expect(second).toContain("\necho again");
+    expect(second).not.toContain(UNTRUSTED_PREAMBLE);
+    // The checkout is deleted after the run.
+    expect(existsSync(checkout)).toBe(false);
+    expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("owner runs cannot use github_checkout", async () => {
+    const { deps, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = prRun([{ kind: "prompt", id: "p", name: "P", prompt: "x" }], "owner");
+    await runJob(run, deps, new AbortController().signal);
+    expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "github_checkout requires a pull request run" }]);
+  });
+
+  test("untrusted runs without pull request metadata are rejected", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, sent } = harnessDeps(sandboxes);
+    deps.config = { ...config, acceptUntrusted: true };
+    const run = assigned(prFlow([{ kind: "prompt", id: "p", name: "P", prompt: "x" }]), "untrusted");
+    await runJob(run, deps, new AbortController().signal);
+    expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Untrusted runs require a pull request" }]);
+    expect(sandboxes.specs).toHaveLength(0);
+  });
+
+  test("untrusted runs with option-like shas are rejected", async () => {
+    const { deps, sent } = harnessDeps(new FakeSandboxProvider());
+    deps.config = { ...config, acceptUntrusted: true };
+    const run = { ...prRun([{ kind: "prompt", id: "p", name: "P", prompt: "x" }]), github: { repo: "acme/widget", number: 7, headSha: "--upload-pack=x", baseSha } };
+    await runJob(run, deps, new AbortController().signal);
+    expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Invalid pull request metadata" }]);
   });
 });

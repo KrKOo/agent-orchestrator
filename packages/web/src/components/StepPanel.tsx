@@ -1,4 +1,4 @@
-import { type Catalog, type FlowDefinition, isAgentStep, type Step } from "@orch/protocol";
+import { type Catalog, type FlowDefinition, isAgentStep, PR_INPUT_FIELDS, type Step } from "@orch/protocol";
 
 export const KIND_LABEL: Record<Step["kind"], string> = {
   prompt: "Prompt",
@@ -77,7 +77,11 @@ export function StepPanel({
 
   const templateHint = (
     <small className="muted">
-      Template variables: {"{{inputs.<key>}}"}, {"{{steps.<id>.output}}"}, {"{{steps.<id>.structured}}"}
+      Template variables:{" "}
+      {def.trigger.kind === "github_pull_request"
+        ? `{{inputs.pr}}, ${PR_INPUT_FIELDS.map((f) => `{{inputs.pr.${f}}}`).join(", ")}`
+        : "{{inputs.<key>}}"}
+      , {"{{steps.<id>.output}}"}, {"{{steps.<id>.structured}}"}
     </small>
   );
 

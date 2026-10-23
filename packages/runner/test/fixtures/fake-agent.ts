@@ -4,8 +4,10 @@
  * - `write <file>`: first creates <file> (content "hi\n") in the session cwd.
  * - `slow`: waits for `session/cancel` and ends with `cancelled`.
  * - `ask`: requests permission first and streams the chosen optionId (or "denied") as a fourth chunk.
+ * - `read <file>`: streams the content of <file> (relative to the session cwd) as an extra chunk.
+ * - `echo`: streams the full prompt text as the last chunk.
  */
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 
@@ -69,6 +71,9 @@ const app = acp
       });
       await chunk(res.outcome.outcome === "selected" ? ` ${res.outcome.optionId}` : " denied");
     }
+    const read = /\bread (\S+)/.exec(text);
+    if (read) await chunk(`\n${readFileSync(join(session.cwd, read[1]!), "utf8")}`);
+    if (text.includes("echo")) await chunk(`\n${text}`);
     return { stopReason: "end_turn" };
   });
 

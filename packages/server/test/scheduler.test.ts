@@ -104,6 +104,30 @@ describe("Scheduler.kick", () => {
     expect(link.sent).toEqual([]);
   });
 
+  test("owner isolation: runs go only to the creator's runners; untrusted runs only to acceptUntrusted runners", () => {
+    const deps = testDeps();
+    const mine = connectRunner(deps, "r-alice", caps(), { ownerUserId: "alice" });
+    const theirs = connectRunner(deps, "r-bob", caps(), { ownerUserId: "bob" });
+    const aliceRun = addRun(deps, { createdBy: "alice", createdAt: 1 });
+    const carolRun = addRun(deps, { createdBy: "carol", createdAt: 2 });
+    const untrusted = addRun(deps, {
+      trust: "untrusted",
+      createdAt: 3,
+      definition: flowDef({ workspace: { kind: "local_path", path: "/Users/me/Documents/repo" } }),
+    });
+    deps.scheduler.kick();
+    expect(deps.runs.get(aliceRun)).toMatchObject({ status: "assigned", runnerId: "r-alice" });
+    expect(deps.runs.get(carolRun)!.status).toBe("queued");
+    expect(deps.runs.get(untrusted)!.status).toBe("queued");
+    expect(mine.of("job.assign").map((m) => m.run.runId)).toEqual([aliceRun]);
+    expect(theirs.sent).toEqual([]);
+
+    connectRunner(deps, "r-ci", caps({ acceptUntrusted: true }));
+    deps.scheduler.kick();
+    expect(deps.runs.get(untrusted)).toMatchObject({ status: "assigned", runnerId: "r-ci" });
+    expect(deps.runs.get(carolRun)!.status).toBe("queued");
+  });
+
   test("fails runs held by a runner offline for more than 10 minutes", () => {
     const deps = testDeps();
     const start = Date.now();

@@ -1,5 +1,5 @@
 import { ElicitationAction, type GitHubIssueInput, type InputDef, type RunDetail } from "@orch/protocol";
-import { asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ulid } from "ulid";
 import { z } from "zod";
@@ -82,6 +82,9 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     const resolved = await resolveInputs(deps, flow.definition.inputs, parsed.data.inputs);
     if (!resolved.ok) return c.json(resolved.body, resolved.status);
 
+    if (flow.definition.trigger.kind !== "manual") {
+      return c.json({ error: "This flow runs on GitHub pull requests and cannot be started manually" }, 400);
+    }
     const id = ulid();
     const now = Date.now();
     db.transaction((tx) => {
@@ -95,6 +98,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
           status: "queued",
           trust: "owner",
           triggerKind: "manual",
+          createdBy: c.get("user")?.id ?? null,
           createdAt: now,
         })
         .run();
@@ -148,6 +152,24 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       default:
         return c.json({ ok: true });
     }
+  });
+
+  app.post("/:id/approve", (c) => {
+    const id = c.req.param("id");
+    const approved = db
+      .update(runs)
+      .set({ status: "queued" })
+      .where(and(eq(runs.id, id), eq(runs.status, "awaiting_approval")))
+      .returning({ id: runs.id })
+      .all();
+    if (approved.length === 0) {
+      const run = deps.runs.get(id);
+      if (!run) return c.json({ error: "Run not found" }, 404);
+      return c.json({ error: `Run is ${run.status}, not awaiting approval` }, 409);
+    }
+    console.log(`[runs] run ${id} approved by ${c.get("user")?.login ?? "local user"}`);
+    deps.scheduler.kick();
+    return c.json({ ok: true });
   });
 
   /** Resolves the live runner holding a non-terminal run, or an error response. */

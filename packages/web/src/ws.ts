@@ -1,5 +1,9 @@
 import { RunEvent, TERMINAL_STATUSES } from "@orch/protocol";
 import { useEffect, useState } from "react";
+import { redirectToLogin } from "./api";
+
+/** Close code the server uses when the browser has no valid session. */
+const WS_UNAUTHORIZED = 4401;
 
 const MAX_BACKOFF_MS = 10_000;
 
@@ -61,11 +65,15 @@ export class RunEventStream {
       this.pending.push(ev);
       if (this.frame === null) this.frame = requestAnimationFrame(() => this.flush());
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (this.ws !== ws) return;
       this.ws = null;
       this.onConnected(false);
       if (this.closed || this.terminal) return;
+      if (ev.code === WS_UNAUTHORIZED) {
+        this.closed = true;
+        return redirectToLogin();
+      }
       this.timer = window.setTimeout(() => this.connect(), this.backoff);
       this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);
     };

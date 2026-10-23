@@ -23,14 +23,14 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ApiRequestError, api, errorMessage } from "../api";
-import { InputsPanel } from "../components/InputsPanel";
+import { DEFAULT_LOCAL_WORKSPACE, InputsPanel } from "../components/InputsPanel";
 import { KIND_ICON, KIND_LABEL, StepPanel } from "../components/StepPanel";
 import { Modal } from "../ui";
 
 const NEW_FLOW: FlowDefinition = {
   name: "New flow",
   inputs: [],
-  workspace: { kind: "local_path", path: "", isolation: "worktree", baseRef: "HEAD", access: "rw" },
+  workspace: DEFAULT_LOCAL_WORKSPACE,
   sandbox: {
     provider: "docker",
     image: "orch/sandbox-omp:latest",
@@ -76,7 +76,7 @@ function normalizeDraft(raw: unknown): FlowDefinition | string {
     ...r,
     inputs: Array.isArray(r.inputs) ? r.inputs : [],
     runnerLabels: Array.isArray(r.runnerLabels) ? r.runnerLabels : [],
-    workspace: { ...NEW_FLOW.workspace, ...r.workspace },
+    workspace: r.workspace?.kind === "github_checkout" ? r.workspace : { ...DEFAULT_LOCAL_WORKSPACE, ...r.workspace },
     harness: { ...NEW_FLOW.harness, ...r.harness },
     sandbox: {
       ...NEW_FLOW.sandbox,
@@ -155,6 +155,16 @@ const edgeTypes = { insert: InsertEdgeView };
 
 const NODE_WIDTH = 280;
 const ROW = 110;
+
+/** Subtitle of the "Trigger, Inputs & Workspace" node. */
+function settingsSubtitle(def: FlowDefinition): string {
+  if (def.trigger.kind === "github_pull_request") {
+    return `on PRs · ${def.trigger.repos.join(", ") || "(no repositories)"}`;
+  }
+  return def.workspace.kind === "local_path"
+    ? def.workspace.path || "(choose a workspace path)"
+    : "manual · PR checkout workspace";
+}
 
 function stepSubtitle(step: Step): string {
   switch (step.kind) {
@@ -235,9 +245,9 @@ export function FlowEditor() {
         position: { x: 0, y: 0 },
         style: { width: NODE_WIDTH },
         data: {
-          icon: "⚙",
-          title: "Inputs & Workspace",
-          subtitle: draft.workspace.path || "(choose a workspace path)",
+          icon: draft.trigger.kind === "github_pull_request" ? "⇄" : "⚙",
+          title: "Trigger, Inputs & Workspace",
+          subtitle: settingsSubtitle(draft),
           errors: errorsByNode.get("inputs") ?? [],
           selected: selection === "inputs",
         },
@@ -315,6 +325,7 @@ export function FlowEditor() {
   };
 
   const selectedIdx = typeof selection === "number" && selection < draft.steps.length ? selection : null;
+  const prFlow = draft.trigger.kind === "github_pull_request";
 
   return (
     <div className="editor">
@@ -357,8 +368,14 @@ export function FlowEditor() {
         <button
           type="button"
           className="btn"
-          disabled={isNew || dirty}
-          title={isNew || dirty ? "Save the flow before running it" : undefined}
+          disabled={isNew || dirty || prFlow}
+          title={
+            prFlow
+              ? "Pull request flows run on GitHub pull request events"
+              : isNew || dirty
+                ? "Save the flow before running it"
+                : undefined
+          }
           onClick={() => setRunning(true)}
         >
           Run…

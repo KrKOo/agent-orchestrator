@@ -1,0 +1,7 @@
+{
+  "serverUrl": "wss://orch.example.com/runner/ws",
+  "token": "<token from: runner-token create --name laptop --owner <your login>>",
+  "runnerId": "<runnerId printed by runner-token create>",
+  "labels": [],
+  "allowedRoots": ["~/Documents"]
+}
