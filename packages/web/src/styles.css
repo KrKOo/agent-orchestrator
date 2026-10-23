@@ -379,7 +379,8 @@ textarea:focus {
   gap: 3px;
   margin-bottom: 10px;
 }
-.field > span {
+.field > span,
+.field > label {
   font-size: 12px;
   color: var(--muted);
 }
@@ -642,7 +643,15 @@ textarea:focus {
   min-width: 0;
   flex: 1;
 }
+.chain-node-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
 .chain-node-title {
+  flex: 1;
+  min-width: 0;
   font-weight: 600;
   font-size: 13px;
   white-space: nowrap;
@@ -756,7 +765,7 @@ textarea:focus {
   display: flex;
 }
 .step-list {
-  width: 240px;
+  width: 280px;
   flex: none;
   border-right: 1px solid var(--border);
   padding: 8px;
@@ -783,12 +792,45 @@ textarea:focus {
   background: var(--panel);
   border-color: var(--border);
 }
-.step-name {
+.step-index {
+  flex: none;
+  width: 18px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.step-item-text {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.step-name {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.step-item-sub {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  min-width: 0;
+}
+.step-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: -12px 0 12px;
+  padding: 12px 0 8px;
+  max-width: 980px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
 }
 .run-main {
   flex: 1;
@@ -874,9 +916,6 @@ textarea:focus {
 }
 .other-update {
   color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 .subagents {
   border: 1px solid var(--border);
@@ -925,14 +964,119 @@ textarea:focus {
   gap: 4px;
 }
 .step-result {
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+  max-width: 980px;
+}
+.step-error {
+  padding: 8px 12px;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: 6px;
+  white-space: pre-wrap;
+}
+.output-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.output-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.output-card-body {
+  padding: 10px 12px;
+}
+pre.output-card-body {
+  margin: 0;
+  max-height: none;
+  background: none;
+}
+.diagnostics {
+  margin-top: 16px;
+  max-width: 980px;
 }
 .log {
   max-height: 300px;
 }
 .log-err {
   color: var(--danger);
+}
+
+/* step ids & template variables */
+.step-id {
+  flex: none;
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  white-space: nowrap;
+}
+.panel-title-text {
+  min-width: 0;
+}
+.panel-title-text h3 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.template-vars {
+  margin-top: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-2);
+}
+.template-vars-group {
+  margin-top: 6px;
+}
+.template-vars-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+.template-var {
+  font: inherit;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 4px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+.template-var:hover {
+  background: var(--panel);
+}
+.template-var code {
+  flex: none;
+  font-size: 12px;
+  background: var(--panel);
+}
+.template-var .muted {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* M2/M3 additions */

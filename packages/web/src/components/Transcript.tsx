@@ -6,7 +6,7 @@ import { ToolCallCard } from "./ToolCallCard";
 
 const PLAN_MARK: Record<string, string> = { completed: "☑", in_progress: "◐", pending: "☐" };
 
-/** Renders one step's ACP session updates, subagents, and final output. */
+/** Renders one step's ACP session updates and subagents. */
 export function Transcript({ step }: { step: StepView }) {
   return (
     <div className="transcript">
@@ -49,28 +49,51 @@ export function Transcript({ step }: { step: StepView }) {
             );
           case "other":
             return (
-              <div key={i} className="other-update mono small" title={JSON.stringify(item.update, null, 2)}>
-                {JSON.stringify(item.update)}
-              </div>
+              <Collapsible
+                key={i}
+                className="other-update small"
+                summary={<span className="muted mono">{item.update.sessionUpdate}</span>}
+              >
+                <pre>{JSON.stringify(item.update, null, 2)}</pre>
+              </Collapsible>
             );
         }
       })}
       <SubagentPanel agents={step.subagents} />
-      {(step.output !== undefined || step.error) && (
-        <div className={`step-result step-result-${step.status}`}>
-          <div className="small muted">Step {step.status}</div>
-          {step.error && <div className="error">{step.error}</div>}
-          {step.output !== undefined && step.output !== "" && (
-            <Collapsible summary="Output" defaultOpen={step.items.length === 0}>
-              <pre>{step.output}</pre>
-            </Collapsible>
+    </div>
+  );
+}
+
+/** A finished step's error and outputs, always expanded, labelled with the template reference later steps use. */
+export function StepResult({ step, stepId, markdown }: { step: StepView; stepId: string; markdown: boolean }) {
+  const hasOutput = step.output !== undefined && step.output !== "";
+  if (!step.error && !hasOutput && step.structured === undefined) return null;
+  return (
+    <div className="step-result">
+      {step.error && <div className="step-error">{step.error}</div>}
+      {hasOutput && (
+        <section className="output-card">
+          <div className="output-card-head">
+            <strong>Output</strong>
+            <code className="small">{`{{steps.${stepId}.output}}`}</code>
+          </div>
+          {markdown ? (
+            <div className="markdown output-card-body">
+              <Markdown>{step.output}</Markdown>
+            </div>
+          ) : (
+            <pre className="output-card-body mono">{step.output}</pre>
           )}
-          {step.structured !== undefined && (
-            <Collapsible summary="Structured output">
-              <pre>{JSON.stringify(step.structured, null, 2)}</pre>
-            </Collapsible>
-          )}
-        </div>
+        </section>
+      )}
+      {step.structured !== undefined && (
+        <section className="output-card">
+          <div className="output-card-head">
+            <strong>Structured output</strong>
+            <code className="small">{`{{steps.${stepId}.structured}}`}</code>
+          </div>
+          <pre className="output-card-body">{JSON.stringify(step.structured, null, 2)}</pre>
+        </section>
       )}
     </div>
   );

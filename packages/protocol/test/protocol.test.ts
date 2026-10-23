@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { renderTemplate, TemplateError, templateRefs, validateFlow } from "../src";
+import { type FlowDefinition, renderTemplate, TemplateError, templateRefs, templateVariables, validateFlow } from "../src";
 
 const ctx = {
   inputs: { issue: { url: "u", repo: "o/r", number: 7, title: "Fix it", body: "Body" }, note: "hello" },
@@ -165,5 +165,59 @@ describe("validateFlow for github_pull_request flows", () => {
     const res = validateFlow({ ...prFlow, trigger: { kind: "manual" }, steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }] });
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.errors.join()).toContain("requires a github_pull_request trigger");
+  });
+});
+
+describe("templateVariables", () => {
+  const parse = (def: unknown): FlowDefinition => {
+    const res = validateFlow(def);
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    return res.flow;
+  };
+  /** Replaces step `idx` with a prompt referencing every listed variable; the flow must still validate. */
+  const expectAllValid = (def: FlowDefinition, idx: number) => {
+    const prompt = templateVariables(def, idx).map((v) => `{{${v.path}}}`).join(" ");
+    const steps = def.steps.map((s, i) => (i === idx ? { id: s.id, name: s.name, kind: "prompt", prompt } : s));
+    parse({ ...def, steps });
+  };
+
+  test("lists inputs and earlier steps only, with structured just for agent steps", () => {
+    const def = parse({
+      ...baseFlow,
+      inputs: [...baseFlow.inputs, { key: "note", label: "Note", type: "text", required: false }],
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "commit", name: "Commit", kind: "git_commit", messageFrom: "impl" },
+        { id: "review", name: "Review", kind: "prompt", prompt: "check" },
+        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
+      ],
+    });
+    const paths = templateVariables(def, 2).map((v) => v.path);
+    expect(paths).toEqual([
+      "inputs.issue",
+      "inputs.issue.url",
+      "inputs.issue.repo",
+      "inputs.issue.number",
+      "inputs.issue.title",
+      "inputs.issue.body",
+      "inputs.note",
+      "steps.impl.output",
+      "steps.impl.structured",
+      "steps.commit.output",
+    ]);
+    expect(templateVariables(def, 0).some((v) => v.path.startsWith("steps."))).toBe(false);
+    for (let i = 0; i < def.steps.length; i++) expectAllValid(def, i);
+  });
+
+  test("pull request flows expose inputs.pr and its fields", () => {
+    const def = parse({
+      ...prFlow,
+      steps: [...prFlow.steps, { id: "summary", name: "Summary", kind: "prompt", prompt: "sum up" }],
+    });
+    const paths = templateVariables(def, 1).map((v) => v.path);
+    expect(paths).toContain("inputs.pr");
+    expect(paths).toContain("inputs.pr.diffPath");
+    expect(paths).toContain("steps.review.structured");
+    expectAllValid(def, 1);
   });
 });

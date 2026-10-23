@@ -25,7 +25,7 @@ export type TranscriptItem =
   | { kind: "user"; text: string }
   | { kind: "tool"; toolCallId: string }
   | { kind: "plan"; entries: PlanEntryView[] }
-  | { kind: "other"; update: unknown };
+  | { kind: "other"; update: { sessionUpdate: string; [k: string]: unknown } };
 
 export interface SubagentMessageView {
   seq: number;

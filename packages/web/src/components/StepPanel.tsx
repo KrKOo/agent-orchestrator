@@ -1,4 +1,12 @@
-import { type Catalog, type FlowDefinition, isAgentStep, PR_INPUT_FIELDS, type Step } from "@orch/protocol";
+import {
+  type Catalog,
+  type FlowDefinition,
+  isAgentStep,
+  type Step,
+  type TemplateVariable,
+  templateVariables,
+} from "@orch/protocol";
+import { useId, useRef } from "react";
 
 export const KIND_LABEL: Record<Step["kind"], string> = {
   prompt: "Prompt",
@@ -17,6 +25,67 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   git_push: "↑",
   github_pr: "⇄",
 };
+
+/** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
+function TemplateVariables({ vars, onInsert }: { vars: TemplateVariable[]; onInsert: (path: string) => void }) {
+  const groups: [string, TemplateVariable[], string][] = [
+    ["Inputs", vars.filter((v) => v.path.startsWith("inputs.")), "No inputs declared."],
+    ["Earlier steps", vars.filter((v) => v.path.startsWith("steps.")), "No earlier steps."],
+  ];
+  return (
+    <div className="template-vars">
+      <div className="small muted">Template variables · click to insert at the cursor</div>
+      {groups.map(([title, items, empty]) => (
+        <div key={title} className="template-vars-group">
+          <div className="template-vars-title">{title}</div>
+          {items.length === 0 && <div className="small muted">{empty}</div>}
+          {items.map((v) => (
+            <button key={v.path} type="button" className="template-var" onClick={() => onInsert(v.path)}>
+              <code>{`{{${v.path}}}`}</code>
+              <span className="muted small">{v.description}</span>
+            </button>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Textarea for a templated field plus the list of variables available at this step. */
+function TemplateField({
+  label,
+  rows,
+  value,
+  vars,
+  onChange,
+}: {
+  label: string;
+  rows: number;
+  value: string;
+  vars: TemplateVariable[];
+  onChange: (value: string) => void;
+}) {
+  const id = useId();
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const insert = (path: string) => {
+    const el = ref.current;
+    const token = `{{${path}}}`;
+    const start = el?.selectionStart ?? value.length;
+    const end = el?.selectionEnd ?? value.length;
+    onChange(value.slice(0, start) + token + value.slice(end));
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(start + token.length, start + token.length);
+    });
+  };
+  return (
+    <div className="field">
+      <label htmlFor={id}>{label}</label>
+      <textarea id={id} ref={ref} rows={rows} value={value} onChange={(e) => onChange(e.target.value)} />
+      <TemplateVariables vars={vars} onInsert={insert} />
+    </div>
+  );
+}
 
 /** Editor form for one step; `onChange` receives the whole replacement step. */
 export function StepPanel({
@@ -75,21 +144,18 @@ export function StepPanel({
     );
   };
 
-  const templateHint = (
-    <small className="muted">
-      Template variables:{" "}
-      {def.trigger.kind === "github_pull_request"
-        ? `{{inputs.pr}}, ${PR_INPUT_FIELDS.map((f) => `{{inputs.pr.${f}}}`).join(", ")}`
-        : "{{inputs.<key>}}"}
-      , {"{{steps.<id>.output}}"}, {"{{steps.<id>.structured}}"}
-    </small>
-  );
+  const vars = templateVariables(def, index);
 
   return (
     <div className="panel-body">
       <div className="panel-title">
         <span className="kind-icon">{KIND_ICON[step.kind]}</span>
-        <h3>{KIND_LABEL[step.kind]} step</h3>
+        <div className="panel-title-text">
+          <h3>{step.name || "(unnamed step)"}</h3>
+          <div className="small muted">
+            Step {index + 1} · {KIND_LABEL[step.kind]} · <span className="step-id">{step.id || "(no id)"}</span>
+          </div>
+        </div>
         <span className="grow" />
         <button type="button" className="btn small" disabled={index === 0} onClick={() => onMove(-1)} title="Move up">
           ↑
@@ -118,6 +184,9 @@ export function StepPanel({
         <label className="field">
           <span>Id</span>
           <input className="mono" value={step.id} onChange={(e) => set({ id: e.target.value })} />
+          <small className="muted">
+            Later steps use <code>{`{{steps.${step.id || "<id>"}.output}}`}</code>
+          </small>
         </label>
         <label className="field">
           <span>Name</span>
@@ -135,24 +204,18 @@ export function StepPanel({
       </label>
 
       {step.kind === "prompt" && (
-        <label className="field">
-          <span>Prompt</span>
-          <textarea rows={8} value={step.prompt} onChange={(e) => set({ prompt: e.target.value })} />
-          {templateHint}
-        </label>
+        <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />
       )}
       {step.kind === "skill" && catalogSelect("skill", step.skill)}
       {step.kind === "command" && catalogSelect("command", step.command)}
       {(step.kind === "skill" || step.kind === "command") && (
-        <label className="field">
-          <span>Arguments (optional)</span>
-          <textarea
-            rows={3}
-            value={step.args ?? ""}
-            onChange={(e) => set({ args: e.target.value === "" ? undefined : e.target.value })}
-          />
-          {templateHint}
-        </label>
+        <TemplateField
+          label="Arguments (optional)"
+          rows={3}
+          value={step.args ?? ""}
+          vars={vars}
+          onChange={(args) => set({ args: args === "" ? undefined : args })}
+        />
       )}
       {isAgentStep(step) && (
         <label className="check">

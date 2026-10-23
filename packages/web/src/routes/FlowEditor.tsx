@@ -91,6 +91,8 @@ type Selection = "inputs" | number;
 interface ChainNodeData extends Record<string, unknown> {
   icon: string;
   title: string;
+  /** Step id shown as a badge; absent on the settings node. */
+  stepId?: string;
   subtitle: string;
   errors: string[];
   selected: boolean;
@@ -108,7 +110,14 @@ function ChainNodeView({ data }: NodeProps<ChainNode>) {
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <span className="kind-icon">{data.icon}</span>
       <div className="chain-node-text">
-        <div className="chain-node-title">{data.title}</div>
+        <div className="chain-node-head">
+          <span className="chain-node-title">{data.title}</span>
+          {data.stepId !== undefined && (
+            <span className="step-id" title="Step id">
+              {data.stepId || "(no id)"}
+            </span>
+          )}
+        </div>
         <div className="chain-node-sub">{data.subtitle}</div>
       </div>
       {data.errors.length > 0 && (
@@ -153,7 +162,7 @@ function InsertEdgeView({ id, sourceX, sourceY, targetX, targetY, data }: EdgePr
 const nodeTypes = { chain: ChainNodeView, end: EndNodeView };
 const edgeTypes = { insert: InsertEdgeView };
 
-const NODE_WIDTH = 280;
+const NODE_WIDTH = 300;
 const ROW = 110;
 
 /** Subtitle of the "Trigger, Inputs & Workspace" node. */
@@ -260,8 +269,9 @@ export function FlowEditor() {
           style: { width: NODE_WIDTH },
           data: {
             icon: KIND_ICON[step.kind],
-            title: `${step.name} · ${KIND_LABEL[step.kind]}`,
-            subtitle: stepSubtitle(step),
+            title: step.name || "(unnamed step)",
+            stepId: step.id,
+            subtitle: `${KIND_LABEL[step.kind]} · ${stepSubtitle(step)}`,
             errors: errorsByNode.get(idx) ?? [],
             selected: selection === idx,
           },

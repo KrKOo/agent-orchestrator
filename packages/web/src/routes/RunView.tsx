@@ -1,12 +1,12 @@
-import { TERMINAL_STATUSES } from "@orch/protocol";
+import { isAgentStep, TERMINAL_STATUSES } from "@orch/protocol";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import { api, errorMessage } from "../api";
 import { ElicitationDialog } from "../components/ElicitationDialog";
 import { PermissionDialog } from "../components/PermissionDialog";
-import { KIND_ICON } from "../components/StepPanel";
-import { Transcript } from "../components/Transcript";
+import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
+import { StepResult, Transcript } from "../components/Transcript";
 import { applyRunEvents, initialRunViewState, type StepView } from "../runState";
 import { Collapsible, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
 import { useRunEventStream } from "../ws";
@@ -56,13 +56,15 @@ function RunViewInner({ runId }: { runId: string }) {
   const runStatus = status ?? run.status;
   const runTerminal = TERMINAL_STATUSES.includes(runStatus);
   const error = state.error ?? run.error;
-  const rowStatus = new Map(detail.data!.steps.map((s) => [s.stepId, s.status]));
+  const stepRows = new Map(detail.data!.steps.map((s) => [s.stepId, s]));
   const findings = state.lastSeq > 0 ? state.findings : detail.data!.findings;
   const permission = state.permissions.find((p) => !p.resolved && !submitted.has(p.requestId));
   const elicitation = state.elicitations.find((e) => !e.resolved && !submitted.has(e.requestId));
   const markSubmitted = (requestId: string) => setSubmitted(new Set([...submitted, requestId]));
   const logs = state.logs.filter((l) => (l.stepId ?? null) === selectedId || l.stepId === undefined);
   const runLevel = state.steps[""];
+  const selectedDef = steps.find((s) => s.id === selectedId);
+  const selectedRow = selectedId !== null ? stepRows.get(selectedId) : undefined;
 
   return (
     <div className="run-view">
@@ -165,8 +167,8 @@ function RunViewInner({ runId }: { runId: string }) {
 
       <div className="run-body">
         <nav className="step-list">
-          {steps.map((s) => {
-            const st = state.steps[s.id]?.status ?? rowStatus.get(s.id) ?? "pending";
+          {steps.map((s, idx) => {
+            const row = stepRows.get(s.id);
             return (
               <button
                 key={s.id}
@@ -174,9 +176,15 @@ function RunViewInner({ runId }: { runId: string }) {
                 className={`step-item ${s.id === selectedId ? "active" : ""}`}
                 onClick={() => setSelected(s.id)}
               >
-                <span className="kind-icon">{KIND_ICON[s.kind]}</span>
-                <span className="step-name">{s.name}</span>
-                <span className={`chip chip-${st}`}>{st}</span>
+                <span className="step-index">{idx + 1}</span>
+                <span className="step-item-text">
+                  <span className="step-name">{s.name}</span>
+                  <span className="step-item-sub">
+                    <span className="step-id">{s.id}</span>
+                    {row?.startedAt && <span className="muted">{formatDuration(row.startedAt, row.finishedAt)}</span>}
+                  </span>
+                </span>
+                <StatusChip status={state.steps[s.id]?.status ?? row?.status ?? "pending"} />
               </button>
             );
           })}
@@ -189,17 +197,31 @@ function RunViewInner({ runId }: { runId: string }) {
             atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
           }}
         >
+          {selectedDef && (
+            <div className="step-header">
+              <span className="kind-icon">{KIND_ICON[selectedDef.kind]}</span>
+              <h3>{selectedDef.name}</h3>
+              <span className="step-id">{selectedDef.id}</span>
+              <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
+              <span className="grow" />
+              {selectedRow?.startedAt && (
+                <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>
+              )}
+              <StatusChip status={state.steps[selectedDef.id]?.status ?? selectedRow?.status ?? "pending"} />
+            </div>
+          )}
           {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && (
             <p className="muted">{step.status === "pending" ? "Step has not started." : "Waiting for output…"}</p>
           )}
           <Transcript step={step} />
+          {selectedDef && <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef)} />}
           {runLevel && runLevel.items.length > 0 && (
-            <Collapsible summary="Run-level updates">
+            <Collapsible summary="Run-level updates" className="diagnostics">
               <Transcript step={runLevel} />
             </Collapsible>
           )}
           {logs.length > 0 && (
-            <Collapsible summary={`Sandbox log (${logs.length})`} className="small">
+            <Collapsible summary={`Sandbox log (${logs.length})`} className="diagnostics small">
               <pre className="log">
                 {logs.map((l) => (
                   <span key={l.seq} className={l.stream === "stderr" ? "log-err" : undefined}>
