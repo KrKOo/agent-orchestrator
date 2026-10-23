@@ -95,6 +95,13 @@ export class PendingRequests {
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
+/** Trimmed agent text with one enclosing code fence removed (models often fence "output only the message" replies). */
+export function plainText(text: string): string {
+  const trimmed = text.trim();
+  const fenced = /^(`{3,})[^\n`]*\n([\s\S]*?)\n\1$/.exec(trimmed);
+  return fenced ? fenced[2]!.trim() : trimmed;
+}
+
 function firstLine(text: string): string {
   return (
     text
@@ -316,7 +323,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   const runActionStep = async (step: Exclude<Step, AgentStep>, abort: AbortSignal): Promise<StepOutcome> => {
     const ws = workspace!;
     if (step.kind === "git_commit") {
-      const message = ctx.steps[step.messageFrom]?.output.trim() ?? "";
+      const message = plainText(ctx.steps[step.messageFrom]?.output ?? "");
       if (!message) throw new Error(`Commit message from step ${step.messageFrom} is empty`);
       const file = join(runDir, "commit-msg");
       await writeFile(file, `${message}\n`);
@@ -333,7 +340,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       return { status: "succeeded", output: ws.branch };
     }
     if (!pushed) throw new Error("github_pr requires an earlier git_push");
-    const title = firstLine(ctx.steps[step.titleFrom]?.output ?? "");
+    const title = firstLine(plainText(ctx.steps[step.titleFrom]?.output ?? ""));
     if (!title) throw new Error(`PR title from step ${step.titleFrom} is empty`);
     const params: CreatePullRequestParams = {
       runId,

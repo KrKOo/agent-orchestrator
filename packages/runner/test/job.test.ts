@@ -14,7 +14,7 @@ import {
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
-import { PendingRequests, runJob, type JobDeps } from "../src/job";
+import { PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
 import type { McpOutputServer } from "../src/mcp-output";
 import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/types";
@@ -145,6 +145,18 @@ beforeAll(() => {
 
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
+});
+
+describe("plainText (commit message / PR title source)", () => {
+  test("unwraps one enclosing fence, with or without a language tag", () => {
+    expect(plainText("```\nfeat: add hello.txt\n```")).toBe("feat: add hello.txt");
+    expect(plainText("  ````text\nfix: a\n\nbody ``` inner\n````\n")).toBe("fix: a\n\nbody ``` inner");
+  });
+
+  test("leaves text with a fence in the middle untouched", () => {
+    const text = "feat: x\n\n```\ncode\n```";
+    expect(plainText(text)).toBe(text);
+  });
 });
 
 describe("runJob", () => {
