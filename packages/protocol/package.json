@@ -1,0 +1,13 @@
+{
+  "name": "@orch/protocol",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

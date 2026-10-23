@@ -1,0 +1,19 @@
+{
+  "name": "agent-orchestrator",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --filter '*' dev",
+    "test": "bun test",
+    "images": "bun scripts/build-images.ts",
+    "db:generate": "cd packages/server && bunx drizzle-kit generate",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "typescript": "^7.0.2"
+  }
+}
