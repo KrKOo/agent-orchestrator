@@ -1,10 +1,10 @@
-import type { AssignedRun } from "@orch/protocol";
+import type { AssignedRun, ModelEntry } from "@orch/protocol";
 import type { Mount, SandboxFile } from "../sandbox/types";
 
 export interface HarnessAdapter {
   id: string;
   /** Files written to the sandbox config dir (`/orch/config`). `gw.url` is the sandbox-side gateway URL. */
-  files(run: AssignedRun, gw: { url: string; providers: string[] }): SandboxFile[];
+  files(run: AssignedRun, gw: { url: string; providers: string[]; models: ModelEntry[] }): SandboxFile[];
   env(gw: { token: string }): Record<string, string>;
   /** Extra mounts; `runDir` is the host per-run dir (`<dataDir>/runs/<runId>`). */
   mounts(run: AssignedRun, runDir: string): Mount[];
