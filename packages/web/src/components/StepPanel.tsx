@@ -16,16 +16,18 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
+  intervention: "Intervention",
 };
 
 export const KIND_ICON: Record<Step["kind"], string> = {
-  prompt: "✎",
-  skill: "★",
-  command: "/",
-  slash: "⌘",
-  git_commit: "●",
-  git_push: "↑",
-  github_pr: "⇄",
+  prompt: "✉️",
+  skill: "🧠",
+  command: "⌨️",
+  slash: "💬",
+  git_commit: "✅",
+  git_push: "⏫",
+  github_pr: "🚀",
+  intervention: "⏸",
 };
 
 /** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
@@ -201,9 +203,34 @@ export function StepPanel({
           type="number"
           min={1}
           value={step.timeoutSec}
-          onChange={(e) => set({ timeoutSec: Number(e.target.value) })}
+          onChange={(e) =>
+            set(
+              step.kind === "intervention" && e.target.value === ""
+                ? { timeoutSec: undefined }
+                : { timeoutSec: Number(e.target.value) },
+            )
+          }
         />
+        {step.kind === "intervention" && step.timeoutSec === undefined && (
+          <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
+        )}
       </label>
+
+      {step.kind === "intervention" && (
+        <>
+          <TemplateField
+            label="Reviewer note (optional)"
+            rows={4}
+            value={step.message ?? ""}
+            vars={vars}
+            onChange={(message) => set({ message: message === "" ? undefined : message })}
+          />
+          <p className="muted small">
+            The run pauses here until you answer from the run view. Feedback you type there becomes{" "}
+            <code>{`{{steps.${step.id}.output}}`}</code>; you can also add prompt/slash steps to run after this gate.
+          </p>
+        </>
+      )}
 
       {step.kind === "prompt" && (
         <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />

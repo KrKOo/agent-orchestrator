@@ -390,6 +390,108 @@ describe("runJob", () => {
     expect(ofType(events, "step.finished")[0]!.payload.output).toBe("Hello, world\n\n allow");
   });
 
+  test("intervention gate: continue with feedback and an injected prompt step splices into the queue", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = new PendingRequests();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") {
+        queueMicrotask(() =>
+          pending.settle(draft.payload.requestId, {
+            action: "continue",
+            feedback: "make it faster",
+            steps: [{ id: "redo", name: "Redo", kind: "prompt", prompt: "echo {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 }],
+          }),
+        );
+      }
+    };
+    const run = assigned({
+      steps: [
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "write hello.txt" },
+        { kind: "intervention", id: "gate", name: "Gate", message: "Review the change" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const req = ofType(events, "intervention.request")[0]!;
+    expect(req.stepId).toBe("gate");
+    expect(req.payload).toEqual({ requestId: req.payload.requestId, message: "Review the change" });
+    const res = ofType(events, "intervention.resolved")[0]!;
+    expect(res.payload).toMatchObject({ requestId: req.payload.requestId, action: "continue" });
+    expect(res.payload.steps).toEqual([{ id: "redo", name: "Redo", kind: "prompt", prompt: "echo {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 }]);
+    // The gate's output is the feedback; the injected step runs after it and echoes it.
+    const finished = ofType(events, "step.finished").map((e) => ({ id: e.stepId, ...e.payload }));
+    expect(finished.map((f) => f.id)).toEqual(["impl", "gate", "redo"]);
+    expect(finished[1]).toMatchObject({ status: "succeeded", output: "make it faster" });
+    // The injected prompt rendered the gate's feedback; the agent echoed the whole prompt.
+    expect(finished[2]!.output).toContain("echo make it faster");
+    expect(finished[2]!.output).toContain("Hello, world");
+    // Injected step is an agent step, so the harness was created lazily and prompted twice.
+    expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["impl", "gate", "redo"]);
+  });
+
+  test("intervention gate: invalid added steps fail the step and emit no resolved-with-steps", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = new PendingRequests();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") {
+        queueMicrotask(() =>
+          pending.settle(draft.payload.requestId, {
+            action: "continue",
+            steps: [{ id: "bad", name: "Bad", kind: "git_push", timeoutSec: 1800 }],
+          }),
+        );
+      }
+    };
+    const run = assigned({
+      steps: [{ kind: "prompt", id: "impl", name: "Implement", prompt: "hi" }, { kind: "intervention", id: "gate", name: "Gate" }],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
+    expect(ofType(events, "intervention.resolved")).toHaveLength(0);
+    const finished = ofType(events, "step.finished").at(-1)!;
+    expect(finished.stepId).toBe("gate");
+    expect(finished.payload.status).toBe("failed");
+    expect(finished.payload.error).toContain("cannot be added");
+    expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["impl", "gate"]);
+  });
+
+  test("intervention gate: cancel while waiting cancels the step and the run", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = new PendingRequests();
+    const abort = new AbortController();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") queueMicrotask(() => abort.abort());
+    };
+    const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+    await runJob(run, deps, abort.signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "cancelled" });
+    expect(ofType(events, "step.finished")[0]!.payload.status).toBe("cancelled");
+    // run.status may only record "running"; the final status event is emitted after the loop.
+    expect(ofType(events, "run.status").at(-1)!.payload.status).toBe("cancelled");
+    // No harness was created for the intervention-only flow.
+    expect(ofType(events, "acp.update")).toHaveLength(0);
+  });
+
+  test("intervention gate: timeoutSec expires into a failed step", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate", timeoutSec: 1 }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
+    const finished = ofType(events, "step.finished")[0]!;
+    expect(finished.stepId).toBe("gate");
+    expect(finished.payload.status).toBe("failed");
+    expect(finished.payload.error).toBe("Step timed out after 1s");
+    // The timeout nulls the answer: the gate is recorded as cancelled.
+    expect(ofType(events, "intervention.resolved")[0]!.payload.action).toBe("cancel");
+  });
+
   test("cancel ends the step and the run cancelled", async () => {
     const sandboxes = new FakeSandboxProvider();
     const { deps, events, sent } = harnessDeps(sandboxes);

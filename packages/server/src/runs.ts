@@ -171,6 +171,20 @@ export class RunService {
           .run();
         return;
       }
+      case "intervention.resolved": {
+        const steps = ev.payload.steps;
+        if (ev.payload.action !== "continue" || !steps?.length) return;
+        const run = tx.select({ definition: runs.definition }).from(runs).where(eq(runs.id, ev.runId)).get();
+        if (!run) return;
+        const defSteps = run.definition.steps;
+        const at = defSteps.findIndex((s) => s.id === ev.stepId);
+        if (at < 0 || steps.some((s) => defSteps.some((d) => d.id === s.id))) return;
+        tx.update(runs)
+          .set({ definition: { ...run.definition, steps: [...defSteps.slice(0, at + 1), ...steps, ...defSteps.slice(at + 1)] } })
+          .where(eq(runs.id, ev.runId))
+          .run();
+        return;
+      }
       default:
         return;
     }

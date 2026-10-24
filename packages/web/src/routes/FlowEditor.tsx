@@ -63,6 +63,8 @@ function newStep(kind: StepKind, id: string, earlier: Step[]): Step {
       return { ...base, kind };
     case "github_pr":
       return { ...base, kind, titleFrom: lastAgent, bodyFrom: lastAgent, draft: false };
+    case "intervention":
+      return { id, name: KIND_LABEL[kind], kind, message: "" };
   }
 }
 
@@ -193,6 +195,8 @@ function stepSubtitle(step: Step): string {
       return "push run branch";
     case "github_pr":
       return `title ${step.titleFrom || "?"} · body ${step.bodyFrom || "?"}`;
+    case "intervention":
+      return step.message?.split("\n")[0] || "wait for user";
   }
 }
 
@@ -498,6 +502,7 @@ const KIND_HELP: Record<StepKind, string> = {
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",
+  intervention: "Pause the run for your review; feedback and added steps continue it",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
