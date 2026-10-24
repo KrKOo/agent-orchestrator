@@ -30,6 +30,7 @@ import { harnessRoleModels, harnesses } from "./harness/omp";
 import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
+import { OmpJsonTranslator } from "./omp-json";
 import type { Mount, Sandbox, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
 import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
@@ -322,19 +323,27 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   /**
    * Runs one omp slash command headless (`omp -p "/cmd args"`) inside the sandbox. omp expands the
-   * command, runs the resulting prompt through the model (routed via the gateway), and prints the
-   * final answer on stdout; that becomes the step output.
+   * command, runs the resulting prompt through the model (routed via the gateway), and the runner
+   * streams its NDJSON progress events to the UI as `acp.update`s (same rendering as agent steps);
+   * the final assistant text becomes the step output.
    */
   const runSlashStep = async (step: Extract<Step, { kind: "slash" }>, abort: AbortSignal): Promise<StepOutcome> => {
     const prompt = step.args && step.args.trim() ? `/${step.command} ${renderTemplate(step.args, ctx).trim()}` : `/${step.command}`;
     // `--` stops omp flag parsing so args cannot inject launch flags; the text stays one argv element.
     const proc = sandbox!.exec([...adapter.printArgv(), "--", prompt], workspace!.hostPath);
+    // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
+    void proc.stdin.close();
+    const translator = new OmpJsonTranslator();
     const drain = async (stream: ReadableStream<Uint8Array>, stream2: "stdout" | "stderr"): Promise<string> => {
       const decoder = new TextDecoder();
       let text = "";
       for await (const chunk of stream) {
         const part = decoder.decode(chunk, { stream: true });
         text += part;
+        if (stream2 === "stdout") {
+          // Translate before emitting so text deltas and tool cards stream like agent steps do.
+          for (const update of translator.push(part)) emit({ type: "acp.update", payload: { update } }, step.id);
+        }
         emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, step.id);
       }
       return text;
@@ -344,9 +353,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         Promise.all([drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"), proc.exited]),
         abort,
       );
-      if (abort.aborted) return { status: "cancelled", output: stdout };
-      if (exitCode !== 0) return { status: "failed", output: stdout, error: `omp -p exited with code ${exitCode}: ${stderr.trim().slice(-500)}` };
-      return { status: "succeeded", output: stdout };
+      for (const update of translator.end()) emit({ type: "acp.update", payload: { update } }, step.id);
+      const output = translator.result() ?? stdout;
+      if (abort.aborted) return { status: "cancelled", output };
+      if (exitCode !== 0) return { status: "failed", output, error: `omp -p exited with code ${exitCode}: ${stderr.trim().slice(-500)}` };
+      return { status: "succeeded", output };
     } finally {
       if (!abort.aborted) proc.kill();
     }

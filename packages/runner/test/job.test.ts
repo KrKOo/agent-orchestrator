@@ -10,6 +10,7 @@ import {
   type RunEventDraft,
   type RunnerMessage,
   UNTRUSTED_PREAMBLE,
+  type SessionUpdate,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
@@ -271,7 +272,7 @@ describe("runJob", () => {
     );
   });
 
-  test("slash step runs omp -p with the command and templated args as output", async () => {
+  test("slash step runs omp -p with the command, streams events, and outputs the final text", async () => {
     const provider = new FakeSandboxProvider();
     const { deps, events, sent } = harnessDeps(provider);
     const run = assigned({
@@ -287,8 +288,48 @@ describe("runJob", () => {
     const finished = ofType(events, "step.finished");
     expect(finished[0]!.payload.status).toBe("succeeded");
     expect(finished[0]!.payload.output).toBe("print:/review focus on tea\n");
+    // Assistant text streamed as acp.update chunks.
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "review");
+    const chunkText = (u: SessionUpdate): string => {
+      if (u.sessionUpdate !== "agent_message_chunk") return "";
+      const c: unknown = u.content;
+      if (typeof c !== "object" || c === null || !("text" in c) || typeof c.text !== "string") return "";
+      return c.text;
+    };
+    expect(updates.map((e) => chunkText(e.payload.update)).join("")).toBe("print:/review focus on tea\n");
+    // Raw NDJSON still lands in the sandbox log.
     const logs = ofType(events, "sandbox.log").filter((e) => e.stepId === "review");
-    expect(logs.map((e) => e.payload.text).join("")).toBe("print:/review focus on tea\n");
+    expect(logs.map((e) => e.payload.text).join("")).toContain("message_update");
+  });
+
+  test("slash step tool activity streams as tool_call cards", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "slash", id: "tools", name: "Tools", command: "plan", args: "use the tool" }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "tools").map((e) => e.payload.update);
+    const started = updates.filter((u) => u.sessionUpdate === "tool_call");
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ toolCallId: "tool_1", title: "Running echo", name: "bash", status: "in_progress" });
+    const ended = updates.filter((u) => u.sessionUpdate === "tool_call_update" && u.status === "completed");
+    expect(ended).toHaveLength(1);
+    expect(ended[0]!.content).toEqual([{ type: "text", text: "hi\n" }]);
+  });
+
+  test("slash step thinking streams as collapsible thought sections", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "slash", id: "thinker", name: "Thinker", command: "plan", args: "think hard" }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "thinker").map((e) => e.payload.update);
+    const thoughts = updates.filter((u) => u.sessionUpdate === "agent_thought_chunk");
+    expect(thoughts).toHaveLength(2);
+    const thoughtText = (u: SessionUpdate): string => {
+      const c: unknown = u.content;
+      if (typeof c !== "object" || c === null || !("text" in c) || typeof c.text !== "string") return "";
+      return c.text;
+    };
+    expect(thoughts.map(thoughtText).join("")).toBe("pondering the request");
   });
 
   test("slash step failure surfaces a non-zero exit as a failed step", async () => {
