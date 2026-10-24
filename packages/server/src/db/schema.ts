@@ -1,4 +1,4 @@
-import type { FlowDefinition, RunGitHubInfo, RunnerCapabilities, RunStatus, StepStatus } from "@orch/protocol";
+import type { FlowDefinition, RunGitHubInfo, RunnerCapabilities, RunStatus, StepStatus, WorkspaceInfo } from "@orch/protocol";
 import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const flows = sqliteTable("flows", {
@@ -29,6 +29,8 @@ export const runs = sqliteTable(
     createdAt: integer("created_at").notNull(),
     startedAt: integer("started_at"),
     finishedAt: integer("finished_at"),
+    /** Host workspace (path/branch/repo) reported by the runner once the run starts. */
+    workspace: text("workspace", { mode: "json" }).$type<WorkspaceInfo>(),
   },
   (t) => [index("runs_status_idx").on(t.status, t.createdAt), index("runs_flow_idx").on(t.flowId, t.createdAt)],
 );

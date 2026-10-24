@@ -1,4 +1,4 @@
-import { isAgentStep, TERMINAL_STATUSES } from "@orch/protocol";
+import { isAgentStep, TERMINAL_STATUSES, type WorkspaceInfo } from "@orch/protocol";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
@@ -8,7 +8,7 @@ import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
 import { applyRunEvents, initialRunViewState, type StepView } from "../runState";
-import { Collapsible, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
+import { Collapsible, CopyButton, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
 import { useRunEventStream } from "../ws";
 
 const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, subagents: [] };
@@ -65,6 +65,8 @@ function RunViewInner({ runId }: { runId: string }) {
   const runLevel = state.steps[""];
   const selectedDef = steps.find((s) => s.id === selectedId);
   const selectedRow = selectedId !== null ? stepRows.get(selectedId) : undefined;
+  // Live stream first; a reloaded (or already terminal) run falls back to the persisted workspace.
+  const workspace = state.workspace ?? run.workspace ?? undefined;
 
   return (
     <div className="run-view">
@@ -112,14 +114,28 @@ function RunViewInner({ runId }: { runId: string }) {
               Runner <span className="mono">{run.runnerId}</span>
             </span>
           )}
-          {state.workspace && (
-            <span>
-              Workspace <span className="mono">{state.workspace.path}</span>
-              {state.workspace.branch && (
+          {(workspace || runStatus === "running") && (
+            <span className="row gap-tight">
+              Workspace
+              {workspace ? (
                 <>
-                  {" "}
-                  on <span className="mono tag">{state.workspace.branch}</span>
+                  <span className="mono" title="Host path of the git worktree/checkout">
+                    {workspace.path}
+                  </span>
+                  {workspace.branch && (
+                    <span className="mono tag" title="Branch the run created">
+                      {workspace.branch}
+                    </span>
+                  )}
+                  {workspace.repo && (
+                    <span className="mono tag" title="GitHub origin repo">
+                      {workspace.repo}
+                    </span>
+                  )}
+                  <CopyButton value={checkoutCommand(workspace)} title="Copy a git command that checks this branch out locally" />
                 </>
+              ) : (
+                <span className="muted">preparing…</span>
               )}
             </span>
           )}
@@ -248,4 +264,13 @@ function RunViewInner({ runId }: { runId: string }) {
       )}
     </div>
   );
+}
+
+/** A single command that reproduces the run's workspace locally: for worktrees, a checkout of
+ * the orchestrator branch; otherwise a plain `cd` into the (shared) workspace path. */
+export function checkoutCommand(ws: WorkspaceInfo): string {
+  if (ws.branch && ws.repo) {
+    return `git fetch origin ${ws.branch} && git checkout ${ws.branch}`;
+  }
+  return `cd ${ws.path}`;
 }

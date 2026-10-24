@@ -35,6 +35,26 @@ export function formatDuration(from: number | null, to: number | null): string {
   return mins < 60 ? `${mins}m ${secs % 60}s` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
 }
 
+/** Copies `value` to the clipboard; shows a short confirmation (or failure) inline. */
+export function CopyButton({ value, title }: { value: string; title?: string }) {
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const copy = async () => {
+    try {
+      // `navigator.clipboard` is missing outside secure contexts; the throw lands in the catch.
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+    setTimeout(() => setCopied(null), 1500);
+  };
+  return (
+    <button type="button" className="btn small" title={title} onClick={() => void copy()}>
+      {copied === null ? "Copy" : copied ? "Copied" : "Copy failed"}
+    </button>
+  );
+}
+
 export function toJson(value: unknown): string {
   if (typeof value === "string") return value;
   try {

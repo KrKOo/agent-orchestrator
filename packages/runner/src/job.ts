@@ -390,7 +390,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       });
       emit({
         type: "run.status",
-        payload: { status: "running", workspace: { path: workspace.hostPath, ...(workspace.branch ? { branch: workspace.branch } : {}) } },
+        payload: {
+          status: "running",
+          workspace: {
+            path: workspace.hostPath,
+            ...(workspace.branch ? { branch: workspace.branch } : {}),
+            ...(workspace.repo ? { repo: `${workspace.repo.owner}/${workspace.repo.name}` } : {}),
+          },
+        },
       });
       checkCancelled();
 
