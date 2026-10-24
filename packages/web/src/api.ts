@@ -88,7 +88,7 @@ export const api = {
   respondIntervention: (
     runId: string,
     requestId: string,
-    body: { stepId: string; action: InterventionAction; feedback?: string; steps?: unknown[] },
+    body: { stepId: string; action: InterventionAction; feedback?: string; output?: string },
   ) => request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/interventions/${enc(requestId)}`, body),
 
   listRunners: () => request<RunnerRow[]>("GET", "/api/runners"),

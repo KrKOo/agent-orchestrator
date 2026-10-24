@@ -502,7 +502,7 @@ const KIND_HELP: Record<StepKind, string> = {
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",
-  intervention: "Pause the run for your review; feedback and added steps continue it",
+  intervention: "Pause and chat with the run's agent sessions, then continue",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {

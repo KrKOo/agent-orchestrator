@@ -11,7 +11,8 @@ const { runs, runners } = schema;
 export const ONLINE_WINDOW_MS = 45_000;
 /** Non-terminal runs held by a runner offline for longer than this fail with `runner_lost`. */
 export const RUNNER_LOST_MS = 10 * 60_000;
-export const ACTIVE_STATUSES = ["assigned", "running"] as const;
+/** Statuses of runs a runner holds (slot taken, resumed on reconnect, failed when the runner is lost). */
+export const ACTIVE_STATUSES = ["assigned", "running", "awaiting_input"] as const;
 
 export interface RunnerState {
   id: string;

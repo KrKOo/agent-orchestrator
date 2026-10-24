@@ -47,7 +47,7 @@ describe("applyRunEvents", () => {
       }),
       ev({ type: "acp.permission_request", stepId: "a", payload: { requestId: "p1", toolCall: {}, options: [] } }),
       ev({ type: "acp.permission_resolved", stepId: "a", payload: { requestId: "p1", optionId: null } }),
-      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i1", message: "review it" } }),
+      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i1", message: "review it", sessions: [] } }),
       ev({ type: "intervention.resolved", stepId: "gate", payload: { requestId: "i1", action: "continue" } }),
       ev({ type: "step.finished", stepId: "a", payload: { status: "succeeded", output: "HelloDone" } }),
     ];

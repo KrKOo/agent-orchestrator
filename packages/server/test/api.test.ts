@@ -163,29 +163,25 @@ describe("runs API", () => {
 
     const ok = await call("POST", `/api/runs/${running}/interventions/req1`, {
       stepId: "gate",
-      action: "continue",
-      feedback: "ship it",
-      steps: [{ id: "extra", name: "Extra", kind: "prompt", prompt: "extra: {{steps.gate.output}}" }],
+      action: "message",
+      session: "agent",
+      text: "/review the diff",
     });
     expect(ok.json).toEqual({ ok: true });
     expect(link.of("intervention.respond")[0]).toEqual({
       t: "intervention.respond",
       runId: running,
       requestId: "req1",
-      action: "continue",
-      feedback: "ship it",
-      steps: [{ id: "extra", name: "Extra", kind: "prompt", prompt: "extra: {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 }],
+      action: "message",
+      session: "agent",
+      text: "/review the diff",
     });
 
-    // invalid added steps → 400, nothing relayed
-    expect(link.sent.length).toBe(1);
-    const bad = await call("POST", `/api/runs/${running}/interventions/req2`, {
-      stepId: "gate",
-      action: "continue",
-      steps: [{ id: "x", name: "X", kind: "git_push" }],
-    });
-    expect(bad.status).toBe(400);
-    expect(bad.json.errors.join()).toContain("cannot be added");
+    // message without text or session → 400, nothing relayed
+    const blank = await call("POST", `/api/runs/${running}/interventions/req2`, { stepId: "gate", action: "message", session: "agent", text: "  " });
+    expect(blank.status).toBe(400);
+    expect(blank.json.errors.join()).toContain("write a message");
+    expect((await call("POST", `/api/runs/${running}/interventions/req2`, { stepId: "gate", action: "message", text: "hi" })).status).toBe(400);
     expect(link.sent.length).toBe(1);
 
     // non-intervention stepId → 400

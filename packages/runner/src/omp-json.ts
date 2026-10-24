@@ -12,6 +12,7 @@ import { z } from "zod";
  *   {"type":"tool_execution_update","toolCallId":"…","partialResult":{"content":[{"type":"text","text":"…"}]}}
  *   {"type":"tool_execution_end","toolCallId":"…","result":{"content":[…]},"isError":false}
  *   {"type":"agent_end","messages":[user and assistant message objects]}
+ *   {"type":"session","version":3,"id":"…","timestamp":"…","cwd":"…"}  (first line; the id `--resume` takes)
  */
 
 /** Tool message content: text blocks (other block types are dropped by the renderer anyway). */
@@ -48,6 +49,8 @@ const ToolEnd = z.object({
   isError: z.boolean().optional(),
 });
 
+const SessionHeader = z.object({ type: z.literal("session"), id: z.string().min(1) });
+
 const AgentEnd = z.object({
   type: z.literal("agent_end"),
   messages: z.array(z.looseObject({ role: z.string(), content: ContentBlocks.optional() })),
@@ -67,6 +70,8 @@ export class OmpJsonTranslator {
   private readonly announced = new Set<string>();
   /** Final assistant text (from the last `agent_end`) — the slash step's output. */
   private output: string | undefined;
+  /** omp session id from the leading `session` event; resuming it continues the conversation. */
+  private session: string | undefined;
 
   /** Ingests one raw stdout chunk (any split across NDJSON lines) and returns updates in order. */
   push(chunk: string): SessionUpdate[] {
@@ -92,6 +97,10 @@ export class OmpJsonTranslator {
   /** Accumulated assistant text of the final turn — the equivalent of print-mode stdout. */
   result(): string | undefined {
     return this.output;
+  }
+
+  sessionId(): string | undefined {
+    return this.session;
   }
 
   private translateLine(line: string): SessionUpdate[] {
@@ -137,6 +146,11 @@ export class OmpJsonTranslator {
       return this.toolUpdate(toolCallId, { sessionUpdate: "tool_call_update", toolCallId, status: isError ? "failed" : "completed", content });
     }
     const agentEnd = AgentEnd.safeParse(ev);
+    const header = SessionHeader.safeParse(ev);
+    if (header.success) {
+      this.session = header.data.id;
+      return [];
+    }
     if (agentEnd.success) {
       const assistant = [...agentEnd.data.messages].reverse().find((m) => m.role === "assistant");
       const text = textBlocks(assistant?.content).map((b) => b.text).join("");

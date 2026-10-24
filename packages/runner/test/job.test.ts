@@ -52,7 +52,9 @@ class FakeSandboxProvider implements SandboxProvider {
       exec: (argv, cwd) => {
         // `omp -p ...` (slash steps): run the fake print-mode responder instead of the ACP agent.
         if (argv.includes("-p")) {
-          const proc = Bun.spawn(["bun", FAKE_PRINT, argv[argv.indexOf("--") + 1] ?? ""], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          const resume = argv.indexOf("--resume");
+          const args = [argv[argv.indexOf("--") + 1] ?? "", resume >= 0 ? argv[resume + 1]! : ""];
+          const proc = Bun.spawn(["bun", FAKE_PRINT, ...args], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
           return {
             stdin: sinkToWritable(proc.stdin),
             stdout: proc.stdout,
@@ -390,73 +392,110 @@ describe("runJob", () => {
     expect(ofType(events, "step.finished")[0]!.payload.output).toBe("Hello, world\n\n allow");
   });
 
-  test("intervention gate: continue with feedback and an injected prompt step splices into the queue", async () => {
-    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+  /** Answers each intervention request in order with the next scripted answer. */
+  function scriptedGate(deps: JobDeps, events: RunEventDraft[], answers: Parameters<PendingRequests["settle"]>[1][]): PendingRequests {
     const pending = new PendingRequests();
     deps.emit = (draft) => {
       events.push(draft);
       if (draft.type === "intervention.request") {
-        queueMicrotask(() =>
-          pending.settle(draft.payload.requestId, {
-            action: "continue",
-            feedback: "make it faster",
-            steps: [{ id: "redo", name: "Redo", kind: "prompt", prompt: "echo {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 }],
-          }),
-        );
+        const answer = answers.shift() ?? null;
+        queueMicrotask(() => pending.settle(draft.payload.requestId, answer));
       }
     };
+    return pending;
+  }
+
+  test("intervention chat: a message goes verbatim into the agent session; continue passes its latest reply on", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = scriptedGate(deps, events, [{ action: "message", session: "agent", text: "echo tweak it" }, { action: "continue" }]);
     const run = assigned({
       steps: [
         { kind: "prompt", id: "impl", name: "Implement", prompt: "write hello.txt" },
         { kind: "intervention", id: "gate", name: "Gate", message: "Review the change" },
+        { kind: "prompt", id: "after", name: "After", prompt: "echo {{steps.gate.output}}" },
       ],
     });
     await runJob(run, deps, new AbortController().signal, pending);
 
     expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
-    const req = ofType(events, "intervention.request")[0]!;
-    expect(req.stepId).toBe("gate");
-    expect(req.payload).toEqual({ requestId: req.payload.requestId, message: "Review the change" });
-    const res = ofType(events, "intervention.resolved")[0]!;
-    expect(res.payload).toMatchObject({ requestId: req.payload.requestId, action: "continue" });
-    expect(res.payload.steps).toEqual([{ id: "redo", name: "Redo", kind: "prompt", prompt: "echo {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 }]);
-    // The gate's output is the feedback; the injected step runs after it and echoes it.
-    const finished = ofType(events, "step.finished").map((e) => ({ id: e.stepId, ...e.payload }));
-    expect(finished.map((f) => f.id)).toEqual(["impl", "gate", "redo"]);
-    expect(finished[1]).toMatchObject({ status: "succeeded", output: "make it faster" });
-    // The injected prompt rendered the gate's feedback; the agent echoed the whole prompt.
-    expect(finished[2]!.output).toContain("echo make it faster");
-    expect(finished[2]!.output).toContain("Hello, world");
-    // Injected step is an agent step, so the harness was created lazily and prompted twice.
-    expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["impl", "gate", "redo"]);
+    const [first, second] = ofType(events, "intervention.request");
+    expect(first!.payload).toEqual({
+      requestId: first!.payload.requestId,
+      message: "Review the change",
+      sessions: [{ id: "agent", label: "Agent session (last step: Implement)", output: "Hello, world" }],
+      session: "agent",
+    });
+    // The agent got exactly the user's text (the fake echoes prompts containing "echo").
+    const reply = second!.payload.sessions[0]!.output;
+    expect(reply).toMatch(/^Hello, world\n+echo tweak it$/);
+    expect(ofType(events, "intervention.resolved").map((e) => e.payload.action)).toEqual(["message", "continue"]);
+    // The run waits for the user at each request and is running again while the agent replies.
+    expect(ofType(events, "run.status").map((e) => e.payload.status)).toEqual([
+      "running",
+      "awaiting_input",
+      "running",
+      "awaiting_input",
+      "running",
+      "succeeded",
+    ]);
+    // The message shows as a user bubble in the gate's transcript, followed by the streamed reply.
+    const gateUpdates = ofType(events, "acp.update").filter((e) => e.stepId === "gate").map((e) => e.payload.update.sessionUpdate);
+    expect(gateUpdates[0]).toBe("user_message_chunk");
+    expect(gateUpdates).toContain("agent_message_chunk");
+
+    const finished = Object.fromEntries(ofType(events, "step.finished").map((e) => [e.stepId, e.payload]));
+    expect(finished.gate).toMatchObject({ status: "succeeded", output: reply });
+    expect(finished.after!.output).toContain("echo tweak it");
   });
 
-  test("intervention gate: invalid added steps fail the step and emit no resolved-with-steps", async () => {
+  test("intervention chat: slash sessions resume their omp session; continue uses the chosen session", async () => {
     const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
-    const pending = new PendingRequests();
-    deps.emit = (draft) => {
-      events.push(draft);
-      if (draft.type === "intervention.request") {
-        queueMicrotask(() =>
-          pending.settle(draft.payload.requestId, {
-            action: "continue",
-            steps: [{ id: "bad", name: "Bad", kind: "git_push", timeoutSec: 1800 }],
-          }),
-        );
-      }
-    };
+    const pending = scriptedGate(deps, events, [
+      { action: "message", session: "slash:plan", text: "add tests" },
+      { action: "continue", session: "slash:plan" },
+    ]);
     const run = assigned({
-      steps: [{ kind: "prompt", id: "impl", name: "Implement", prompt: "hi" }, { kind: "intervention", id: "gate", name: "Gate" }],
+      steps: [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan", args: "an app" },
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "hi" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ],
     });
     await runJob(run, deps, new AbortController().signal, pending);
 
-    expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
-    expect(ofType(events, "intervention.resolved")).toHaveLength(0);
-    const finished = ofType(events, "step.finished").at(-1)!;
-    expect(finished.stepId).toBe("gate");
-    expect(finished.payload.status).toBe("failed");
-    expect(finished.payload.error).toContain("cannot be added");
-    expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["impl", "gate"]);
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const [first, second] = ofType(events, "intervention.request");
+    expect(first!.payload.sessions).toEqual([
+      { id: "slash:plan", label: "/plan (Plan)", output: "print:/plan an app\n" },
+      { id: "agent", label: "Agent session (last step: Implement)", output: "Hello, world" },
+    ]);
+    // The previous step's session is preselected; after a message, the one chatted with.
+    expect(first!.payload.session).toBe("agent");
+    expect(second!.payload.session).toBe("slash:plan");
+    const finished = Object.fromEntries(ofType(events, "step.finished").map((e) => [e.stepId, e.payload]));
+    expect(finished.gate).toMatchObject({ status: "succeeded", output: "print:(resumed fake) add tests\n" });
+  });
+
+  test("intervention chat: unknown sessions and failed turns ask again with the error and keep the last result", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = scriptedGate(deps, events, [
+      { action: "message", session: "nope", text: "hi" },
+      { action: "message", session: "slash:plan", text: "make it fail" },
+      { action: "continue" },
+    ]);
+    const run = assigned({
+      steps: [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const requests = ofType(events, "intervention.request").map((e) => e.payload);
+    expect(requests.map((r) => r.error)).toEqual([undefined, 'Unknown session "nope".', "omp -p exited with code 3: boom"]);
+    expect(requests[2]!.sessions).toEqual(requests[0]!.sessions);
+    expect(ofType(events, "step.finished").at(-1)!.payload).toMatchObject({ status: "succeeded", output: "print:/plan\n" });
   });
 
   test("intervention gate: cancel while waiting cancels the step and the run", async () => {
@@ -487,7 +526,7 @@ describe("runJob", () => {
     const finished = ofType(events, "step.finished")[0]!;
     expect(finished.stepId).toBe("gate");
     expect(finished.payload.status).toBe("failed");
-    expect(finished.payload.error).toBe("Step timed out after 1s");
+    expect(finished.payload.error).toBe("No answer within 1s");
     // The timeout nulls the answer: the gate is recorded as cancelled.
     expect(ofType(events, "intervention.resolved")[0]!.payload.action).toBe("cancel");
   });

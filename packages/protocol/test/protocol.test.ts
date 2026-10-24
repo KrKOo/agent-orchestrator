@@ -8,7 +8,6 @@ import {
   templateRefs,
   templateVariables,
   validateFlow,
-  validateInterventionSteps,
 } from "../src";
 
 const ctx = {
@@ -212,61 +211,6 @@ describe("intervention steps", () => {
     const step = { id: "gate", name: "Gate", kind: "intervention" };
     expect(isActionStep(step as never)).toBe(false);
     expect(isAgentStep(step as never)).toBe(false);
-  });
-
-  test("validateInterventionSteps accepts prompt/slash/command referencing the gate and earlier steps", () => {
-    const flow = validateFlow({
-      ...baseFlow,
-      steps: [
-        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
-        { id: "gate", name: "Gate", kind: "intervention", message: "ok?" },
-      ],
-    });
-    if (!flow.ok) throw new Error(flow.errors.join("\n"));
-    const res = validateInterventionSteps(flow.flow, "gate", [
-      { id: "fix", name: "Fix", kind: "prompt", prompt: "Fix per {{steps.gate.output}} and {{steps.impl.structured}}" },
-      { id: "rv", name: "Review", kind: "slash", command: "review", args: "about {{steps.gate.output}}" },
-    ]);
-    expect(res.ok).toBe(true);
-    if (!res.ok) throw new Error(res.errors.join("\n"));
-    expect(res.steps.map((s) => s.id)).toEqual(["fix", "rv"]);
-  });
-
-  test("validateInterventionSteps rejects action/skill/intervention kinds, duplicate ids, forward refs and >10", () => {
-    const flow = validateFlow({
-      ...baseFlow,
-      steps: [
-        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
-        { id: "gate", name: "Gate", kind: "intervention", message: "ok?" },
-        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
-      ],
-    });
-    if (!flow.ok) throw new Error(flow.errors.join("\n"));
-
-    const kinds = validateInterventionSteps(flow.flow, "gate", [
-      { id: "a", name: "A", kind: "git_push" },
-      { id: "b", name: "B", kind: "skill", skill: "x" },
-      { id: "c", name: "C", kind: "intervention" },
-    ]);
-    expect(kinds.ok).toBe(false);
-    if (!kinds.ok) expect(kinds.errors.filter((e) => e.includes("cannot be added")).length).toBe(3);
-
-    const dup = validateInterventionSteps(flow.flow, "gate", [{ id: "impl", name: "Dup", kind: "prompt", prompt: "x" }]);
-    expect(dup.ok).toBe(false);
-    if (!dup.ok) expect(dup.errors.join()).toContain('duplicate step id "impl"');
-
-    const laterDup = validateInterventionSteps(flow.flow, "gate", [{ id: "later", name: "Dup", kind: "prompt", prompt: "x" }]);
-    expect(laterDup.ok).toBe(false);
-
-    const fwd = validateInterventionSteps(flow.flow, "gate", [
-      { id: "a", name: "A", kind: "prompt", prompt: "{{steps.later.output}}" },
-    ]);
-    expect(fwd.ok).toBe(false);
-
-    const many = Array.from({ length: 11 }, (_, i) => ({ id: `s${i}`, name: `S${i}`, kind: "prompt", prompt: "x" }));
-    const tooMany = validateInterventionSteps(flow.flow, "gate", many);
-    expect(tooMany.ok).toBe(false);
-    if (!tooMany.ok) expect(tooMany.errors.join()).toContain("at most 10");
   });
 
   test("validateFlow rejects intervention steps in pull request flows", () => {

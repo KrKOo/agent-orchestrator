@@ -183,9 +183,10 @@ export const GitHubPrStep = z.object({
   draft: z.boolean().default(false),
 });
 /**
- * Pauses the run until a user answers from the web UI. Feedback (optional) becomes the step output;
- * the answer may also carry prompt/slash/command steps to splice in after this one. No `timeoutSec`
- * means wait until answered or cancelled.
+ * Pauses the run so the user can chat with the run's agent sessions from the web UI: the shared
+ * ACP session of prompt/skill/command steps, or the resumable `omp -p` session of an earlier slash
+ * step. On continue, the latest result of the selected session becomes this step's output.
+ * No `timeoutSec` means wait until answered or cancelled; otherwise each wait for the user is capped.
  */
 export const InterventionStep = z.object({
   ...stepBase,
@@ -392,39 +393,5 @@ export function validateFlow(input: unknown): ValidateResult {
 }
 
 export type InterventionAction = z.infer<typeof InterventionAction>;
-export const InterventionAction = z.enum(["continue", "cancel"]);
-
-export type InterventionStepsResult = { ok: true; steps: Step[] } | { ok: false; errors: string[] };
-
-const INJECTED_STEP_KINDS: StepKind[] = ["prompt", "slash", "command"];
-const MAX_INJECTED_STEPS = 10;
-
-/**
- * Validates steps a user adds at an intervention step: only prompt/slash/command, at most
- * {@link MAX_INJECTED_STEPS}, ids unique across the whole flow, and — validated on the flow
- * prefix up to and including the intervention — template references may only point at inputs,
- * earlier steps, or the intervention's own output.
- */
-export function validateInterventionSteps(def: FlowDefinition, interventionId: string, added: unknown): InterventionStepsResult {
-  const parsed = z.array(Step).safeParse(added);
-  if (!parsed.success) {
-    return { ok: false, errors: parsed.error.issues.map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)) };
-  }
-  const steps = parsed.data;
-  const errors: string[] = [];
-  if (steps.length > MAX_INJECTED_STEPS) errors.push(`too many steps: at most ${MAX_INJECTED_STEPS} steps can be added at an intervention`);
-  const known = new Set(def.steps.map((s) => s.id));
-  for (const step of steps) {
-    if (!INJECTED_STEP_KINDS.includes(step.kind)) errors.push(`steps.${step.id}: kind "${step.kind}" cannot be added at an intervention`);
-    if (known.has(step.id)) errors.push(`steps.${step.id}: duplicate step id "${step.id}"`);
-    known.add(step.id);
-  }
-  if (errors.length) return { ok: false, errors };
-
-  const at = def.steps.findIndex((s) => s.id === interventionId);
-  if (at < 0) return { ok: false, errors: [`no intervention step "${interventionId}" in this flow`] };
-  const prefix = def.steps.slice(0, at + 1);
-  const check = validateFlow({ ...def, steps: [...prefix, ...steps] });
-  if (!check.ok) return { ok: false, errors: check.errors };
-  return { ok: true, steps };
-}
+/** `message` sends text to one of the run's sessions (the gate asks again afterwards); `continue` resumes the flow. */
+export const InterventionAction = z.enum(["message", "continue", "cancel"]);

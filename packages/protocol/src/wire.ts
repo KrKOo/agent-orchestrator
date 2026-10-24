@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { RunEvent, RunStatus } from "./events";
-import { FlowDefinition, InterventionAction, Step } from "./flow";
+import { FlowDefinition, InterventionAction } from "./flow";
 
 export const WIRE_PROTOCOL = 1;
 
@@ -147,9 +147,10 @@ export const ServerMessage = z.union([
     runId: z.string(),
     requestId: z.string(),
     action: InterventionAction,
-    /** Validated steps to splice in after the intervention step (continue with additions). */
-    steps: z.array(Step).optional(),
-    feedback: z.string().optional(),
+    /** `message`/`continue`: id of one of the request's `sessions`. */
+    session: z.string().optional(),
+    /** `message`: text sent verbatim to the session (slash commands included). */
+    text: z.string().optional(),
   }),
   z.object({ t: z.literal("pong") }),
 ]);

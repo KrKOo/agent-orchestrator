@@ -226,8 +226,9 @@ export function StepPanel({
             onChange={(message) => set({ message: message === "" ? undefined : message })}
           />
           <p className="muted small">
-            The run pauses here until you answer from the run view. Feedback you type there becomes{" "}
-            <code>{`{{steps.${step.id}.output}}`}</code>; you can also add prompt/slash steps to run after this gate.
+            The run pauses here and opens a chat in the run view: message the agent session or an earlier slash step's session
+            (slash commands work too) as often as needed, then continue. The selected session's latest reply becomes{" "}
+            <code>{`{{steps.${step.id}.output}}`}</code>.
           </p>
         </>
       )}

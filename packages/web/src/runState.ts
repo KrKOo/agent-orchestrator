@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import type { Finding, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
+import type { Finding, InterventionSession, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -71,6 +71,12 @@ export interface InterventionView {
   requestId: string;
   stepId?: string;
   message: string;
+  /** Sessions the user can chat with and their latest results. */
+  sessions: InterventionSession[];
+  /** Preselected session id. */
+  session?: string;
+  /** Why the last chat turn failed. */
+  error?: string;
   resolved: boolean;
 }
 

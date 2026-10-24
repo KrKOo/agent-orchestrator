@@ -109,10 +109,11 @@ export const ompAdapter: HarnessAdapter = {
     return ["omp", "acp", "--config", "/orch/config/omp-config.yml", "--session-dir", OMP_SESSIONS_DIR];
   },
 
-  printArgv() {
+  printArgv(resume) {
     // Headless one-shot: slash commands run their documented headless path (no mode chooser).
     // `--mode json` streams NDJSON progress events; the runner translates them into `acp.update`s.
-    return ["omp", "-p", "--mode", "json", "--config", "/orch/config/omp-config.yml", "--session-dir", OMP_SESSIONS_DIR];
+    const argv = ["omp", "-p", "--mode", "json", "--config", "/orch/config/omp-config.yml", "--session-dir", OMP_SESSIONS_DIR];
+    return resume === undefined ? argv : [...argv, "--resume", resume];
   },
 };
 
