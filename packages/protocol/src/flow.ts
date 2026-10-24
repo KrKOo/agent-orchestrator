@@ -182,20 +182,31 @@ export const GitHubPrStep = z.object({
   base: z.string().min(1).optional(),
   draft: z.boolean().default(false),
 });
+/**
+ * Pauses the run until a user answers from the web UI. Feedback (optional) becomes the step output;
+ * the answer may also carry prompt/slash/command steps to splice in after this one. No `timeoutSec`
+ * means wait until answered or cancelled.
+ */
+export const InterventionStep = z.object({
+  ...stepBase,
+  kind: z.literal("intervention"),
+  message: z.string().optional(),
+  timeoutSec: z.number().int().positive().optional(),
+});
 
-export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, SlashStep, GitCommitStep, GitPushStep, GitHubPrStep]);
+export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, SlashStep, GitCommitStep, GitPushStep, GitHubPrStep, InterventionStep]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr", "intervention"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
 }
 
 export function isActionStep(step: Step): step is ActionStep {
-  return !isAgentStep(step);
+  return step.kind === "git_commit" || step.kind === "git_push" || step.kind === "github_pr";
 }
 
 export const FlowDefinition = z.object({
@@ -229,6 +240,8 @@ export function stepTemplates(step: Step): [string, string][] {
     case "command":
     case "slash":
       return step.args === undefined ? [] : [["args", step.args]];
+    case "intervention":
+      return step.message === undefined ? [] : [["message", step.message]];
     default:
       return [];
   }
@@ -353,6 +366,9 @@ export function validateFlow(input: unknown): ValidateResult {
         errors.push(`${where}: ${step.kind} requires workspace isolation "worktree" with access "rw"`);
       }
     }
+    if (step.kind === "intervention" && prFlow) {
+      errors.push(`${where}: pull request flows cannot contain intervention steps`);
+    }
     const refFields: [string, string][] =
       step.kind === "git_commit"
         ? [["messageFrom", step.messageFrom]]
@@ -373,4 +389,42 @@ export function validateFlow(input: unknown): ValidateResult {
   });
 
   return errors.length ? { ok: false, errors } : { ok: true, flow };
+}
+
+export type InterventionAction = z.infer<typeof InterventionAction>;
+export const InterventionAction = z.enum(["continue", "cancel"]);
+
+export type InterventionStepsResult = { ok: true; steps: Step[] } | { ok: false; errors: string[] };
+
+const INJECTED_STEP_KINDS: StepKind[] = ["prompt", "slash", "command"];
+const MAX_INJECTED_STEPS = 10;
+
+/**
+ * Validates steps a user adds at an intervention step: only prompt/slash/command, at most
+ * {@link MAX_INJECTED_STEPS}, ids unique across the whole flow, and — validated on the flow
+ * prefix up to and including the intervention — template references may only point at inputs,
+ * earlier steps, or the intervention's own output.
+ */
+export function validateInterventionSteps(def: FlowDefinition, interventionId: string, added: unknown): InterventionStepsResult {
+  const parsed = z.array(Step).safeParse(added);
+  if (!parsed.success) {
+    return { ok: false, errors: parsed.error.issues.map((i) => (i.path.length ? `${i.path.join(".")}: ${i.message}` : i.message)) };
+  }
+  const steps = parsed.data;
+  const errors: string[] = [];
+  if (steps.length > MAX_INJECTED_STEPS) errors.push(`too many steps: at most ${MAX_INJECTED_STEPS} steps can be added at an intervention`);
+  const known = new Set(def.steps.map((s) => s.id));
+  for (const step of steps) {
+    if (!INJECTED_STEP_KINDS.includes(step.kind)) errors.push(`steps.${step.id}: kind "${step.kind}" cannot be added at an intervention`);
+    if (known.has(step.id)) errors.push(`steps.${step.id}: duplicate step id "${step.id}"`);
+    known.add(step.id);
+  }
+  if (errors.length) return { ok: false, errors };
+
+  const at = def.steps.findIndex((s) => s.id === interventionId);
+  if (at < 0) return { ok: false, errors: [`no intervention step "${interventionId}" in this flow`] };
+  const prefix = def.steps.slice(0, at + 1);
+  const check = validateFlow({ ...def, steps: [...prefix, ...steps] });
+  if (!check.ok) return { ok: false, errors: check.errors };
+  return { ok: true, steps };
 }

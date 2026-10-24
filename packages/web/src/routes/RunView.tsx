@@ -1,9 +1,10 @@
-import { isAgentStep, TERMINAL_STATUSES, type WorkspaceInfo } from "@orch/protocol";
+import { isAgentStep, TERMINAL_STATUSES, type WorkspaceInfo, templateVariables } from "@orch/protocol";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import { api, errorMessage } from "../api";
 import { ElicitationDialog } from "../components/ElicitationDialog";
+import { InterventionDialog } from "../components/InterventionDialog";
 import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
@@ -60,6 +61,8 @@ function RunViewInner({ runId }: { runId: string }) {
   const findings = state.lastSeq > 0 ? state.findings : detail.data!.findings;
   const permission = state.permissions.find((p) => !p.resolved && !submitted.has(p.requestId));
   const elicitation = state.elicitations.find((e) => !e.resolved && !submitted.has(e.requestId));
+  const intervention = state.interventions.find((i) => !i.resolved && !submitted.has(i.requestId));
+  const [interventionOpen, setInterventionOpen] = useState(true);
   const markSubmitted = (requestId: string) => setSubmitted(new Set([...submitted, requestId]));
   const logs = state.logs.filter((l) => (l.stepId ?? null) === selectedId || l.stepId === undefined);
   const runLevel = state.steps[""];
@@ -146,6 +149,11 @@ function RunViewInner({ runId }: { runId: string }) {
           )}
         </div>
         {error && <p className="error">{error}</p>}
+        {intervention && !interventionOpen && (
+          <button type="button" className="btn primary" onClick={() => setInterventionOpen(true)}>
+            ⏸ Waiting for your review — step {intervention.stepId ?? "(unknown)"}
+          </button>
+        )}
         {cancel.error && <p className="error">{errorMessage(cancel.error)}</p>}
         {approve.error && <p className="error">{errorMessage(approve.error)}</p>}
         {findings.length > 0 && (
@@ -252,7 +260,19 @@ function RunViewInner({ runId }: { runId: string }) {
         </div>
       </div>
 
-      {permission ? (
+      {intervention && interventionOpen ? (
+        <InterventionDialog
+          key={intervention.requestId}
+          runId={runId}
+          request={intervention}
+          variables={templateVariables(run.definition, Math.max(0, steps.findIndex((s) => s.id === intervention.stepId)))}
+          onClose={() => setInterventionOpen(false)}
+          onSubmitted={(id) => {
+            markSubmitted(id);
+            void detail.refetch();
+          }}
+        />
+      ) : permission ? (
         <PermissionDialog key={permission.requestId} runId={runId} request={permission} onSubmitted={markSubmitted} />
       ) : (
         elicitation && (

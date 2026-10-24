@@ -1,4 +1,4 @@
-import { ElicitationAction, type GitHubIssueInput, type InputDef, type RunDetail } from "@orch/protocol";
+import { ElicitationAction, InterventionAction, type GitHubIssueInput, type InputDef, type RunDetail, type Step, validateInterventionSteps } from "@orch/protocol";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ulid } from "ulid";
@@ -16,6 +16,12 @@ const { flows, runs, runSteps, findings } = schema;
 const CreateRunBody = z.object({ inputs: z.record(z.string(), z.string()).default({}) });
 const PermissionBody = z.object({ optionId: z.string().min(1).nullable() });
 const ElicitationBody = z.object({ action: ElicitationAction, content: z.record(z.string(), z.unknown()).optional() });
+const InterventionBody = z.object({
+  stepId: z.string().min(1),
+  action: InterventionAction,
+  feedback: z.string().optional(),
+  steps: z.array(z.unknown()).optional(),
+});
 
 export type InputResolution =
   | { ok: true; inputs: Record<string, unknown> }
@@ -208,6 +214,36 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       requestId,
       action,
       ...(content === undefined ? {} : { content }),
+    });
+    return c.json({ ok: true });
+  });
+
+  /** Answers an intervention gate; added steps are validated here so the runner only sees sound flows. */
+  app.post("/:id/interventions/:requestId", async (c) => {
+    const { id, requestId } = c.req.param();
+    const body = await readJson(c);
+    if (!body.ok) return body.response;
+    const parsed = InterventionBody.safeParse(body.value);
+    if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
+    const h = holder(id);
+    if ("error" in h) return c.json({ error: h.error }, h.status);
+    const run = deps.runs.get(id)!;
+    const step = run.definition.steps.find((s) => s.id === parsed.data.stepId);
+    if (step?.kind !== "intervention") return c.json({ error: `Step "${parsed.data.stepId}" is not an intervention step` }, 400);
+    const { action, steps, feedback } = parsed.data;
+    let relayed: Step[] | undefined;
+    if (action === "continue" && steps !== undefined) {
+      const validated = validateInterventionSteps(run.definition, parsed.data.stepId, steps);
+      if (!validated.ok) return c.json({ errors: validated.errors }, 400);
+      relayed = validated.steps;
+    }
+    hub.sendToRunner(h.runnerId, {
+      t: "intervention.respond",
+      runId: id,
+      requestId,
+      action,
+      ...(relayed === undefined ? {} : { steps: relayed }),
+      ...(feedback === undefined ? {} : { feedback }),
     });
     return c.json({ ok: true });
   });

@@ -67,6 +67,13 @@ export interface ElicitationView {
   resolved: boolean;
 }
 
+export interface InterventionView {
+  requestId: string;
+  stepId?: string;
+  message: string;
+  resolved: boolean;
+}
+
 export interface LogLine {
   seq: number;
   stepId?: string;
@@ -84,6 +91,7 @@ export interface RunViewState {
   findings: (Finding & { stepId?: string })[];
   permissions: PermissionView[];
   elicitations: ElicitationView[];
+  interventions: InterventionView[];
   logs: LogLine[];
 }
 
@@ -93,6 +101,7 @@ export const initialRunViewState: RunViewState = {
   findings: [],
   permissions: [],
   elicitations: [],
+  interventions: [],
   logs: [],
 };
 
@@ -225,6 +234,16 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
       return {
         ...s,
         elicitations: s.elicitations.map((e) => (e.requestId === ev.payload.requestId ? { ...e, resolved: true } : e)),
+      };
+    case "intervention.request":
+      return {
+        ...s,
+        interventions: [...s.interventions, { ...ev.payload, stepId: ev.stepId, resolved: false }],
+      };
+    case "intervention.resolved":
+      return {
+        ...s,
+        interventions: s.interventions.map((i) => (i.requestId === ev.payload.requestId ? { ...i, resolved: true } : i)),
       };
     case "sandbox.log":
       return { ...s, logs: [...s.logs, { seq: ev.seq, stepId: ev.stepId, ...ev.payload }] };

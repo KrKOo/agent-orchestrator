@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { schema } from "../src/db";
 import { authenticateRunner, RunnerSession } from "../src/ws/runner";
 import { eventsAfter } from "../src/ws/browser";
-import { addRun, addRunner, caps, FakeLink, testDeps } from "./helpers";
+import { addRun, addRunner, caps, FakeLink, flowDef, testDeps } from "./helpers";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -192,6 +192,29 @@ describe("RunnerSession", () => {
     await other.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "evil" } }));
     await session.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "/x" } }));
     expect(await pending).toEqual({ path: "/x" });
+  });
+
+  test("intervention.resolved splices added steps into runs.definition exactly once", async () => {
+    const { deps, session } = setup();
+    const definition = flowDef({
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "gate", name: "Gate", kind: "intervention", message: "review" },
+        { id: "tail", name: "Tail", kind: "prompt", prompt: "done" },
+      ],
+    });
+    const runId = addRun(deps, { status: "running", runnerId: "r1", definition });
+    const injected = { id: "extra", name: "Extra", kind: "prompt", prompt: "extra: {{steps.gate.output}}", freshSession: false, timeoutSec: 1800 };
+    const resolved = ev(runId, 1, "intervention.resolved", { requestId: "r1", action: "continue", steps: [injected] }, "gate");
+    await session.handle(JSON.stringify({ t: "job.events", runId, events: [resolved, resolved] }));
+
+    const steps = deps.runs.get(runId)!.definition.steps.map((s) => s.id);
+    expect(steps).toEqual(["impl", "gate", "extra", "tail"]);
+
+    // A later dynamic step.started projects at the injected step's index.
+    await session.handle(JSON.stringify({ t: "job.events", runId, events: [ev(runId, 2, "step.started", {}, "extra")] }));
+    const row = deps.db.select().from(schema.runSteps).where(eq(schema.runSteps.stepId, "extra")).get();
+    expect(row).toMatchObject({ idx: 2, status: "running" });
   });
 
   test("invalid frames are dropped without a reply", async () => {

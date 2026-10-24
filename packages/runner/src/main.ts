@@ -148,6 +148,9 @@ async function main(): Promise<void> {
       case "elicitation.respond":
         jobs.respondElicitation(msg.runId, msg.requestId, msg.action, msg.content);
         return;
+      case "intervention.respond":
+        jobs.respondIntervention(msg.runId, msg.requestId, msg);
+        return;
       case "rpc.call":
         fsList(msg.params.path, config.allowedRoots).then(
           (result) => send({ t: "rpc.result", rpcId: msg.rpcId, ok: true, result }),

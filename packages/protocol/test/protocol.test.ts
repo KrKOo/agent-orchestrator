@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { type FlowDefinition, renderTemplate, TemplateError, templateRefs, templateVariables, validateFlow } from "../src";
+import {
+  type FlowDefinition,
+  isActionStep,
+  isAgentStep,
+  renderTemplate,
+  TemplateError,
+  templateRefs,
+  templateVariables,
+  validateFlow,
+  validateInterventionSteps,
+} from "../src";
 
 const ctx = {
   inputs: { issue: { url: "u", repo: "o/r", number: 7, title: "Fix it", body: "Body" }, note: "hello" },
@@ -162,6 +172,110 @@ describe("validateFlow", () => {
     expect(bad.errors.some((e) => e.includes("modelRoles.default: set harness.model instead"))).toBe(true);
     expect(bad.errors.some((e) => e.includes("modelRoles.smol: set harness.smolModel instead"))).toBe(true);
     expect(bad.errors.some((e) => e.includes("modelRoles.bad key: role must match"))).toBe(true);
+  });
+
+  test("accepts an intervention step with an optional timeout and templated message", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "Implement {{inputs.issue.title}}" },
+        { id: "gate", name: "Review", kind: "intervention", message: "Check {{steps.impl.output}} before continuing" },
+        { id: "after", name: "After", kind: "prompt", prompt: "{{steps.gate.output}}" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const gate = res.flow.steps[1];
+    expect(gate).toMatchObject({ kind: "intervention", message: "Check {{steps.impl.output}} before continuing" });
+    expect(gate!.timeoutSec).toBeUndefined();
+
+    const withTimeout = validateFlow({
+      ...baseFlow,
+      steps: [{ id: "gate", name: "Gate", kind: "intervention", message: "ok?", timeoutSec: 600 }],
+    });
+    if (!withTimeout.ok) throw new Error(withTimeout.errors.join("\n"));
+    expect(withTimeout.flow.steps[0]!.timeoutSec).toBe(600);
+
+    // message templates cannot reference later steps
+    const fwd = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gate", name: "Gate", kind: "intervention", message: "{{steps.after.output}}" },
+        { id: "after", name: "After", kind: "prompt", prompt: "x" },
+      ],
+    });
+    expect(fwd.ok).toBe(false);
+  });
+});
+
+describe("intervention steps", () => {
+  test("is not an action step", () => {
+    const step = { id: "gate", name: "Gate", kind: "intervention" };
+    expect(isActionStep(step as never)).toBe(false);
+    expect(isAgentStep(step as never)).toBe(false);
+  });
+
+  test("validateInterventionSteps accepts prompt/slash/command referencing the gate and earlier steps", () => {
+    const flow = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "gate", name: "Gate", kind: "intervention", message: "ok?" },
+      ],
+    });
+    if (!flow.ok) throw new Error(flow.errors.join("\n"));
+    const res = validateInterventionSteps(flow.flow, "gate", [
+      { id: "fix", name: "Fix", kind: "prompt", prompt: "Fix per {{steps.gate.output}} and {{steps.impl.structured}}" },
+      { id: "rv", name: "Review", kind: "slash", command: "review", args: "about {{steps.gate.output}}" },
+    ]);
+    expect(res.ok).toBe(true);
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.steps.map((s) => s.id)).toEqual(["fix", "rv"]);
+  });
+
+  test("validateInterventionSteps rejects action/skill/intervention kinds, duplicate ids, forward refs and >10", () => {
+    const flow = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "gate", name: "Gate", kind: "intervention", message: "ok?" },
+        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
+      ],
+    });
+    if (!flow.ok) throw new Error(flow.errors.join("\n"));
+
+    const kinds = validateInterventionSteps(flow.flow, "gate", [
+      { id: "a", name: "A", kind: "git_push" },
+      { id: "b", name: "B", kind: "skill", skill: "x" },
+      { id: "c", name: "C", kind: "intervention" },
+    ]);
+    expect(kinds.ok).toBe(false);
+    if (!kinds.ok) expect(kinds.errors.filter((e) => e.includes("cannot be added")).length).toBe(3);
+
+    const dup = validateInterventionSteps(flow.flow, "gate", [{ id: "impl", name: "Dup", kind: "prompt", prompt: "x" }]);
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.errors.join()).toContain('duplicate step id "impl"');
+
+    const laterDup = validateInterventionSteps(flow.flow, "gate", [{ id: "later", name: "Dup", kind: "prompt", prompt: "x" }]);
+    expect(laterDup.ok).toBe(false);
+
+    const fwd = validateInterventionSteps(flow.flow, "gate", [
+      { id: "a", name: "A", kind: "prompt", prompt: "{{steps.later.output}}" },
+    ]);
+    expect(fwd.ok).toBe(false);
+
+    const many = Array.from({ length: 11 }, (_, i) => ({ id: `s${i}`, name: `S${i}`, kind: "prompt", prompt: "x" }));
+    const tooMany = validateInterventionSteps(flow.flow, "gate", many);
+    expect(tooMany.ok).toBe(false);
+    if (!tooMany.ok) expect(tooMany.errors.join()).toContain("at most 10");
+  });
+
+  test("validateFlow rejects intervention steps in pull request flows", () => {
+    const res = validateFlow({
+      ...prFlow,
+      steps: [...prFlow.steps, { id: "gate", name: "Gate", kind: "intervention", message: "ok?" }],
+    });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.errors.join()).toContain("cannot contain intervention steps");
   });
 });
 

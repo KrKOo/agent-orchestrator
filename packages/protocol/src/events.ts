@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { InterventionAction, Step } from "./flow";
 
 export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running", "succeeded", "failed", "cancelled"] as const;
 export const RunStatus = z.enum(RUN_STATUSES);
@@ -87,6 +88,21 @@ export const RunEvent = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("acp.elicitation_resolved"),
     payload: z.object({ requestId: z.string(), action: z.enum(["accept", "decline", "cancel"]) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("intervention.request"),
+    payload: z.object({ requestId: z.string(), message: z.string() }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("intervention.resolved"),
+    payload: z.object({
+      requestId: z.string(),
+      action: InterventionAction,
+      /** Steps the user added at the gate; present only on a successful continue. Persisted and projected into `runs.definition`. */
+      steps: z.array(Step).optional(),
+    }),
   }),
   z.object({
     ...base,

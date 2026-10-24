@@ -6,9 +6,10 @@ import {
   type AssignedRun,
   type CreatePullRequestParams,
   type CreatePullRequestResult,
-  type ElicitationAction,
+  ElicitationAction,
   type GitHubTokenParams,
   type GitHubTokenResult,
+  InterventionAction,
   type RunEventDraft,
   type RunnerMessage,
   REPO_RE,
@@ -19,6 +20,7 @@ import {
   isAgentStep,
   renderTemplate,
   validateFlow,
+  validateInterventionSteps,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import { AcpHarness } from "./acp-session";
@@ -63,18 +65,26 @@ type StepOutcome = {
   output?: string;
   structured?: unknown;
   error?: string;
+  /** User-added steps an intervention gate spliced into the queue after itself. */
+  addedSteps?: Step[];
 };
 
-type Answer = { optionId: string | null } | { action: ElicitationAction; content?: Record<string, unknown> };
+type Answer =
+  | { optionId: string | null }
+  | { action: ElicitationAction; content?: Record<string, unknown> }
+  | { action: InterventionAction; steps?: Step[]; feedback?: string };
 
-/** Pending permission / elicitation requests of one run, answered by server messages. */
+/** Pending permission / elicitation / intervention requests of one run, answered by server messages. */
 export class PendingRequests {
   private readonly waiters = new Map<string, (answer: Answer | null) => void>();
 
-  /** Resolves with the answer, or null on timeout / cancellation. */
-  wait(requestId: string, timeoutMs = ANSWER_TIMEOUT_MS): Promise<Answer | null> {
+  /**
+   * Resolves with the answer, or null on timeout / cancellation. A `undefined` timeout waits
+   * indefinitely (intervention gates); the default caps permission/elicitation answers at 30 min.
+   */
+  wait(requestId: string, timeoutMs: number | undefined = ANSWER_TIMEOUT_MS): Promise<Answer | null> {
     const { promise, resolve } = Promise.withResolvers<Answer | null>();
-    const timer = setTimeout(() => this.settle(requestId, null), timeoutMs);
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => this.settle(requestId, null), timeoutMs);
     this.waiters.set(requestId, (answer) => {
       clearTimeout(timer);
       resolve(answer);
@@ -252,9 +262,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const stepId = currentStepId;
     emit({ type: "acp.elicitation_request", payload: { requestId, message: req.message, requestedSchema: req.requestedSchema } }, stepId);
     const answer = await pending.wait(requestId);
-    const action: ElicitationAction = answer && "action" in answer ? answer.action : "cancel";
+    const action: ElicitationAction = answer && "action" in answer && "content" in answer ? answer.action : "cancel";
     emit({ type: "acp.elicitation_resolved", payload: { requestId, action } }, stepId);
-    if (action === "accept" && answer && "action" in answer) return { action, content: elicitationContent(answer.content) ?? {} };
+    if (action === "accept" && answer && "action" in answer && "content" in answer) return { action, content: elicitationContent(answer.content) ?? {} };
     return { action };
   };
 
@@ -321,6 +331,31 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   };
 
   /**
+   * Pauses the run and asks the user (via the server) to continue. Feedback becomes the step
+   * output; added steps are validated against the queue prefix and spliced in by the caller.
+   */
+  const runInterventionStep = async (step: Extract<Step, { kind: "intervention" }>): Promise<StepOutcome> => {
+    const requestId = ulid();
+    emit({ type: "intervention.request", payload: { requestId, message: step.message ? renderTemplate(step.message, ctx) : "" } }, step.id);
+    const answer = await pending.wait(requestId, step.timeoutSec === undefined ? undefined : step.timeoutSec * 1000);
+    if (!answer || !("action" in answer) || answer.action === "cancel") {
+      emit({ type: "intervention.resolved", payload: { requestId, action: "cancel" } }, step.id);
+      return { status: "cancelled" };
+    }
+    const { steps, feedback } = answer as { action: InterventionAction; steps?: Step[]; feedback?: string };
+    if (!steps?.length) {
+      emit({ type: "intervention.resolved", payload: { requestId, action: "continue" } }, step.id);
+      return { status: "succeeded", output: feedback ?? "" };
+    }
+    const validated = validateInterventionSteps(def, step.id, steps);
+    if (!validated.ok) {
+      return { status: "failed", error: `Invalid added steps: ${validated.errors.join("; ")}` };
+    }
+    emit({ type: "intervention.resolved", payload: { requestId, action: "continue", steps: validated.steps } }, step.id);
+    return { status: "succeeded", output: feedback ?? "", addedSteps: validated.steps };
+  };
+
+  /**
    * Runs one omp slash command headless (`omp -p "/cmd args"`) inside the sandbox. omp expands the
    * command, runs the resulting prompt through the model (routed via the gateway), and prints the
    * final answer on stdout; that becomes the step output.
@@ -352,7 +387,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     }
   };
 
-  const runActionStep = async (step: Exclude<Step, AgentStep | { kind: "slash" }>, abort: AbortSignal): Promise<StepOutcome> => {
+  const runActionStep = async (step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "intervention" }>, abort: AbortSignal): Promise<StepOutcome> => {
     const ws = workspace!;
     if (step.kind === "git_commit") {
       const message = plainText(ctx.steps[step.messageFrom]?.output ?? "");
@@ -387,14 +422,16 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     return { status: "succeeded", output: pr.url };
   };
 
-  const runStep = async (step: Step): Promise<StepOutcome> => {
+  const runStep = async (step: Step, ensureHarness: () => Promise<AcpHarness>): Promise<StepOutcome> => {
     const abort = new AbortController();
     stepAbort = abort;
     let timedOut = false;
-    const timer = setTimeout(() => {
+    // Interventions may wait indefinitely; other step kinds always have a timeout.
+    const timeoutMs: number | undefined = step.kind === "intervention" ? (step.timeoutSec === undefined ? undefined : step.timeoutSec * 1000) : step.timeoutSec * 1000;
+    const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
       timedOut = true;
       abort.abort();
-    }, step.timeoutSec * 1000);
+    }, timeoutMs);
     if (signal.aborted) abort.abort();
     const interrupted = (output?: string): StepOutcome =>
       timedOut && !signal.aborted
@@ -405,7 +442,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         ? await runAgentStep(step, abort.signal)
         : step.kind === "slash"
           ? await runSlashStep(step, abort.signal)
-          : await runActionStep(step, abort.signal);
+          : step.kind === "intervention"
+            ? await runInterventionStep(step)
+            : await runActionStep(step, abort.signal);
+      if (step.kind === "intervention" && outcome.status === "succeeded" && outcome.addedSteps) {
+        // The gate's harness must exist before any injected prompt step runs.
+        if (outcome.addedSteps.some(isAgentStep)) await ensureHarness();
+      }
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };
@@ -474,27 +517,35 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       tail.start();
       const mcp = deps.mcp.registerRun(runId, sink);
       mcpRegistered = true;
+      // Created lazily: flows with no static agent steps still get one when a user adds prompts at an intervention.
+      const ensureHarness = async (): Promise<AcpHarness> => {
+        if (!harness) {
+          harness = new AcpHarness({
+            approval: def.approval,
+            mcpServer: { type: "http", name: "orchestrator", url: mcp.url, headers: [{ name: "Authorization", value: `Bearer ${mcp.secret}` }] },
+            onPermission,
+            onElicitation,
+            onLog: (stream, text) => emit({ type: "sandbox.log", payload: { stream, text } }, currentStepId),
+          });
+          await rejectWhenAborted(harness.start(sandbox!, adapter.acpArgv(run), workspace!.hostPath), signal);
+          await rejectWhenAborted(harness.newSession(), signal);
+        }
+        return harness;
+      };
       // Slash-only flows never prompt the ACP harness; `omp -p` runs handle them inside the sandbox.
-      if (def.steps.some(isAgentStep)) {
-        harness = new AcpHarness({
-          approval: def.approval,
-          mcpServer: { type: "http", name: "orchestrator", url: mcp.url, headers: [{ name: "Authorization", value: `Bearer ${mcp.secret}` }] },
-          onPermission,
-          onElicitation,
-          onLog: (stream, text) => emit({ type: "sandbox.log", payload: { stream, text } }, currentStepId),
-        });
-        await rejectWhenAborted(harness.start(sandbox, adapter.acpArgv(run), workspace.hostPath), signal);
-        await rejectWhenAborted(harness.newSession(), signal);
-      }
+      if (def.steps.some(isAgentStep)) await ensureHarness();
 
-      for (const step of def.steps) {
+      // Index-based queue: a successful intervention step can splice added steps in at its position.
+      const queue: Step[] = [...def.steps];
+      for (let qi = 0; qi < queue.length; qi++) {
+        const step = queue[qi]!;
         if (signal.aborted) {
           status = "cancelled";
           break;
         }
         currentStepId = step.id;
         emit({ type: "step.started", payload: {} }, step.id);
-        const outcome = await runStep(step);
+        const outcome = await runStep(step, ensureHarness);
         ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
         emit({ type: "step.finished", payload: outcome }, step.id);
         if (outcome.status !== "succeeded") {
@@ -502,6 +553,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           error = outcome.error;
           break;
         }
+        if (outcome.addedSteps?.length) queue.splice(qi + 1, 0, ...outcome.addedSteps);
       }
     } catch (err) {
       status = signal.aborted ? "cancelled" : "failed";
@@ -517,7 +569,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   } finally {
     signal.removeEventListener("abort", onCancel);
     pending.cancelAll();
-    await harness?.close().catch(() => {});
+    await (harness as AcpHarness | null)?.close().catch(() => {});
     await sandbox?.destroy().catch((err) => console.error(`[job ${runId}] sandbox destroy: ${errorText(err)}`));
     if (mcpRegistered) deps.mcp.unregisterRun(runId);
     if (def.workspace.kind === "github_checkout") {
@@ -564,6 +616,14 @@ export class JobManager {
 
   respondElicitation(runId: string, requestId: string, action: ElicitationAction, content?: Record<string, unknown>): void {
     this.jobs.get(runId)?.pending.settle(requestId, { action, ...(content ? { content } : {}) });
+  }
+
+  respondIntervention(runId: string, requestId: string, msg: { action: InterventionAction; steps?: Step[]; feedback?: string }): void {
+    this.jobs.get(runId)?.pending.settle(requestId, {
+      action: msg.action,
+      ...(msg.steps !== undefined ? { steps: msg.steps } : {}),
+      ...(msg.feedback !== undefined ? { feedback: msg.feedback } : {}),
+    });
   }
 
   activeCount(): number {
