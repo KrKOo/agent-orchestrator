@@ -1,4 +1,4 @@
-import type { Catalog, CatalogItem, CreateRunnerTokenResponse, FsListResult, RunnerRow } from "@orch/protocol";
+import type { Catalog, CatalogItem, CreateRunnerTokenResponse, FsListResult, ModelEntry, RunnerRow } from "@orch/protocol";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { randomBytes } from "node:crypto";
@@ -48,7 +48,7 @@ function runnerRows(deps: AppDeps): RunnerRow[] {
   }));
 }
 
-/** Skills/commands advertised by online runners, merged by name and tagged with the runners offering them. */
+/** Skills/commands/models advertised by online runners, merged by name/id and tagged with the runners offering them. */
 export function buildCatalog(rows: RunnerRow[]): Catalog {
   const merge = (pick: (r: RunnerRow) => { name: string; description: string }[]): CatalogItem[] => {
     const byName = new Map<string, CatalogItem>();
@@ -62,9 +62,16 @@ export function buildCatalog(rows: RunnerRow[]): Catalog {
     }
     return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
   };
+  const models = new Map<string, ModelEntry>();
+  // rows arrive ordered by runner id (scheduler.runnerStates sorts by runners.id), so first-writer-wins is deterministic.
+  for (const r of rows) {
+    if (!r.online) continue;
+    for (const m of r.capabilities?.models ?? []) if (!models.has(m.id)) models.set(m.id, m);
+  }
   return {
     skills: merge((r) => r.capabilities?.skills ?? []),
     commands: merge((r) => r.capabilities?.commands ?? []),
+    models: [...models.values()].sort((a, b) => a.id.localeCompare(b.id)),
   };
 }
 

@@ -26,7 +26,7 @@ import type { RunnerConfig } from "./config";
 import type { RunnerRpcMethod } from "./connection";
 import type { Gateway } from "./gateway";
 import { commitAll, pushBranch } from "./git";
-import { harnesses } from "./harness/omp";
+import { harnessRoleModels, harnesses } from "./harness/omp";
 import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
@@ -396,9 +396,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
       const sessionsDir = join(runDir, "sessions");
       await mkdir(sessionsDir, { recursive: true });
-      const { model, smolModel } = def.harness;
-      const fallback = [model, smolModel].flatMap((m) => (m ? (modelProvider(m) ?? []) : []));
-      const providers = await deps.gateway.listGatewayProviders([...new Set(fallback)]);
+      const roles = harnessRoleModels(def.harness);
+      const fallback = [...new Set([...roles.values()].map((m) => modelProvider(m)).filter((p): p is string => p !== null))];
+      const providers = await deps.gateway.listGatewayProviders(fallback);
       const skillMounts: Mount[] = [];
       for (const step of def.steps) {
         if (step.kind !== "skill") continue;

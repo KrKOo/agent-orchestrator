@@ -1,4 +1,4 @@
-import { WIRE_PROTOCOL, type RunnerMessage, type ServerMessage } from "@orch/protocol";
+import { WIRE_PROTOCOL, type ModelEntry, type RunnerMessage, type ServerMessage } from "@orch/protocol";
 import { join } from "node:path";
 import pkg from "../package.json";
 import { loadConfig, type RunnerConfig } from "./config";
@@ -102,8 +102,12 @@ async function main(): Promise<void> {
     },
   });
 
-  const sendHello = () => {
+  // JSON of the model list last advertised in hello, to avoid re-sending unchanged capabilities.
+  let lastModelsFingerprint = JSON.stringify([]);
+  const sendHello = async () => {
     const { skills, commands } = library.catalog();
+    const models = await gateway.listGatewayModels([]);
+    lastModelsFingerprint = JSON.stringify(models);
     send({
       t: "hello",
       protocol: WIRE_PROTOCOL,
@@ -114,6 +118,7 @@ async function main(): Promise<void> {
         maxConcurrentJobs: config.maxConcurrentJobs,
         allowedRoots: config.allowedRoots,
         harnesses: [{ id: "omp", version: harnessVersion }],
+        models,
         sandboxProviders: ["docker"],
         acceptUntrusted: config.acceptUntrusted,
         skills,
@@ -159,7 +164,7 @@ async function main(): Promise<void> {
     token: config.token,
     onOpen: async () => {
       await library.scan();
-      sendHello();
+      await sendHello();
     },
     onMessage,
   });
@@ -169,12 +174,18 @@ async function main(): Promise<void> {
 
   const rescan = setInterval(async () => {
     try {
-      if ((await library.scan()) && conn?.connected) {
-        console.log("[main] skill/command catalog changed; re-sending hello");
-        sendHello();
+      const changed = await library.scan();
+      // The gateway's model list can change (credentials landing in the broker, models added or removed);
+      // re-send hello when it differs from what the server currently holds.
+      const models = await gateway.listGatewayModels([]);
+      const fingerprint = JSON.stringify(models);
+      if (conn?.connected && (changed || fingerprint !== lastModelsFingerprint)) {
+        console.log("[main] runner capabilities changed; re-sending hello");
+        await sendHello();
+        lastModelsFingerprint = fingerprint;
       }
     } catch (err) {
-      console.error(`[main] library rescan failed: ${(err as Error).message}`);
+      console.error(`[main] capability rescan failed: ${(err as Error).message}`);
     }
   }, LIBRARY_RESCAN_MS);
 

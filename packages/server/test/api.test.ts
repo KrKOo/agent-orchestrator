@@ -183,8 +183,23 @@ describe("runners API", () => {
 
   test("runner list and catalog only merge online runners", async () => {
     const deps = testDeps();
-    connectRunner(deps, "r1", caps({ labels: ["mac"], skills: [{ name: "review", description: "Review code" }] }), { labels: ["laptop"] });
-    connectRunner(deps, "r2", caps({ skills: [{ name: "review", description: "other" }, { name: "sec", description: "Security" }] }));
+    connectRunner(
+      deps,
+      "r1",
+      caps({ labels: ["mac"], models: [{ id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5" }], skills: [{ name: "review", description: "Review code" }] }),
+      { labels: ["laptop"] },
+    );
+    connectRunner(
+      deps,
+      "r2",
+      caps({
+        models: [
+          { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+          { id: "litellm/glm-5.3", name: "GLM 5.3" },
+        ],
+        skills: [{ name: "review", description: "other" }, { name: "sec", description: "Security" }],
+      }),
+    );
     connectRunner(deps, "r3", caps({ commands: [{ name: "stale", description: "" }] }), { lastSeenAt: 0 });
     addRun(deps, { status: "running", runnerId: "r1" });
     const call = client(deps);
@@ -204,6 +219,10 @@ describe("runners API", () => {
         { name: "sec", description: "Security", runnerIds: ["r2"] },
       ],
       commands: [],
+      models: [
+        { id: "anthropic/claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+        { id: "litellm/glm-5.3", name: "GLM 5.3" },
+      ],
     });
   });
 

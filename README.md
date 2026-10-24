@@ -39,6 +39,9 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
 - Per run: `--internal` Docker network; the only route out is a per-run squid proxy (`gateway_only` | `allowlist` | `open`).
 - Run container: `--cap-drop ALL`, `no-new-privileges`, host uid, tmpfs HOME. `.git/hooks` and `.git/config` are mounted read-only over the repo.
 - Model access goes through the host `omp auth-gateway`; the gateway bearer is the only secret in the sandbox.
+- Flow models are picked from the gateway's model list (`/api/catalog`, advertised by online runners) in the
+  flow editor; `harness.modelRoles` maps extra omp roles (`slow`, `plan`, `task`, …) to models, with `smol`
+  (`smolModel`) and unset roles falling back to `model`.
 - git commit/push run on the host. GitHub API calls run on the server. The agent never holds GitHub credentials.
 
 ## Public control plane (M2)

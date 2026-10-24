@@ -2,7 +2,7 @@
 // Timestamps are epoch milliseconds.
 import type { Finding, RunStatus, StepStatus } from "./events";
 import type { FlowDefinition } from "./flow";
-import type { CatalogEntry, RunnerCapabilities } from "./wire";
+import type { CatalogEntry, ModelEntry, RunnerCapabilities } from "./wire";
 
 export interface FlowRow {
   id: string;
@@ -82,6 +82,8 @@ export interface CatalogItem extends CatalogEntry {
 export interface Catalog {
   skills: CatalogItem[];
   commands: CatalogItem[];
+  /** Gateway models of online runners, merged by id. */
+  models: ModelEntry[];
 }
 
 /** Error body: `{error}` for single failures, `{errors}` for validation failures. */

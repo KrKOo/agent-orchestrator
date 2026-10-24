@@ -55,10 +55,30 @@ export type SandboxSpec = z.infer<typeof SandboxSpec>;
 export const HarnessSpec = z.object({
   /** Harness adapter id ("omp"); the runner rejects ids it has no adapter for. */
   id: z.string().min(1),
+  /** Model for the `default` role: the main agent loop. */
   model: z.string().min(1),
+  /** Model for the `smol` role (lightweight tasks and subagents); defaults to `model`. */
   smolModel: z.string().min(1).optional(),
+  /** Further harness model roles (e.g. `slow`, `plan`, `task`); unset roles fall back to `model`. */
+  modelRoles: z.record(z.string(), z.string().min(1)).optional(),
 });
 export type HarnessSpec = z.infer<typeof HarnessSpec>;
+
+/**
+ * Known omp chat model roles (checked against omp 18.10.3). `default`/`smol` have their own
+ * `HarnessSpec` fields so they are excluded; anything off this list is still valid — omp
+ * silently ignores unknown roles in `modelRoles`.
+ */
+export const MODEL_ROLE_LABELS: Record<string, string> = {
+  slow: "Slow · thorough analysis",
+  vision: "Vision · image understanding",
+  plan: "Plan · architect/plan mode",
+  commit: "Commit · commit message drafting",
+  tiny: "Tiny · tiny helper",
+  memory: "Memory · memory tools",
+  task: "Task · subagent default",
+  advisor: "Advisor · passive review",
+};
 
 export const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 export const PR_EVENTS = ["opened", "synchronize", "reopened", "ready_for_review"] as const;
@@ -285,6 +305,12 @@ export function validateFlow(input: unknown): ValidateResult {
   for (const def of flow.inputs) {
     if (inputs.has(def.key)) errors.push(`inputs: duplicate input key "${def.key}"`);
     inputs.set(def.key, def);
+  }
+
+  for (const [role, model] of Object.entries(flow.harness.modelRoles ?? {})) {
+    if (role === "default") errors.push(`harness.modelRoles.default: set harness.model instead`);
+    else if (role === "smol") errors.push(`harness.modelRoles.smol: set harness.smolModel instead`);
+    else if (!ID_RE.test(role)) errors.push(`harness.modelRoles.${role}: role must match /^[a-z][a-z0-9_]*$/`);
   }
 
   const prFlow = flow.trigger.kind === "github_pull_request";
