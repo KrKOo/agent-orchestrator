@@ -264,5 +264,18 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
 }
 
 export function applyRunEvents(state: RunViewState, events: RunEvent[]): RunViewState {
-  return events.reduce(applyRunEvent, state);
+  // Logs are independent of other state, so a batch (e.g. a replayed backlog with thousands of
+  // raw NDJSON lines) appends them in one copy instead of re-copying the array per line.
+  const logs: LogLine[] = [];
+  let next = state;
+  for (const ev of events) {
+    if (ev.seq <= next.lastSeq) continue;
+    if (ev.type === "sandbox.log") {
+      logs.push({ seq: ev.seq, stepId: ev.stepId, ...ev.payload });
+      next = { ...next, lastSeq: ev.seq };
+    } else {
+      next = applyRunEvent(next, ev);
+    }
+  }
+  return logs.length > 0 ? { ...next, logs: next.logs.concat(logs) } : next;
 }
