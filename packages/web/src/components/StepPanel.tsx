@@ -12,6 +12,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   prompt: "Prompt",
   skill: "Skill",
   command: "Command",
+  slash: "Slash command",
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
@@ -21,6 +22,7 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   prompt: "✎",
   skill: "★",
   command: "/",
+  slash: "⌘",
   git_commit: "●",
   git_push: "↑",
   github_pr: "⇄",
@@ -208,6 +210,30 @@ export function StepPanel({
       )}
       {step.kind === "skill" && catalogSelect("skill", step.skill)}
       {step.kind === "command" && catalogSelect("command", step.command)}
+      {step.kind === "slash" && (
+        <label className="field">
+          <span>Command</span>
+          <input
+            className="mono"
+            placeholder="review"
+            value={step.command}
+            onChange={(e) => set({ command: e.target.value })}
+          />
+          <small className="muted">
+            Runs <code>{`omp -p /${step.command || "<command>"}`}</code> headless in the sandbox — e.g. <code>review</code>,{" "}
+            <code>plan</code>, <code>init</code>.
+          </small>
+        </label>
+      )}
+      {step.kind === "slash" && (
+        <TemplateField
+          label="Arguments (optional)"
+          rows={3}
+          value={step.args ?? ""}
+          vars={vars}
+          onChange={(args) => set({ args: args === "" ? undefined : args })}
+        />
+      )}
       {(step.kind === "skill" || step.kind === "command") && (
         <TemplateField
           label="Arguments (optional)"

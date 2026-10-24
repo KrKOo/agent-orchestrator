@@ -9,6 +9,8 @@ export interface HarnessAdapter {
   /** Extra mounts; `runDir` is the host per-run dir (`<dataDir>/runs/<runId>`). */
   mounts(run: AssignedRun, runDir: string): Mount[];
   acpArgv(run: AssignedRun): string[];
+  /** Argv for a headless one-shot slash-command run (`omp -p`); `/orch/config` files and env are already in place. */
+  printArgv(): string[];
 }
 
 /** Provider prefix of a `provider/model` id, or null for ids without `/`. */

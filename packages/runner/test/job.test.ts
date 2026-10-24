@@ -21,6 +21,8 @@ import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/typ
 import { sinkToWritable } from "../src/sandbox/types";
 
 const FAKE_AGENT = join(import.meta.dir, "fixtures", "fake-agent.ts");
+/** Print-mode responder for slash steps: echoes the prompt text on stdout. */
+const FAKE_PRINT = join(import.meta.dir, "fixtures", "fake-print.ts");
 
 let root: string;
 let repo: string;
@@ -46,7 +48,18 @@ class FakeSandboxProvider implements SandboxProvider {
   async create(spec: CreateSandbox): Promise<Sandbox> {
     this.specs.push(spec);
     return {
-      exec: (_argv, cwd) => {
+      exec: (argv, cwd) => {
+        // `omp -p ...` (slash steps): run the fake print-mode responder instead of the ACP agent.
+        if (argv.includes("-p")) {
+          const proc = Bun.spawn(["bun", FAKE_PRINT, argv[argv.indexOf("--") + 1] ?? ""], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          return {
+            stdin: sinkToWritable(proc.stdin),
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+            exited: proc.exited,
+            kill: () => proc.kill(),
+          };
+        }
         const proc = Bun.spawn(["bun", FAKE_AGENT], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
         return {
           stdin: sinkToWritable(proc.stdin),
@@ -256,6 +269,44 @@ describe("runJob", () => {
         "",
       ].join("\n"),
     );
+  });
+
+  test("slash step runs omp -p with the command and templated args as output", async () => {
+    const provider = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(provider);
+    const run = assigned({
+      inputs: [{ key: "topic", label: "Topic", type: "text", required: true }],
+      steps: [{ kind: "slash", id: "review", name: "Review", command: "review", args: "focus on {{inputs.topic}}" }],
+    });
+    run.inputs.topic = "tea";
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const started = ofType(events, "step.started");
+    expect(started.map((e) => e.stepId)).toEqual(["review"]);
+    const finished = ofType(events, "step.finished");
+    expect(finished[0]!.payload.status).toBe("succeeded");
+    expect(finished[0]!.payload.output).toBe("print:/review focus on tea\n");
+    const logs = ofType(events, "sandbox.log").filter((e) => e.stepId === "review");
+    expect(logs.map((e) => e.payload.text).join("")).toBe("print:/review focus on tea\n");
+  });
+
+  test("slash step failure surfaces a non-zero exit as a failed step", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "slash", id: "broken", name: "Broken", command: "review", args: "make it fail" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({
+      t: "job.finished",
+      runId: run.runId,
+      status: "failed",
+      error: expect.stringContaining("exited with code 3"),
+    });
+    const finished = ofType(events, "step.finished");
+    expect(finished.map((e) => e.payload.status)).toEqual(["failed"]);
+    expect(finished[0]!.payload.error).toContain("exited with code 3");
   });
 
   test("command + git_commit commit agent changes in the worktree", async () => {

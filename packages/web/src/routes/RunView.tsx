@@ -230,7 +230,9 @@ function RunViewInner({ runId }: { runId: string }) {
             <p className="muted">{step.status === "pending" ? "Step has not started." : "Waiting for output…"}</p>
           )}
           <Transcript step={step} />
-          {selectedDef && <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef)} />}
+          {selectedDef && (
+            <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"} />
+          )}
           {runLevel && runLevel.items.length > 0 && (
             <Collapsible summary="Run-level updates" className="diagnostics">
               <Transcript step={runLevel} />

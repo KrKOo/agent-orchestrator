@@ -108,6 +108,11 @@ export const ompAdapter: HarnessAdapter = {
     // Verified on omp 18.10.3: flags after `acp` are honoured (`--config` overlay, `--session-dir`).
     return ["omp", "acp", "--config", "/orch/config/omp-config.yml", "--session-dir", OMP_SESSIONS_DIR];
   },
+
+  printArgv() {
+    // Headless one-shot: slash commands run their documented headless path (no mode chooser).
+    return ["omp", "-p", "--config", "/orch/config/omp-config.yml", "--session-dir", OMP_SESSIONS_DIR];
+  },
 };
 
 export const harnesses: Record<string, HarnessAdapter> = { omp: ompAdapter };

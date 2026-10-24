@@ -55,6 +55,8 @@ function newStep(kind: StepKind, id: string, earlier: Step[]): Step {
       return { ...base, kind, skill: "", freshSession: false };
     case "command":
       return { ...base, kind, command: "", freshSession: false };
+    case "slash":
+      return { ...base, kind, command: "" };
     case "git_commit":
       return { ...base, kind, messageFrom: lastAgent };
     case "git_push":
@@ -183,6 +185,8 @@ function stepSubtitle(step: Step): string {
       return step.skill || "(no skill chosen)";
     case "command":
       return step.command ? `/${step.command}` : "(no command chosen)";
+    case "slash":
+      return step.command ? `/${step.command} (headless)` : "(no command chosen)";
     case "git_commit":
       return `message from ${step.messageFrom || "?"}`;
     case "git_push":
@@ -490,6 +494,7 @@ const KIND_HELP: Record<StepKind, string> = {
   prompt: "Send a templated prompt to the agent",
   skill: "Apply a skill from the runner library",
   command: "Run a command template with arguments",
+  slash: "Run a built-in omp slash command (e.g. review, plan) headless",
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",

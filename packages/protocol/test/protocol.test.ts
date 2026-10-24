@@ -118,6 +118,31 @@ describe("validateFlow", () => {
     expect(res.ok).toBe(false);
   });
 
+  test("accepts a slash step with args templates and rejects bad command names", () => {
+    const ok = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "Implement {{inputs.issue.title}}" },
+        { id: "check", name: "Check", kind: "slash", command: "review", args: "focus on {{steps.impl.output}}" },
+      ],
+    });
+    if (!ok.ok) throw new Error(ok.errors.join("\n"));
+    expect(ok.flow.steps[1]!.kind).toBe("slash");
+
+    const bad = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "hi" },
+        { id: "s", name: "S", kind: "slash", command: "bad name" },
+        { id: "t", name: "T", kind: "slash", command: "" },
+        { id: "u", name: "U", kind: "slash", command: "with space" },
+      ],
+    });
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.errors.filter((e) => e.includes("command")).length).toBe(3);
+  });
+
   test("accepts extra harness model roles and rejects default/smol and malformed role keys", () => {
     const ok = validateFlow({
       ...baseFlow,

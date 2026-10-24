@@ -320,7 +320,39 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     }
   };
 
-  const runActionStep = async (step: Exclude<Step, AgentStep>, abort: AbortSignal): Promise<StepOutcome> => {
+  /**
+   * Runs one omp slash command headless (`omp -p "/cmd args"`) inside the sandbox. omp expands the
+   * command, runs the resulting prompt through the model (routed via the gateway), and prints the
+   * final answer on stdout; that becomes the step output.
+   */
+  const runSlashStep = async (step: Extract<Step, { kind: "slash" }>, abort: AbortSignal): Promise<StepOutcome> => {
+    const prompt = step.args && step.args.trim() ? `/${step.command} ${renderTemplate(step.args, ctx).trim()}` : `/${step.command}`;
+    // `--` stops omp flag parsing so args cannot inject launch flags; the text stays one argv element.
+    const proc = sandbox!.exec([...adapter.printArgv(), "--", prompt], workspace!.hostPath);
+    const drain = async (stream: ReadableStream<Uint8Array>, stream2: "stdout" | "stderr"): Promise<string> => {
+      const decoder = new TextDecoder();
+      let text = "";
+      for await (const chunk of stream) {
+        const part = decoder.decode(chunk, { stream: true });
+        text += part;
+        emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, step.id);
+      }
+      return text;
+    };
+    try {
+      const [stdout, stderr, exitCode] = await rejectWhenAborted(
+        Promise.all([drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"), proc.exited]),
+        abort,
+      );
+      if (abort.aborted) return { status: "cancelled", output: stdout };
+      if (exitCode !== 0) return { status: "failed", output: stdout, error: `omp -p exited with code ${exitCode}: ${stderr.trim().slice(-500)}` };
+      return { status: "succeeded", output: stdout };
+    } finally {
+      if (!abort.aborted) proc.kill();
+    }
+  };
+
+  const runActionStep = async (step: Exclude<Step, AgentStep | { kind: "slash" }>, abort: AbortSignal): Promise<StepOutcome> => {
     const ws = workspace!;
     if (step.kind === "git_commit") {
       const message = plainText(ctx.steps[step.messageFrom]?.output ?? "");
@@ -369,7 +401,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         ? { status: "failed", output, error: `Step timed out after ${step.timeoutSec}s` }
         : { status: "cancelled", output };
     try {
-      const outcome = isAgentStep(step) ? await runAgentStep(step, abort.signal) : await runActionStep(step, abort.signal);
+      const outcome = isAgentStep(step)
+        ? await runAgentStep(step, abort.signal)
+        : step.kind === "slash"
+          ? await runSlashStep(step, abort.signal)
+          : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };
@@ -438,15 +474,18 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       tail.start();
       const mcp = deps.mcp.registerRun(runId, sink);
       mcpRegistered = true;
-      harness = new AcpHarness({
-        approval: def.approval,
-        mcpServer: { type: "http", name: "orchestrator", url: mcp.url, headers: [{ name: "Authorization", value: `Bearer ${mcp.secret}` }] },
-        onPermission,
-        onElicitation,
-        onLog: (stream, text) => emit({ type: "sandbox.log", payload: { stream, text } }, currentStepId),
-      });
-      await rejectWhenAborted(harness.start(sandbox, adapter.acpArgv(run), workspace.hostPath), signal);
-      await rejectWhenAborted(harness.newSession(), signal);
+      // Slash-only flows never prompt the ACP harness; `omp -p` runs handle them inside the sandbox.
+      if (def.steps.some(isAgentStep)) {
+        harness = new AcpHarness({
+          approval: def.approval,
+          mcpServer: { type: "http", name: "orchestrator", url: mcp.url, headers: [{ name: "Authorization", value: `Bearer ${mcp.secret}` }] },
+          onPermission,
+          onElicitation,
+          onLog: (stream, text) => emit({ type: "sandbox.log", payload: { stream, text } }, currentStepId),
+        });
+        await rejectWhenAborted(harness.start(sandbox, adapter.acpArgv(run), workspace.hostPath), signal);
+        await rejectWhenAborted(harness.newSession(), signal);
+      }
 
       for (const step of def.steps) {
         if (signal.aborted) {

@@ -156,6 +156,15 @@ export const CommandStep = z.object({
   args: z.string().optional(),
   freshSession: z.boolean().default(false),
 });
+/** Built-in omp slash command (`/review`, `/plan`, …) run headless via `omp -p`; output is the step output. */
+export const SlashStep = z.object({
+  ...stepBase,
+  kind: z.literal("slash"),
+  command: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]*$/, "command must be a slash command name without leading / or whitespace"),
+  args: z.string().optional(),
+});
 export const GitCommitStep = z.object({
   ...stepBase,
   kind: z.literal("git_commit"),
@@ -174,12 +183,12 @@ export const GitHubPrStep = z.object({
   draft: z.boolean().default(false),
 });
 
-export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, GitCommitStep, GitPushStep, GitHubPrStep]);
+export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, SlashStep, GitCommitStep, GitPushStep, GitHubPrStep]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "git_commit", "git_push", "github_pr"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
@@ -218,6 +227,7 @@ export function stepTemplates(step: Step): [string, string][] {
       return [["prompt", step.prompt]];
     case "skill":
     case "command":
+    case "slash":
       return step.args === undefined ? [] : [["args", step.args]];
     default:
       return [];
