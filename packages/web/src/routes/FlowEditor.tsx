@@ -442,7 +442,7 @@ export function FlowEditor() {
           </div>
           <aside className="side-panel">
             {selectedIdx === null ? (
-              <InputsPanel def={draft} errors={errorsByNode.get("inputs") ?? []} onChange={update} />
+              <InputsPanel def={draft} errors={errorsByNode.get("inputs") ?? []} catalog={catalog.data} onChange={update} />
             ) : (
               <StepPanel
                 key={selectedIdx}

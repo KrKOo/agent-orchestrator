@@ -1115,3 +1115,21 @@ pre.output-card-body {
   border-radius: 4px;
   overflow: auto;
 }
+
+/* Model role rows in the flow editor's harness section. */
+.model-role-row {
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+.model-role-row .role-name {
+  width: 9rem;
+  flex: none;
+}
+.model-role-row .role-name-input {
+  width: 9rem;
+  flex: none;
+}
+.model-role-row .field {
+  flex: 1;
+  margin: 0;
+}

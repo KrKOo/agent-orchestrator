@@ -117,6 +117,27 @@ describe("validateFlow", () => {
     });
     expect(res.ok).toBe(false);
   });
+
+  test("accepts extra harness model roles and rejects default/smol and malformed role keys", () => {
+    const ok = validateFlow({
+      ...baseFlow,
+      harness: { ...baseFlow.harness, modelRoles: { slow: "anthropic/claude-opus-4-5", plan: "litellm/glm-5.3" } },
+      steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }],
+    });
+    if (!ok.ok) throw new Error(ok.errors.join("\n"));
+    expect(ok.flow.harness.modelRoles).toEqual({ slow: "anthropic/claude-opus-4-5", plan: "litellm/glm-5.3" });
+
+    const bad = validateFlow({
+      ...baseFlow,
+      harness: { ...baseFlow.harness, modelRoles: { default: "x/y", smol: "x/y", "bad key": "x/y" } },
+      steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }],
+    });
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.errors.some((e) => e.includes("modelRoles.default: set harness.model instead"))).toBe(true);
+    expect(bad.errors.some((e) => e.includes("modelRoles.smol: set harness.smolModel instead"))).toBe(true);
+    expect(bad.errors.some((e) => e.includes("modelRoles.bad key: role must match"))).toBe(true);
+  });
 });
 
 const prFlow = {

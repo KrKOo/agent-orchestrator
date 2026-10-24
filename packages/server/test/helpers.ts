@@ -46,6 +46,7 @@ export function caps(over: Partial<RunnerCapabilities> = {}): RunnerCapabilities
     maxConcurrentJobs: 2,
     allowedRoots: ["/Users/me/Documents"],
     harnesses: [{ id: "omp", version: "18.10.3" }],
+    models: [],
     sandboxProviders: ["docker"],
     acceptUntrusted: false,
     skills: [],

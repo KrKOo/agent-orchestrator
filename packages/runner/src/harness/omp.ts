@@ -9,14 +9,22 @@ export const OMP_SESSIONS_DIR = "/orch/sessions";
 
 const yaml = (s: string) => JSON.stringify(s);
 
+/** All role → model mappings of a harness spec, with `smol` falling back to `model`. */
+export function harnessRoleModels(spec: { model: string; smolModel?: string; modelRoles?: Record<string, string> }): Map<string, string> {
+  const roles = new Map<string, string>(Object.entries(spec.modelRoles ?? {}));
+  roles.set("default", spec.model);
+  roles.set("smol", spec.smolModel ?? spec.modelRoles?.smol ?? spec.model);
+  return roles;
+}
+
 export const ompAdapter: HarnessAdapter = {
   id: "omp",
 
   files(run, gw) {
-    const { model, smolModel } = run.definition.harness;
+    const roles = harnessRoleModels(run.definition.harness);
     const providers = new Set(gw.providers);
-    for (const m of [model, smolModel]) {
-      const p = m ? modelProvider(m) : null;
+    for (const m of roles.values()) {
+      const p = modelProvider(m);
       if (p) providers.add(p);
     }
     const modelsYml = [
@@ -30,9 +38,7 @@ export const ompAdapter: HarnessAdapter = {
     ].join("\n");
     const configYml = [
       "modelRoles:",
-      `  default: ${yaml(model)}`,
-      `  slow: ${yaml(model)}`,
-      `  smol: ${yaml(smolModel ?? model)}`,
+      ...[...roles.entries()].map(([role, model]) => `  ${role}: ${yaml(model)}`),
       "tools:",
       `  approvalMode: ${run.definition.approval === "ask" ? "always-ask" : "yolo"}`,
       "async:",

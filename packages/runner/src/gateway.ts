@@ -1,3 +1,4 @@
+import type { ModelEntry } from "@orch/protocol";
 import type { Subprocess } from "bun";
 import { z } from "zod";
 import type { RunnerConfig } from "./config";
@@ -7,6 +8,8 @@ export interface Gateway {
   token: string;
   /** Providers the gateway can route (from `/v1/models`); `fallback` when that endpoint is unusable. */
   listGatewayProviders(fallback: string[]): Promise<string[]>;
+  /** Routable models (from `/v1/models`); `fallback` when that endpoint is unusable. */
+  listGatewayModels(fallback: ModelEntry[]): Promise<ModelEntry[]>;
   stop(): Promise<void>;
 }
 
@@ -154,17 +157,16 @@ async function readGatewayToken(env: Record<string, string | undefined>): Promis
 
 const ModelsResponse = z.object({ data: z.array(z.looseObject({ id: z.unknown() })) });
 
-/** Extracts distinct provider prefixes (`<provider>/<model>`) from a `/v1/models` response; null when unusable. */
-export function providersFromModels(body: unknown): string[] | null {
+/** Routable `provider/model` ids with display names; null when the response is unusable. */
+function modelsFrom(body: unknown): ModelEntry[] | null {
   const parsed = ModelsResponse.safeParse(body);
   if (!parsed.success) return null;
-  const providers = new Set<string>();
-  for (const { id } of parsed.data.data) {
-    if (typeof id !== "string") continue;
-    const slash = id.indexOf("/");
-    if (slash > 0) providers.add(id.slice(0, slash));
+  const out: ModelEntry[] = [];
+  for (const { id, display_name } of parsed.data.data) {
+    if (typeof id !== "string" || !id.includes("/")) continue;
+    out.push({ id, name: typeof display_name === "string" && display_name ? display_name : id });
   }
-  return [...providers].sort();
+  return out.length ? out : null;
 }
 
 /**
@@ -218,29 +220,58 @@ export async function startGateway(cfg: RunnerConfig): Promise<Gateway> {
   }
   console.log(`[gateway] auth-broker ${brokerUrl} and auth-gateway ${gatewayUrl} ready`);
 
-  let cache: { providers: string[]; at: number } | null = null;
+  let cache: { models: ModelEntry[]; providers: string[]; at: number } | null = null;
+  // Null on fetch/parse failure OR when the response has no `provider/`-prefixed ids (modelsFrom null):
+  // callers then use their fallback instead of an empty list, so an unparsable gateway can't wipe
+  // the flow's own providers/models from routing decisions and catalog advertisement.
+  const fetchModels = async (): Promise<{ models: ModelEntry[]; providers: string[] } | null> => {
+    if (cache && Date.now() - cache.at < PROVIDER_CACHE_MS) return cache;
+    let models: ModelEntry[] | null = null;
+    try {
+      const res = await fetch(`${gatewayUrl}/v1/models`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (res.ok) models = modelsFrom(await res.json());
+    } catch {
+      models = null;
+    }
+    if (!models) return null;
+    cache = { models, providers: providersFromIds(models), at: Date.now() };
+    return cache;
+  };
 
   return {
     token,
     async listGatewayProviders(fallback: string[]): Promise<string[]> {
-      if (cache && Date.now() - cache.at < PROVIDER_CACHE_MS) return cache.providers;
-      let providers: string[] | null = null;
-      try {
-        const res = await fetch(`${gatewayUrl}/v1/models`, {
-          headers: { Authorization: `Bearer ${token}` },
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (res.ok) providers = providersFromModels(await res.json());
-      } catch {
-        providers = null;
-      }
-      if (!providers) {
+      const found = await fetchModels();
+      if (!found) {
         console.warn("[gateway] gateway /v1/models unusable; routing flow model providers only");
         return [...new Set(fallback)].sort();
       }
-      cache = { providers, at: Date.now() };
-      return providers;
+      return found.providers;
+    },
+    async listGatewayModels(fallback: ModelEntry[]): Promise<ModelEntry[]> {
+      const found = await fetchModels();
+      if (!found) return dedupeModels(fallback);
+      return found.models;
     },
     stop,
   };
+}
+
+/** Provider prefixes of model ids (`<provider>/<model>`). */
+function providersFromIds(models: ModelEntry[]): string[] {
+  const providers = new Set<string>();
+  for (const { id } of models) {
+    const slash = id.indexOf("/");
+    if (slash > 0) providers.add(id.slice(0, slash));
+  }
+  return [...providers].sort();
+}
+
+/** Distinct models by id, keeping the first name seen. */
+function dedupeModels(models: ModelEntry[]): ModelEntry[] {
+  const byId = new Map(models.map((m) => [m.id, m]));
+  return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
 }

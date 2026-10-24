@@ -66,7 +66,12 @@ class FakeSandboxProvider implements SandboxProvider {
 function harnessDeps(sandboxes: SandboxProvider) {
   const events: RunEventDraft[] = [];
   const sent: RunnerMessage[] = [];
-  const gateway: Gateway = { token: "gw-token", listGatewayProviders: async (fallback) => fallback, stop: async () => {} };
+  const gateway: Gateway = {
+    token: "gw-token",
+    listGatewayProviders: async (fallback) => fallback,
+    listGatewayModels: async (fallback) => fallback,
+    stop: async () => {},
+  };
   const mcp: McpOutputServer = {
     registerRun: (runId) => ({ url: `http://host.docker.internal:7802/mcp/${runId}`, secret: "secret" }),
     unregisterRun: () => {},
@@ -195,6 +200,40 @@ describe("runJob", () => {
     // The user's checkout is untouched.
     expect(sh(repo, "git", "status", "--porcelain")).toBe("");
     expect(sh(repo, "git", "branch", "--show-current")).toBe("main");
+  });
+
+  test("omp config maps harness model roles and gateway providers into models.yml/modelRoles", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps } = harnessDeps(sandboxes);
+    const run = assigned({
+      harness: {
+        id: "omp",
+        model: "anthropic/claude-sonnet-4-5",
+        modelRoles: { slow: "litellm/glm-5.3", plan: "litellm/deepseek" },
+      },
+      steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    const config = sandboxes.specs[0]!.files.find((f) => f.path === "omp-config.yml")!;
+    expect(config.content).toBe(
+      [
+        "modelRoles:",
+        '  slow: "litellm/glm-5.3"',
+        '  plan: "litellm/deepseek"',
+        '  default: "anthropic/claude-sonnet-4-5"',
+        '  smol: "anthropic/claude-sonnet-4-5"',
+        "tools:",
+        "  approvalMode: yolo",
+        "async:",
+        "  enabled: false",
+        "",
+      ].join("\n"),
+    );
+    // Roles render in declaration order with `default`/`smol` appended after custom roles (Map insertion order).
+    const models = sandboxes.specs[0]!.files.find((f) => f.path === "models.yml")!;
+    expect(models.content).toContain('"anthropic":');
+    expect(models.content).toContain('"litellm":');
   });
 
   test("command + git_commit commit agent changes in the worktree", async () => {

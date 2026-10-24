@@ -7,11 +7,17 @@ export const WIRE_PROTOCOL = 1;
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
 
+/** One routable model advertised by a runner's gateway (`provider/model` id plus display name). */
+export const ModelEntry = z.object({ id: z.string(), name: z.string() });
+export type ModelEntry = z.infer<typeof ModelEntry>;
+
 export const RunnerCapabilities = z.object({
   labels: z.array(z.string()),
   maxConcurrentJobs: z.number().int().min(1),
   allowedRoots: z.array(z.string()),
   harnesses: z.array(z.object({ id: z.string(), version: z.string() })),
+  /** Optional on the wire (defaults empty) so pre-model runners still parse; runners advertise it in hello. */
+  models: z.array(ModelEntry).default([]),
   sandboxProviders: z.array(z.literal("docker")),
   acceptUntrusted: z.boolean(),
   skills: z.array(CatalogEntry),
