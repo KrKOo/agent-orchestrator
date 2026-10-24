@@ -15,6 +15,13 @@
       "when": 1792789895468,
       "tag": "0001_m2_users_webhooks",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792835604247,
+      "tag": "0002_run_workspace",
+      "breakpoints": true
     }
   ]
 }

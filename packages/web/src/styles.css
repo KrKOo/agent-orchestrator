@@ -136,6 +136,9 @@ textarea:focus {
 .gap {
   gap: 8px;
 }
+.gap-tight {
+  gap: 4px;
+}
 .wrap {
   flex-wrap: wrap;
 }

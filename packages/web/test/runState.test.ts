@@ -12,7 +12,7 @@ describe("applyRunEvents", () => {
   test("coalesces chunks, merges tool calls, replaces plans, tracks subagents and dialogs", () => {
     seq = 0;
     const events: RunEvent[] = [
-      ev({ type: "run.status", payload: { status: "running", workspace: { path: "/w", branch: "orch/x" } } }),
+      ev({ type: "run.status", payload: { status: "running", workspace: { path: "/w", branch: "orch/x", repo: "acme/widget" } } }),
       ev({ type: "step.started", stepId: "a", payload: {} }),
       chunk("agent_thought_chunk", "hmm "),
       chunk("agent_thought_chunk", "ok"),
@@ -51,7 +51,7 @@ describe("applyRunEvents", () => {
     ];
     const s = applyRunEvents(initialRunViewState, events);
     const step = s.steps.a!;
-    expect(s.workspace).toEqual({ path: "/w", branch: "orch/x" });
+    expect(s.workspace).toEqual({ path: "/w", branch: "orch/x", repo: "acme/widget" });
     expect(step.status).toBe("succeeded");
     expect(step.items.map((i) => i.kind)).toEqual(["thought", "assistant", "tool", "plan", "assistant"]);
     expect(step.items[0]).toEqual({ kind: "thought", text: "hmm ok" });

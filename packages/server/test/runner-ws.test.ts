@@ -87,7 +87,12 @@ describe("RunnerSession", () => {
     expect(eventsAfter(deps, runId, 4).map((e) => e.type)).toEqual(["step.finished", "step.started"]);
 
     const run = deps.runs.get(runId)!;
-    expect(run).toMatchObject({ status: "running", startedAt: 1000, finishedAt: null });
+    expect(run).toMatchObject({
+      status: "running",
+      startedAt: 1000,
+      finishedAt: null,
+      workspace: { path: "/wt", branch: "orch/x" },
+    });
     const steps = deps.db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, runId)).all();
     const byId = Object.fromEntries(steps.map((s) => [s.stepId, s]));
     expect(byId.impl).toMatchObject({ idx: 0, status: "succeeded", output: "hi", structured: { ok: 1 }, startedAt: 1001, finishedAt: 1005 });
@@ -126,6 +131,25 @@ describe("RunnerSession", () => {
     expect(link.of("job.ack")).toEqual([{ t: "job.ack", runId, seq: 1 }]);
     expect(eventsAfter(deps, runId, 0)).toEqual([]);
     expect(deps.runs.get(runId)!.status).toBe("running");
+  });
+
+  test("workspace from run.status(running) persists and survives later non-terminal statuses", async () => {
+    const { deps, session } = setup();
+    const runId = addRun(deps, { status: "assigned", runnerId: "r1" });
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [
+          ev(runId, 1, "run.status", { status: "running", workspace: { path: "/wt", branch: "orch/x", repo: "acme/widget" } }, undefined, 10),
+          ev(runId, 2, "run.status", { status: "running" }, undefined, 20),
+        ],
+      }),
+    );
+    expect(deps.runs.get(runId)).toMatchObject({
+      status: "running",
+      workspace: { path: "/wt", branch: "orch/x", repo: "acme/widget" },
+    });
   });
 
   test("job.finished makes the run terminal and frees capacity for queued runs", async () => {

@@ -22,6 +22,13 @@ export interface RunGitHubInfo {
   checkRunId?: number;
 }
 
+/** Where a run's code lives: host workspace path, orchestrator branch, GitHub origin repo. */
+export interface WorkspaceInfo {
+  path: string;
+  branch?: string;
+  repo?: string;
+}
+
 export interface RunRow {
   id: string;
   flowId: string;
@@ -39,6 +46,8 @@ export interface RunRow {
   createdAt: number;
   startedAt: number | null;
   finishedAt: number | null;
+  /** Host workspace (worktree or direct path) the runner prepared, set once the run starts. */
+  workspace: WorkspaceInfo | null;
 }
 
 export interface StepRow {

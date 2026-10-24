@@ -52,8 +52,8 @@ export const RunEvent = z.discriminatedUnion("type", [
     payload: z.object({
       status: RunStatus,
       error: z.string().optional(),
-      /** Set on `running`: host workspace path (worktree or direct path) and orchestrator branch if any. */
-      workspace: z.object({ path: z.string(), branch: z.string().optional() }).optional(),
+      /** Set on `running`: host workspace (worktree or direct path), orchestrator branch, and GitHub origin repo if any. */
+      workspace: z.object({ path: z.string(), branch: z.string().optional(), repo: z.string().optional() }).optional(),
     }),
   }),
   z.object({ ...base, type: z.literal("step.started"), payload: z.object({}) }),

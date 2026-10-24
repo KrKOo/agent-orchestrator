@@ -31,6 +31,7 @@ export function runRow(r: typeof schema.runs.$inferSelect): RunRow {
     createdAt: r.createdAt,
     startedAt: r.startedAt,
     finishedAt: r.finishedAt,
+    workspace: r.workspace ?? null,
   };
 }
 

@@ -2,7 +2,7 @@ import type { CreateRunnerTokenResponse } from "@orch/protocol";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api, errorMessage } from "../api";
-import { Collapsible, formatTime } from "../ui";
+import { Collapsible, CopyButton, formatTime } from "../ui";
 
 export function Runners() {
   const runners = useQuery({ queryKey: ["runners"], queryFn: api.listRunners, refetchInterval: 5000 });
@@ -203,21 +203,3 @@ function CopyField({ label, value }: { label: string; value: string }) {
   );
 }
 
-function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState<boolean | null>(null);
-  const copy = async () => {
-    try {
-      // `navigator.clipboard` is missing outside secure contexts; the throw lands in the catch.
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-    } catch {
-      setCopied(false);
-    }
-    setTimeout(() => setCopied(null), 1500);
-  };
-  return (
-    <button type="button" className="btn small" onClick={() => void copy()}>
-      {copied === null ? "Copy" : copied ? "Copied" : "Copy failed"}
-    </button>
-  );
-}

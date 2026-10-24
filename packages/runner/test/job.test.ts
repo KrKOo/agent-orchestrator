@@ -368,7 +368,10 @@ describe("runJob: untrusted pull request runs", () => {
 
     const checkout = join(config.dataDir, "checkouts", run.runId);
     const contextDir = join(config.dataDir, "runs", run.runId, "context");
-    expect(ofType(events, "run.status")[0]!.payload).toEqual({ status: "running", workspace: { path: checkout } });
+    expect(ofType(events, "run.status")[0]!.payload).toEqual({
+      status: "running",
+      workspace: { path: checkout, repo: "acme/widget" },
+    });
     const spec = sandboxes.specs[0]!;
     expect(spec.mounts).toContainEqual({ hostPath: checkout, containerPath: checkout, readonly: true });
     expect(spec.mounts).toContainEqual({ hostPath: contextDir, containerPath: "/orch/context", readonly: true });

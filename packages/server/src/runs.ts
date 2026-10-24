@@ -117,8 +117,14 @@ export class RunService {
     switch (ev.type) {
       case "run.status": {
         const run = tx.select().from(runs).where(eq(runs.id, ev.runId)).get();
-        if (!run || isTerminal(run.status)) return;
-        const { status, error } = ev.payload;
+        if (!run) return;
+        const { status, error, workspace } = ev.payload;
+        // The workspace outlives status changes: it is where the modified code sits for review,
+        // so late events (after job.finished marked the run terminal) still record it. First one wins.
+        if (run.workspace === null && workspace !== undefined) {
+          tx.update(runs).set({ workspace }).where(eq(runs.id, run.id)).run();
+        }
+        if (isTerminal(run.status)) return;
         if (isTerminal(status)) {
           this.markTerminal(tx, run, status, ev.ts, error);
           return;

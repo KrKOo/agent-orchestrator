@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import type { Finding, RunEvent, RunStatus, StepStatus, SubagentBlock } from "@orch/protocol";
+import type { Finding, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -78,7 +78,7 @@ export interface RunViewState {
   lastSeq: number;
   status?: RunStatus;
   error?: string;
-  workspace?: { path: string; branch?: string };
+  workspace?: WorkspaceInfo;
   currentStepId?: string;
   steps: Record<string, StepView>;
   findings: (Finding & { stepId?: string })[];
