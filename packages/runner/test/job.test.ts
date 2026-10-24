@@ -73,7 +73,7 @@ function harnessDeps(sandboxes: SandboxProvider) {
     stop: async () => {},
   };
   const mcp: McpOutputServer = {
-    registerRun: (runId) => ({ url: `http://host.docker.internal:7802/mcp/${runId}`, secret: "secret" }),
+    registerRun: (runId) => ({ url: `http://host.docker.internal:7804/mcp/${runId}`, secret: "secret" }),
     unregisterRun: () => {},
     stop: async () => {},
   };
@@ -232,8 +232,30 @@ describe("runJob", () => {
     );
     // Roles render in declaration order with `default`/`smol` appended after custom roles (Map insertion order).
     const models = sandboxes.specs[0]!.files.find((f) => f.path === "models.yml")!;
-    expect(models.content).toContain('"anthropic":');
-    expect(models.content).toContain('"litellm":');
+    expect(models.content).toBe(
+      [
+        "providers:",
+        '  "anthropic":',
+        '    baseUrl: "http://host.docker.internal:7804"',
+        "    apiKey: ORCH_GATEWAY_TOKEN",
+        "    transport: pi-native",
+        '    api: "anthropic-messages"',
+        "    models:",
+        '      - id: "claude-sonnet-4-5"',
+        '        name: "claude-sonnet-4-5"',
+        '  "litellm":',
+        '    baseUrl: "http://host.docker.internal:7804"',
+        "    apiKey: ORCH_GATEWAY_TOKEN",
+        "    transport: pi-native",
+        '    api: "openai-completions"',
+        "    models:",
+        '      - id: "glm-5.3"',
+        '        name: "glm-5.3"',
+        '      - id: "deepseek"',
+        '        name: "deepseek"',
+        "",
+      ].join("\n"),
+    );
   });
 
   test("command + git_commit commit agent changes in the worktree", async () => {

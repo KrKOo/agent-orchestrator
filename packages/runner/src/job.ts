@@ -397,8 +397,15 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       const sessionsDir = join(runDir, "sessions");
       await mkdir(sessionsDir, { recursive: true });
       const roles = harnessRoleModels(def.harness);
-      const fallback = [...new Set([...roles.values()].map((m) => modelProvider(m)).filter((p): p is string => p !== null))];
-      const providers = await deps.gateway.listGatewayProviders(fallback);
+      const providerFallback = [...new Set([...roles.values()].map((m) => modelProvider(m)).filter((p): p is string => p !== null))];
+      const modelFallback = [...new Set(roles.values())].map((id) => {
+        const i = id.indexOf("/");
+        return { id, name: i > 0 ? id.slice(i + 1) : id };
+      });
+      const [providers, models] = await Promise.all([
+        deps.gateway.listGatewayProviders(providerFallback),
+        deps.gateway.listGatewayModels(modelFallback),
+      ]);
       const skillMounts: Mount[] = [];
       for (const step of def.steps) {
         if (step.kind !== "skill") continue;
@@ -412,7 +419,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         runId,
         image: def.sandbox.image,
         mounts: [...workspace.mounts, ...adapter.mounts(run, runDir), ...skillMounts],
-        files: adapter.files(run, { url: `http://host.docker.internal:${deps.config.ports.gateway}`, providers }),
+        files: adapter.files(run, { url: `http://host.docker.internal:${deps.config.ports.gateway}`, providers, models }),
         env: adapter.env({ token: deps.gateway.token }),
         network: def.sandbox.network,
         cpus: def.sandbox.cpus,
