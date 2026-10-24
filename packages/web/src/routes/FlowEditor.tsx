@@ -55,12 +55,16 @@ function newStep(kind: StepKind, id: string, earlier: Step[]): Step {
       return { ...base, kind, skill: "", freshSession: false };
     case "command":
       return { ...base, kind, command: "", freshSession: false };
+    case "slash":
+      return { ...base, kind, command: "" };
     case "git_commit":
       return { ...base, kind, messageFrom: lastAgent };
     case "git_push":
       return { ...base, kind };
     case "github_pr":
       return { ...base, kind, titleFrom: lastAgent, bodyFrom: lastAgent, draft: false };
+    case "intervention":
+      return { id, name: KIND_LABEL[kind], kind, message: "" };
   }
 }
 
@@ -183,12 +187,16 @@ function stepSubtitle(step: Step): string {
       return step.skill || "(no skill chosen)";
     case "command":
       return step.command ? `/${step.command}` : "(no command chosen)";
+    case "slash":
+      return step.command ? `/${step.command} (headless)` : "(no command chosen)";
     case "git_commit":
       return `message from ${step.messageFrom || "?"}`;
     case "git_push":
       return "push run branch";
     case "github_pr":
       return `title ${step.titleFrom || "?"} · body ${step.bodyFrom || "?"}`;
+    case "intervention":
+      return step.message?.split("\n")[0] || "wait for user";
   }
 }
 
@@ -490,9 +498,11 @@ const KIND_HELP: Record<StepKind, string> = {
   prompt: "Send a templated prompt to the agent",
   skill: "Apply a skill from the runner library",
   command: "Run a command template with arguments",
+  slash: "Run a built-in omp slash command (e.g. review, plan) headless",
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",
+  intervention: "Pause and chat with the run's agent sessions, then continue",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {

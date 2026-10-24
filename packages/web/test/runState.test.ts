@@ -47,6 +47,8 @@ describe("applyRunEvents", () => {
       }),
       ev({ type: "acp.permission_request", stepId: "a", payload: { requestId: "p1", toolCall: {}, options: [] } }),
       ev({ type: "acp.permission_resolved", stepId: "a", payload: { requestId: "p1", optionId: null } }),
+      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i1", message: "review it", sessions: [] } }),
+      ev({ type: "intervention.resolved", stepId: "gate", payload: { requestId: "i1", action: "continue" } }),
       ev({ type: "step.finished", stepId: "a", payload: { status: "succeeded", output: "HelloDone" } }),
     ];
     const s = applyRunEvents(initialRunViewState, events);
@@ -61,6 +63,7 @@ describe("applyRunEvents", () => {
     expect(step.subagents).toHaveLength(1);
     expect(step.subagents[0]!.messages).toHaveLength(1);
     expect(s.permissions[0]!.resolved).toBe(true);
+    expect(s.interventions[0]).toMatchObject({ requestId: "i1", stepId: "gate", message: "review it", resolved: true });
     // Replayed events (seq <= lastSeq) are ignored.
     expect(applyRunEvents(s, events)).toBe(s);
   });

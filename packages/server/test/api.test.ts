@@ -4,7 +4,7 @@ import { FS_LIST_TIMEOUT_MS } from "../src/api/runners";
 import { createApp } from "../src/app";
 import type { AppDeps } from "../src/deps";
 import { PatCredentials } from "../src/github/credentials";
-import { addRun, caps, connectRunner, testDeps } from "./helpers";
+import { addRun, caps, connectRunner, flowDef, testDeps } from "./helpers";
 
 const flowBody = {
   name: "Issue to commit",
@@ -146,6 +146,60 @@ describe("runs API", () => {
     ]);
     expect((await call("POST", `/api/runs/${running}/elicitations/e2`, { action: "maybe" })).status).toBe(400);
     expect((await call("POST", `/api/runs/${orphan}/permissions/p1`, { optionId: "allow" })).status).toBe(409);
+  });
+
+  test("intervention answers are validated and relayed to the runner holding the run", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const definition = flowDef({
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "gate", name: "Gate", kind: "intervention", message: "review it" },
+      ],
+    });
+    const running = addRun(deps, { status: "running", runnerId: "r1", definition });
+    const offline = addRun(deps, { status: "running", runnerId: "gone", definition });
+
+    const ok = await call("POST", `/api/runs/${running}/interventions/req1`, {
+      stepId: "gate",
+      action: "message",
+      session: "agent",
+      text: "/review the diff",
+    });
+    expect(ok.json).toEqual({ ok: true });
+    expect(link.of("intervention.respond")[0]).toEqual({
+      t: "intervention.respond",
+      runId: running,
+      requestId: "req1",
+      action: "message",
+      session: "agent",
+      text: "/review the diff",
+    });
+
+    // message without text or session → 400, nothing relayed
+    const blank = await call("POST", `/api/runs/${running}/interventions/req2`, { stepId: "gate", action: "message", session: "agent", text: "  " });
+    expect(blank.status).toBe(400);
+    expect(blank.json.errors.join()).toContain("write a message");
+    expect((await call("POST", `/api/runs/${running}/interventions/req2`, { stepId: "gate", action: "message", text: "hi" })).status).toBe(400);
+    expect(link.sent.length).toBe(1);
+
+    // non-intervention stepId → 400
+    expect(
+      (await call("POST", `/api/runs/${running}/interventions/req3`, { stepId: "impl", action: "continue" })).status,
+    ).toBe(400);
+    // action cancel relays without steps
+    expect(
+      (await call("POST", `/api/runs/${running}/interventions/req4`, { stepId: "gate", action: "cancel" })).json,
+    ).toEqual({ ok: true });
+    expect(link.of("intervention.respond")[1]).toEqual({
+      t: "intervention.respond",
+      runId: running,
+      requestId: "req4",
+      action: "cancel",
+    });
+    // offline runner → 409
+    expect((await call("POST", `/api/runs/${offline}/interventions/req5`, { stepId: "gate", action: "continue" })).status).toBe(409);
   });
 });
 

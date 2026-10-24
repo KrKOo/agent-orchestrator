@@ -56,14 +56,18 @@ export class RunEventStream {
       } catch {
         return;
       }
-      const parsed = RunEvent.safeParse(raw);
-      if (!parsed.success) return;
-      const ev = parsed.data;
-      if (ev.seq <= this.lastSeq) return;
-      this.lastSeq = ev.seq;
-      if (ev.type === "run.status" && TERMINAL_STATUSES.includes(ev.payload.status)) this.terminal = true;
-      this.pending.push(ev);
-      if (this.frame === null) this.frame = requestAnimationFrame(() => this.flush());
+      // Each message is an array of events: the replayed backlog in one message, then live events.
+      if (!Array.isArray(raw)) return;
+      for (const item of raw) {
+        const parsed = RunEvent.safeParse(item);
+        if (!parsed.success) continue;
+        const ev = parsed.data;
+        if (ev.seq <= this.lastSeq) continue;
+        this.lastSeq = ev.seq;
+        if (ev.type === "run.status" && TERMINAL_STATUSES.includes(ev.payload.status)) this.terminal = true;
+        this.pending.push(ev);
+      }
+      if (this.pending.length > 0 && this.frame === null) this.frame = requestAnimationFrame(() => this.flush());
     };
     ws.onclose = (ev) => {
       if (this.ws !== ws) return;

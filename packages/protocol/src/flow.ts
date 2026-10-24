@@ -156,6 +156,15 @@ export const CommandStep = z.object({
   args: z.string().optional(),
   freshSession: z.boolean().default(false),
 });
+/** Built-in omp slash command (`/review`, `/plan`, …) run headless via `omp -p`; output is the step output. */
+export const SlashStep = z.object({
+  ...stepBase,
+  kind: z.literal("slash"),
+  command: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9:_-]*$/, "command must be a slash command name without leading / or whitespace"),
+  args: z.string().optional(),
+});
 export const GitCommitStep = z.object({
   ...stepBase,
   kind: z.literal("git_commit"),
@@ -173,20 +182,32 @@ export const GitHubPrStep = z.object({
   base: z.string().min(1).optional(),
   draft: z.boolean().default(false),
 });
+/**
+ * Pauses the run so the user can chat with the run's agent sessions from the web UI: the shared
+ * ACP session of prompt/skill/command steps, or the resumable `omp -p` session of an earlier slash
+ * step. On continue, the latest result of the selected session becomes this step's output.
+ * No `timeoutSec` means wait until answered or cancelled; otherwise each wait for the user is capped.
+ */
+export const InterventionStep = z.object({
+  ...stepBase,
+  kind: z.literal("intervention"),
+  message: z.string().optional(),
+  timeoutSec: z.number().int().positive().optional(),
+});
 
-export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, GitCommitStep, GitPushStep, GitHubPrStep]);
+export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, SlashStep, GitCommitStep, GitPushStep, GitHubPrStep, InterventionStep]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "git_commit", "git_push", "github_pr"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr", "intervention"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
 }
 
 export function isActionStep(step: Step): step is ActionStep {
-  return !isAgentStep(step);
+  return step.kind === "git_commit" || step.kind === "git_push" || step.kind === "github_pr";
 }
 
 export const FlowDefinition = z.object({
@@ -218,7 +239,10 @@ export function stepTemplates(step: Step): [string, string][] {
       return [["prompt", step.prompt]];
     case "skill":
     case "command":
+    case "slash":
       return step.args === undefined ? [] : [["args", step.args]];
+    case "intervention":
+      return step.message === undefined ? [] : [["message", step.message]];
     default:
       return [];
   }
@@ -343,6 +367,9 @@ export function validateFlow(input: unknown): ValidateResult {
         errors.push(`${where}: ${step.kind} requires workspace isolation "worktree" with access "rw"`);
       }
     }
+    if (step.kind === "intervention" && prFlow) {
+      errors.push(`${where}: pull request flows cannot contain intervention steps`);
+    }
     const refFields: [string, string][] =
       step.kind === "git_commit"
         ? [["messageFrom", step.messageFrom]]
@@ -364,3 +391,7 @@ export function validateFlow(input: unknown): ValidateResult {
 
   return errors.length ? { ok: false, errors } : { ok: true, flow };
 }
+
+export type InterventionAction = z.infer<typeof InterventionAction>;
+/** `message` sends text to one of the run's sessions (the gate asks again afterwards); `continue` resumes the flow. */
+export const InterventionAction = z.enum(["message", "continue", "cancel"]);

@@ -49,15 +49,15 @@ export function registerBrowserWs(app: Hono, deps: AppDeps): void {
             return;
           }
           // DB reads and publishes are synchronous, so nothing can slip between the replay and the subscription.
-          let last = afterSeq;
-          for (const ev of eventsAfter(deps, runId, afterSeq)) {
-            ws.send(JSON.stringify(ev));
-            last = ev.seq;
-          }
+          // Every message is a JSON array of events; the backlog goes out as one message so a page refresh
+          // renders the whole history in a single pass instead of event by event.
+          const backlog = eventsAfter(deps, runId, afterSeq);
+          let last = backlog.at(-1)?.seq ?? afterSeq;
+          if (backlog.length > 0) ws.send(JSON.stringify(backlog));
           unsubscribe = deps.hub.subscribe(runId, (ev) => {
             if (ev.seq <= last) return;
             last = ev.seq;
-            ws.send(JSON.stringify(ev));
+            ws.send(JSON.stringify([ev]));
           });
         },
         onClose() {

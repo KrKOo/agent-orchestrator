@@ -6,6 +6,7 @@ import type {
   FlowDefinitionInput,
   FlowRow,
   FsListResult,
+  InterventionAction,
   MeResponse,
   RunDetail,
   RunEvent,
@@ -84,6 +85,11 @@ export const api = {
     action: ElicitationAction,
     content?: Record<string, unknown>,
   ) => request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/elicitations/${enc(requestId)}`, { action, content }),
+  respondIntervention: (
+    runId: string,
+    requestId: string,
+    body: { stepId: string; action: InterventionAction; feedback?: string; output?: string },
+  ) => request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/interventions/${enc(requestId)}`, body),
 
   listRunners: () => request<RunnerRow[]>("GET", "/api/runners"),
   createRunnerToken: (name: string, labels: string[]) =>

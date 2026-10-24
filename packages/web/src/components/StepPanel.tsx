@@ -12,18 +12,22 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   prompt: "Prompt",
   skill: "Skill",
   command: "Command",
+  slash: "Slash command",
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
+  intervention: "Intervention",
 };
 
 export const KIND_ICON: Record<Step["kind"], string> = {
-  prompt: "✎",
-  skill: "★",
-  command: "/",
-  git_commit: "●",
-  git_push: "↑",
-  github_pr: "⇄",
+  prompt: "✉️",
+  skill: "🧠",
+  command: "⌨️",
+  slash: "💬",
+  git_commit: "✅",
+  git_push: "⏫",
+  github_pr: "🚀",
+  intervention: "⏸",
 };
 
 /** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
@@ -199,15 +203,65 @@ export function StepPanel({
           type="number"
           min={1}
           value={step.timeoutSec}
-          onChange={(e) => set({ timeoutSec: Number(e.target.value) })}
+          onChange={(e) =>
+            set(
+              step.kind === "intervention" && e.target.value === ""
+                ? { timeoutSec: undefined }
+                : { timeoutSec: Number(e.target.value) },
+            )
+          }
         />
+        {step.kind === "intervention" && step.timeoutSec === undefined && (
+          <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
+        )}
       </label>
+
+      {step.kind === "intervention" && (
+        <>
+          <TemplateField
+            label="Reviewer note (optional)"
+            rows={4}
+            value={step.message ?? ""}
+            vars={vars}
+            onChange={(message) => set({ message: message === "" ? undefined : message })}
+          />
+          <p className="muted small">
+            The run pauses here and opens a chat in the run view: message the agent session or an earlier slash step's session
+            (slash commands work too) as often as needed, then continue. The selected session's latest reply becomes{" "}
+            <code>{`{{steps.${step.id}.output}}`}</code>.
+          </p>
+        </>
+      )}
 
       {step.kind === "prompt" && (
         <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />
       )}
       {step.kind === "skill" && catalogSelect("skill", step.skill)}
       {step.kind === "command" && catalogSelect("command", step.command)}
+      {step.kind === "slash" && (
+        <label className="field">
+          <span>Command</span>
+          <input
+            className="mono"
+            placeholder="review"
+            value={step.command}
+            onChange={(e) => set({ command: e.target.value })}
+          />
+          <small className="muted">
+            Runs <code>{`omp -p /${step.command || "<command>"}`}</code> headless in the sandbox — e.g. <code>review</code>,{" "}
+            <code>plan</code>, <code>init</code>.
+          </small>
+        </label>
+      )}
+      {step.kind === "slash" && (
+        <TemplateField
+          label="Arguments (optional)"
+          rows={3}
+          value={step.args ?? ""}
+          vars={vars}
+          onChange={(args) => set({ args: args === "" ? undefined : args })}
+        />
+      )}
       {(step.kind === "skill" || step.kind === "command") && (
         <TemplateField
           label="Arguments (optional)"

@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react"
 import { Link, useParams } from "react-router";
 import { api, errorMessage } from "../api";
 import { ElicitationDialog } from "../components/ElicitationDialog";
+import { chatSession, InterventionComposer, InterventionStart } from "../components/InterventionChat";
 import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
@@ -30,6 +31,8 @@ function RunViewInner({ runId }: { runId: string }) {
   });
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState<ReadonlySet<string>>(new Set());
+  /** Session picked in an intervention step's chat (per step, so another gate starts from its own preselection). */
+  const [pickedSession, setPickedSession] = useState<{ stepId: string; id: string } | null>(null);
   const cancel = useMutation({ mutationFn: () => api.cancelRun(runId) });
   const approve = useMutation({ mutationFn: () => api.approveRun(runId), onSuccess: () => detail.refetch() });
 
@@ -60,7 +63,17 @@ function RunViewInner({ runId }: { runId: string }) {
   const findings = state.lastSeq > 0 ? state.findings : detail.data!.findings;
   const permission = state.permissions.find((p) => !p.resolved && !submitted.has(p.requestId));
   const elicitation = state.elicitations.find((e) => !e.resolved && !submitted.has(e.requestId));
+  const intervention = state.interventions.find((i) => !i.resolved && !submitted.has(i.requestId));
+  /** Chat of the selected intervention step while it runs; the latest request carries its sessions. */
+  const gateRequest =
+    selectedId !== null && state.steps[selectedId]?.status === "running"
+      ? state.interventions.findLast((i) => i.stepId === selectedId)
+      : undefined;
   const markSubmitted = (requestId: string) => setSubmitted(new Set([...submitted, requestId]));
+  const gateSession = gateRequest && chatSession(gateRequest, pickedSession?.stepId === selectedId ? pickedSession.id : undefined);
+  /** First request of the selected intervention step: results as they were when the run paused (kept after it finishes). */
+  const gateStart = selectedId !== null ? state.interventions.find((i) => i.stepId === selectedId) : undefined;
+  const startSession = gateStart && chatSession(gateStart, gateSession?.id);
   const logs = state.logs.filter((l) => (l.stepId ?? null) === selectedId || l.stepId === undefined);
   const runLevel = state.steps[""];
   const selectedDef = steps.find((s) => s.id === selectedId);
@@ -146,6 +159,11 @@ function RunViewInner({ runId }: { runId: string }) {
           )}
         </div>
         {error && <p className="error">{error}</p>}
+        {intervention && intervention.stepId !== selectedId && intervention.stepId !== undefined && (
+          <button type="button" className="btn primary" onClick={() => setSelected(intervention.stepId!)}>
+            ⏸ Waiting for you — open step {intervention.stepId}
+          </button>
+        )}
         {cancel.error && <p className="error">{errorMessage(cancel.error)}</p>}
         {approve.error && <p className="error">{errorMessage(approve.error)}</p>}
         {findings.length > 0 && (
@@ -205,47 +223,69 @@ function RunViewInner({ runId }: { runId: string }) {
             );
           })}
         </nav>
-        <div
-          className="run-main"
-          ref={scrollRef}
-          onScroll={(e) => {
-            const el = e.currentTarget;
-            atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-          }}
-        >
-          {selectedDef && (
-            <div className="step-header">
-              <span className="kind-icon">{KIND_ICON[selectedDef.kind]}</span>
-              <h3>{selectedDef.name}</h3>
-              <span className="step-id">{selectedDef.id}</span>
-              <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
-              <span className="grow" />
-              {selectedRow?.startedAt && (
-                <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>
-              )}
-              <StatusChip status={state.steps[selectedDef.id]?.status ?? selectedRow?.status ?? "pending"} />
-            </div>
-          )}
-          {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && (
-            <p className="muted">{step.status === "pending" ? "Step has not started." : "Waiting for output…"}</p>
-          )}
-          <Transcript step={step} />
-          {selectedDef && <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef)} />}
-          {runLevel && runLevel.items.length > 0 && (
-            <Collapsible summary="Run-level updates" className="diagnostics">
-              <Transcript step={runLevel} />
-            </Collapsible>
-          )}
-          {logs.length > 0 && (
-            <Collapsible summary={`Sandbox log (${logs.length})`} className="diagnostics small">
-              <pre className="log">
-                {logs.map((l) => (
-                  <span key={l.seq} className={l.stream === "stderr" ? "log-err" : undefined}>
-                    {l.text.endsWith("\n") ? l.text : `${l.text}\n`}
-                  </span>
-                ))}
-              </pre>
-            </Collapsible>
+        <div className="run-pane">
+          <div
+            className="run-main"
+            ref={scrollRef}
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+            }}
+          >
+            {selectedDef && (
+              <div className="step-header">
+                <span className="kind-icon">{KIND_ICON[selectedDef.kind]}</span>
+                <h3>{selectedDef.name}</h3>
+                <span className="step-id">{selectedDef.id}</span>
+                <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
+                <span className="grow" />
+                {selectedRow?.startedAt && (
+                  <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>
+                )}
+                <StatusChip status={state.steps[selectedDef.id]?.status ?? selectedRow?.status ?? "pending"} />
+              </div>
+            )}
+            {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && !gateRequest && (
+              <p className="muted">{step.status === "pending" ? "Step has not started." : "Waiting for output…"}</p>
+            )}
+            {gateStart?.message && <p className="intervention-note pre-wrap">{gateStart.message}</p>}
+            {startSession && <InterventionStart session={startSession} />}
+            <Transcript step={step} />
+            {selectedDef && (
+              <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"} />
+            )}
+            {runLevel && runLevel.items.length > 0 && (
+              <Collapsible summary="Run-level updates" className="diagnostics">
+                <Transcript step={runLevel} />
+              </Collapsible>
+            )}
+            {logs.length > 0 && (
+              <Collapsible summary={`Sandbox log (${logs.length})`} className="diagnostics small">
+                <pre className="log">
+                  {logs.map((l) => (
+                    <span key={l.seq} className={l.stream === "stderr" ? "log-err" : undefined}>
+                      {l.text.endsWith("\n") ? l.text : `${l.text}\n`}
+                    </span>
+                  ))}
+                </pre>
+              </Collapsible>
+            )}
+          </div>
+          {gateRequest && selectedId !== null && (
+            <InterventionComposer
+              key={selectedId}
+              runId={runId}
+              stepId={selectedId}
+              request={gateRequest}
+              session={gateSession}
+              awaiting={!gateRequest.resolved && !submitted.has(gateRequest.requestId)}
+              onPick={(id) => setPickedSession({ stepId: selectedId, id })}
+              onSubmitted={(requestId) => {
+                markSubmitted(requestId);
+                // Follow the reply as it streams in.
+                atBottom.current = true;
+              }}
+            />
           )}
         </div>
       </div>

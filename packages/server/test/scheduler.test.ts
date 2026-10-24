@@ -149,6 +149,24 @@ describe("Scheduler.kick", () => {
     expect(deps.runs.maxSeq(run)).toBe(1);
   });
 
+  test("a run awaiting input keeps its runner slot and fails with a lost runner like a running one", () => {
+    const deps = testDeps();
+    connectRunner(deps, "r1", caps({ maxConcurrentJobs: 1 }));
+    addRun(deps, { status: "awaiting_input", runnerId: "r1", createdAt: 1 });
+    const queued = addRun(deps, { createdAt: 2 });
+    deps.scheduler.kick();
+    expect(deps.runs.get(queued)!.status).toBe("queued");
+
+    const start = Date.now();
+    let now = start;
+    const scheduler = new Scheduler(deps.runs, () => now);
+    addRunner(deps, "r2", { capabilities: caps(), lastSeenAt: start }); // registered, not connected
+    const waiting = addRun(deps, { status: "awaiting_input", runnerId: "r2" });
+    now = start + RUNNER_LOST_MS + 1000;
+    scheduler.kick();
+    expect(deps.runs.get(waiting)).toMatchObject({ status: "failed", error: "runner_lost" });
+  });
+
   test("a connected runner with a fresh heartbeat never loses its runs", () => {
     const deps = testDeps();
     const start = Date.now();

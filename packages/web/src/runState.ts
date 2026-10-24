@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import type { Finding, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
+import type { Finding, InterventionSession, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -67,6 +67,19 @@ export interface ElicitationView {
   resolved: boolean;
 }
 
+export interface InterventionView {
+  requestId: string;
+  stepId?: string;
+  message: string;
+  /** Sessions the user can chat with and their latest results. */
+  sessions: InterventionSession[];
+  /** Preselected session id. */
+  session?: string;
+  /** Why the last chat turn failed. */
+  error?: string;
+  resolved: boolean;
+}
+
 export interface LogLine {
   seq: number;
   stepId?: string;
@@ -84,6 +97,7 @@ export interface RunViewState {
   findings: (Finding & { stepId?: string })[];
   permissions: PermissionView[];
   elicitations: ElicitationView[];
+  interventions: InterventionView[];
   logs: LogLine[];
 }
 
@@ -93,6 +107,7 @@ export const initialRunViewState: RunViewState = {
   findings: [],
   permissions: [],
   elicitations: [],
+  interventions: [],
   logs: [],
 };
 
@@ -226,6 +241,16 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
         ...s,
         elicitations: s.elicitations.map((e) => (e.requestId === ev.payload.requestId ? { ...e, resolved: true } : e)),
       };
+    case "intervention.request":
+      return {
+        ...s,
+        interventions: [...s.interventions, { ...ev.payload, stepId: ev.stepId, resolved: false }],
+      };
+    case "intervention.resolved":
+      return {
+        ...s,
+        interventions: s.interventions.map((i) => (i.requestId === ev.payload.requestId ? { ...i, resolved: true } : i)),
+      };
     case "sandbox.log":
       return { ...s, logs: [...s.logs, { seq: ev.seq, stepId: ev.stepId, ...ev.payload }] };
     case "finding":
@@ -264,5 +289,18 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
 }
 
 export function applyRunEvents(state: RunViewState, events: RunEvent[]): RunViewState {
-  return events.reduce(applyRunEvent, state);
+  // Logs are independent of other state, so a batch (e.g. a replayed backlog with thousands of
+  // raw NDJSON lines) appends them in one copy instead of re-copying the array per line.
+  const logs: LogLine[] = [];
+  let next = state;
+  for (const ev of events) {
+    if (ev.seq <= next.lastSeq) continue;
+    if (ev.type === "sandbox.log") {
+      logs.push({ seq: ev.seq, stepId: ev.stepId, ...ev.payload });
+      next = { ...next, lastSeq: ev.seq };
+    } else {
+      next = applyRunEvent(next, ev);
+    }
+  }
+  return logs.length > 0 ? { ...next, logs: next.logs.concat(logs) } : next;
 }

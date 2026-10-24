@@ -10,6 +10,7 @@ import {
   type RunEventDraft,
   type RunnerMessage,
   UNTRUSTED_PREAMBLE,
+  type SessionUpdate,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
@@ -21,6 +22,8 @@ import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/typ
 import { sinkToWritable } from "../src/sandbox/types";
 
 const FAKE_AGENT = join(import.meta.dir, "fixtures", "fake-agent.ts");
+/** Print-mode responder for slash steps: echoes the prompt text on stdout. */
+const FAKE_PRINT = join(import.meta.dir, "fixtures", "fake-print.ts");
 
 let root: string;
 let repo: string;
@@ -46,7 +49,20 @@ class FakeSandboxProvider implements SandboxProvider {
   async create(spec: CreateSandbox): Promise<Sandbox> {
     this.specs.push(spec);
     return {
-      exec: (_argv, cwd) => {
+      exec: (argv, cwd) => {
+        // `omp -p ...` (slash steps): run the fake print-mode responder instead of the ACP agent.
+        if (argv.includes("-p")) {
+          const resume = argv.indexOf("--resume");
+          const args = [argv[argv.indexOf("--") + 1] ?? "", resume >= 0 ? argv[resume + 1]! : ""];
+          const proc = Bun.spawn(["bun", FAKE_PRINT, ...args], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          return {
+            stdin: sinkToWritable(proc.stdin),
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+            exited: proc.exited,
+            kill: () => proc.kill(),
+          };
+        }
         const proc = Bun.spawn(["bun", FAKE_AGENT], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
         return {
           stdin: sinkToWritable(proc.stdin),
@@ -258,6 +274,84 @@ describe("runJob", () => {
     );
   });
 
+  test("slash step runs omp -p with the command, streams events, and outputs the final text", async () => {
+    const provider = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(provider);
+    const run = assigned({
+      inputs: [{ key: "topic", label: "Topic", type: "text", required: true }],
+      steps: [{ kind: "slash", id: "review", name: "Review", command: "review", args: "focus on {{inputs.topic}}" }],
+    });
+    run.inputs.topic = "tea";
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const started = ofType(events, "step.started");
+    expect(started.map((e) => e.stepId)).toEqual(["review"]);
+    const finished = ofType(events, "step.finished");
+    expect(finished[0]!.payload.status).toBe("succeeded");
+    expect(finished[0]!.payload.output).toBe("print:/review focus on tea\n");
+    // Assistant text streamed as acp.update chunks.
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "review");
+    const chunkText = (u: SessionUpdate): string => {
+      if (u.sessionUpdate !== "agent_message_chunk") return "";
+      const c: unknown = u.content;
+      if (typeof c !== "object" || c === null || !("text" in c) || typeof c.text !== "string") return "";
+      return c.text;
+    };
+    expect(updates.map((e) => chunkText(e.payload.update)).join("")).toBe("print:/review focus on tea\n");
+    // Raw NDJSON still lands in the sandbox log.
+    const logs = ofType(events, "sandbox.log").filter((e) => e.stepId === "review");
+    expect(logs.map((e) => e.payload.text).join("")).toContain("message_update");
+  });
+
+  test("slash step tool activity streams as tool_call cards", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "slash", id: "tools", name: "Tools", command: "plan", args: "use the tool" }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "tools").map((e) => e.payload.update);
+    const started = updates.filter((u) => u.sessionUpdate === "tool_call");
+    expect(started).toHaveLength(1);
+    expect(started[0]).toMatchObject({ toolCallId: "tool_1", title: "Running echo", name: "bash", status: "in_progress" });
+    const ended = updates.filter((u) => u.sessionUpdate === "tool_call_update" && u.status === "completed");
+    expect(ended).toHaveLength(1);
+    expect(ended[0]!.content).toEqual([{ type: "text", text: "hi\n" }]);
+  });
+
+  test("slash step thinking streams as collapsible thought sections", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "slash", id: "thinker", name: "Thinker", command: "plan", args: "think hard" }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    const updates = ofType(events, "acp.update").filter((e) => e.stepId === "thinker").map((e) => e.payload.update);
+    const thoughts = updates.filter((u) => u.sessionUpdate === "agent_thought_chunk");
+    expect(thoughts).toHaveLength(2);
+    const thoughtText = (u: SessionUpdate): string => {
+      const c: unknown = u.content;
+      if (typeof c !== "object" || c === null || !("text" in c) || typeof c.text !== "string") return "";
+      return c.text;
+    };
+    expect(thoughts.map(thoughtText).join("")).toBe("pondering the request");
+  });
+
+  test("slash step failure surfaces a non-zero exit as a failed step", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "slash", id: "broken", name: "Broken", command: "review", args: "make it fail" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({
+      t: "job.finished",
+      runId: run.runId,
+      status: "failed",
+      error: expect.stringContaining("exited with code 3"),
+    });
+    const finished = ofType(events, "step.finished");
+    expect(finished.map((e) => e.payload.status)).toEqual(["failed"]);
+    expect(finished[0]!.payload.error).toContain("exited with code 3");
+  });
+
   test("command + git_commit commit agent changes in the worktree", async () => {
     const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
     const run = assigned({
@@ -296,6 +390,145 @@ describe("runJob", () => {
     expect(ofType(events, "acp.permission_resolved")[0]!.payload).toEqual({ requestId: req.payload.requestId, optionId: "allow" });
     // Text after the permission-gated tool call starts a new paragraph.
     expect(ofType(events, "step.finished")[0]!.payload.output).toBe("Hello, world\n\n allow");
+  });
+
+  /** Answers each intervention request in order with the next scripted answer. */
+  function scriptedGate(deps: JobDeps, events: RunEventDraft[], answers: Parameters<PendingRequests["settle"]>[1][]): PendingRequests {
+    const pending = new PendingRequests();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") {
+        const answer = answers.shift() ?? null;
+        queueMicrotask(() => pending.settle(draft.payload.requestId, answer));
+      }
+    };
+    return pending;
+  }
+
+  test("intervention chat: a message goes verbatim into the agent session; continue passes its latest reply on", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = scriptedGate(deps, events, [{ action: "message", session: "agent", text: "echo tweak it" }, { action: "continue" }]);
+    const run = assigned({
+      steps: [
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "write hello.txt" },
+        { kind: "intervention", id: "gate", name: "Gate", message: "Review the change" },
+        { kind: "prompt", id: "after", name: "After", prompt: "echo {{steps.gate.output}}" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const [first, second] = ofType(events, "intervention.request");
+    expect(first!.payload).toEqual({
+      requestId: first!.payload.requestId,
+      message: "Review the change",
+      sessions: [{ id: "agent", label: "Agent session (last step: Implement)", output: "Hello, world" }],
+      session: "agent",
+    });
+    // The agent got exactly the user's text (the fake echoes prompts containing "echo").
+    const reply = second!.payload.sessions[0]!.output;
+    expect(reply).toMatch(/^Hello, world\n+echo tweak it$/);
+    expect(ofType(events, "intervention.resolved").map((e) => e.payload.action)).toEqual(["message", "continue"]);
+    // The run waits for the user at each request and is running again while the agent replies.
+    expect(ofType(events, "run.status").map((e) => e.payload.status)).toEqual([
+      "running",
+      "awaiting_input",
+      "running",
+      "awaiting_input",
+      "running",
+      "succeeded",
+    ]);
+    // The message shows as a user bubble in the gate's transcript, followed by the streamed reply.
+    const gateUpdates = ofType(events, "acp.update").filter((e) => e.stepId === "gate").map((e) => e.payload.update.sessionUpdate);
+    expect(gateUpdates[0]).toBe("user_message_chunk");
+    expect(gateUpdates).toContain("agent_message_chunk");
+
+    const finished = Object.fromEntries(ofType(events, "step.finished").map((e) => [e.stepId, e.payload]));
+    expect(finished.gate).toMatchObject({ status: "succeeded", output: reply });
+    expect(finished.after!.output).toContain("echo tweak it");
+  });
+
+  test("intervention chat: slash sessions resume their omp session; continue uses the chosen session", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = scriptedGate(deps, events, [
+      { action: "message", session: "slash:plan", text: "add tests" },
+      { action: "continue", session: "slash:plan" },
+    ]);
+    const run = assigned({
+      steps: [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan", args: "an app" },
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "hi" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const [first, second] = ofType(events, "intervention.request");
+    expect(first!.payload.sessions).toEqual([
+      { id: "slash:plan", label: "/plan (Plan)", output: "print:/plan an app\n" },
+      { id: "agent", label: "Agent session (last step: Implement)", output: "Hello, world" },
+    ]);
+    // The previous step's session is preselected; after a message, the one chatted with.
+    expect(first!.payload.session).toBe("agent");
+    expect(second!.payload.session).toBe("slash:plan");
+    const finished = Object.fromEntries(ofType(events, "step.finished").map((e) => [e.stepId, e.payload]));
+    expect(finished.gate).toMatchObject({ status: "succeeded", output: "print:(resumed fake) add tests\n" });
+  });
+
+  test("intervention chat: unknown sessions and failed turns ask again with the error and keep the last result", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = scriptedGate(deps, events, [
+      { action: "message", session: "nope", text: "hi" },
+      { action: "message", session: "slash:plan", text: "make it fail" },
+      { action: "continue" },
+    ]);
+    const run = assigned({
+      steps: [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const requests = ofType(events, "intervention.request").map((e) => e.payload);
+    expect(requests.map((r) => r.error)).toEqual([undefined, 'Unknown session "nope".', "omp -p exited with code 3: boom"]);
+    expect(requests[2]!.sessions).toEqual(requests[0]!.sessions);
+    expect(ofType(events, "step.finished").at(-1)!.payload).toMatchObject({ status: "succeeded", output: "print:/plan\n" });
+  });
+
+  test("intervention gate: cancel while waiting cancels the step and the run", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const pending = new PendingRequests();
+    const abort = new AbortController();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") queueMicrotask(() => abort.abort());
+    };
+    const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+    await runJob(run, deps, abort.signal, pending);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "cancelled" });
+    expect(ofType(events, "step.finished")[0]!.payload.status).toBe("cancelled");
+    // run.status may only record "running"; the final status event is emitted after the loop.
+    expect(ofType(events, "run.status").at(-1)!.payload.status).toBe("cancelled");
+    // No harness was created for the intervention-only flow.
+    expect(ofType(events, "acp.update")).toHaveLength(0);
+  });
+
+  test("intervention gate: timeoutSec expires into a failed step", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate", timeoutSec: 1 }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
+    const finished = ofType(events, "step.finished")[0]!;
+    expect(finished.stepId).toBe("gate");
+    expect(finished.payload.status).toBe("failed");
+    expect(finished.payload.error).toBe("No answer within 1s");
+    // The timeout nulls the answer: the gate is recorded as cancelled.
+    expect(ofType(events, "intervention.resolved")[0]!.payload.action).toBe("cancel");
   });
 
   test("cancel ends the step and the run cancelled", async () => {

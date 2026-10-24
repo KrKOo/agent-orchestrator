@@ -1,6 +1,8 @@
 import { z } from "zod";
+import { InterventionAction } from "./flow";
 
-export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running", "succeeded", "failed", "cancelled"] as const;
+/** `awaiting_input`: an intervention step is paused for the user (the runner still holds the run). */
+export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running", "awaiting_input", "succeeded", "failed", "cancelled"] as const;
 export const RunStatus = z.enum(RUN_STATUSES);
 export type RunStatus = z.infer<typeof RunStatus>;
 export const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "cancelled"];
@@ -37,6 +39,10 @@ export const SubagentBlock = z.discriminatedUnion("type", [
 export type SubagentBlock = z.infer<typeof SubagentBlock>;
 
 const PermissionOption = z.object({ optionId: z.string(), name: z.string(), kind: z.string() });
+
+/** An agent session of the run that an intervention can chat with, and its latest result. */
+export const InterventionSession = z.object({ id: z.string(), label: z.string(), output: z.string() });
+export type InterventionSession = z.infer<typeof InterventionSession>;
 
 const base = {
   runId: z.string(),
@@ -87,6 +93,25 @@ export const RunEvent = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("acp.elicitation_resolved"),
     payload: z.object({ requestId: z.string(), action: z.enum(["accept", "decline", "cancel"]) }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("intervention.request"),
+    payload: z.object({
+      requestId: z.string(),
+      message: z.string(),
+      /** Sessions the user can chat with, in the order they were opened. */
+      sessions: z.array(InterventionSession),
+      /** Preselected session: the one the user last chatted with, else the previous step's. */
+      session: z.string().optional(),
+      /** Why the last chat turn failed. */
+      error: z.string().optional(),
+    }),
+  }),
+  z.object({
+    ...base,
+    type: z.literal("intervention.resolved"),
+    payload: z.object({ requestId: z.string(), action: InterventionAction }),
   }),
   z.object({
     ...base,

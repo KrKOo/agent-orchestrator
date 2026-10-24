@@ -1,6 +1,6 @@
 # Agent Orchestrator
 
-Runs multi-step AI-agent **flows** (prompt → skill → command → git commit → push → PR, or GitHub PR checks) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
+Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → git commit → push → PR, or GitHub PR checks) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
 
 - `packages/protocol` — flow schema + validation, templates, run events, runner wire protocol, REST types.
 - `packages/server` — Hono API, SQLite (drizzle), scheduler, runner/browser WebSockets, GitHub (PAT or App: login, webhooks, Checks, reviews).
@@ -43,6 +43,14 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   flow editor; `harness.modelRoles` maps extra omp roles (`slow`, `plan`, `task`, …) to models, with `smol`
   (`smolModel`) and unset roles falling back to `model`.
 - git commit/push run on the host. GitHub API calls run on the server. The agent never holds GitHub credentials.
+- **Intervention steps** pause the run and open a chat under the step in the run view. Pick one of the run's
+  sessions — the shared agent (ACP) session of prompt/skill/command steps, or the `omp -p` session of an
+  earlier slash step (resumed with `--resume`) — and send any text, slash commands included; replies stream
+  into the step's transcript. *Continue run* passes the selected session's latest reply on as
+  `{{steps.<gate>.output}}`; later agent steps keep the chat in their context when they share the session.
+  While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
+  while a reply is generated. Without a timeout the run waits until answered or cancelled. Not available in
+  PR-triggered flows.
 
 ## Public control plane (M2)
 

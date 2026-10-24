@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { schema } from "../src/db";
 import { authenticateRunner, RunnerSession } from "../src/ws/runner";
 import { eventsAfter } from "../src/ws/browser";
-import { addRun, addRunner, caps, FakeLink, testDeps } from "./helpers";
+import { addRun, addRunner, caps, FakeLink, flowDef, testDeps } from "./helpers";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

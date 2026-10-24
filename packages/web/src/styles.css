@@ -247,6 +247,7 @@ textarea:focus {
   color: var(--danger);
 }
 .chip-awaiting_approval,
+.chip-awaiting_input,
 .sev-warning {
   background: color-mix(in srgb, var(--warn) 18%, transparent);
   color: var(--warn);
@@ -824,7 +825,8 @@ textarea:focus {
 }
 .step-header {
   position: sticky;
-  top: 0;
+  /* Sticky offsets start inside .run-main's 12px top padding; -12px closes that gap (matches the margin). */
+  top: -12px;
   z-index: 1;
   display: flex;
   align-items: center;
@@ -835,9 +837,18 @@ textarea:focus {
   background: var(--bg);
   border-bottom: 1px solid var(--border);
 }
+/* Step pane: scrolling transcript, plus an intervention composer docked below it when one is open. */
+.run-pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .run-main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
   padding: 12px 20px 40px;
 }
@@ -1002,6 +1013,53 @@ pre.output-card-body {
   margin: 0;
   max-height: none;
   background: none;
+}
+/* intervention chat: the reviewer note scrolls with the transcript; the composer is docked below the pane */
+.intervention-note {
+  max-width: 980px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.intervention-start {
+  max-width: 980px;
+  margin: 0 0 12px;
+  padding: 0 0 0 12px;
+  border-left: 3px solid var(--border);
+}
+.intervention-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 10px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+/* One line: what Continue passes on, previewed by its first line; expands to the full text. */
+.intervention-result-summary {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.intervention-result .collapsible-body {
+  max-height: 30vh;
+  overflow: auto;
+}
+.intervention-composer > * {
+  max-width: 980px;
+}
+.intervention-composer textarea {
+  width: 100%;
+  box-sizing: border-box;
 }
 .diagnostics {
   margin-top: 16px;
