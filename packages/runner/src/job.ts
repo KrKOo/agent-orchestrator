@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
@@ -82,6 +82,19 @@ interface ChatSession {
   /** Cap for one chat turn: the timeout of the step that last used the session. */
   timeoutSec: number;
   resume?: string;
+}
+
+/** Per succeeded step: the chat sessions as they were right after it (in the run dir, so it outlives attempts). */
+const CHAT_SESSIONS_FILE = "chat-sessions.json";
+type ChatSnapshots = Record<string, Record<string, ChatSession>>;
+
+async function readChatSnapshots(runDir: string): Promise<ChatSnapshots> {
+  try {
+    return JSON.parse(await readFile(join(runDir, CHAT_SESSIONS_FILE), "utf8")) as ChatSnapshots;
+  } catch {
+    // First attempt here (e.g. a PR checkout retried on another runner): no sessions to restore.
+    return {};
+  }
 }
 
 type Answer = { optionId: string | null } | { action: ElicitationAction; content?: Record<string, unknown> } | InterventionAnswer;
@@ -233,17 +246,27 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /** Agent step accepting MCP output, with its structured result. */
   let activeStep: { id: string; structured?: unknown } | null = null;
   let stepAbort: AbortController | null = null;
-  // A resumed run cannot continue the old ACP conversation (no ACP resume exists); treat attempt 2
-  // like a session that was already prompted so its first prompt skips the untrusted preamble only
-  // when a prior *agent* step already carried it.
-  let sessionPrompted = resume?.prior.some((p) => {
-    const s = def.steps.find((step) => step.id === p.stepId);
-    return s !== undefined && isAgentStep(s);
-  }) ?? false;
+  /** Whether the current ACP session has been prompted; its first prompt carries the untrusted preamble.
+   * A resumed run starts a fresh ACP session (ACP has no conversation resume), so this starts false. */
+  let sessionPrompted = false;
   // `github_pr` requires an earlier `git_push`; on resume a skipped succeeded push counts.
   let pushed = resume?.prior.some((p) => def.steps.find((step) => step.id === p.stepId)?.kind === "git_push") ?? false;
   /** Sessions an intervention can chat with: `agent` (the ACP session) and `slash:<stepId>` (resumable `omp -p` runs). */
   const sessions = new Map<string, ChatSession>();
+  // Chat sessions as of the cursor (the snapshot after the step before it), for interventions past it.
+  // Slash sessions resume their omp session, whose file is in the run dir; the ACP agent session is new
+  // and keeps only its last result.
+  const chatSnapshots: ChatSnapshots = fromStepIdx > 0 ? await readChatSnapshots(runDir) : {};
+  const lastAgentStep = def.steps.slice(0, fromStepIdx).findLast(isAgentStep);
+  const restartedAgent = `Agent session (new after retry; last step: ${lastAgentStep?.name ?? "?"})`;
+  for (const [id, chat] of Object.entries(chatSnapshots[def.steps[fromStepIdx - 1]?.id ?? ""] ?? {})) {
+    sessions.set(id, { ...chat, ...(id === AGENT_SESSION ? { label: restartedAgent } : {}) });
+  }
+  // No snapshot (attempt 1 predates them, or ran on another runner): the agent step's output still seeds it.
+  if (lastAgentStep && !sessions.has(AGENT_SESSION)) {
+    const output = resume?.prior.find((p) => p.stepId === lastAgentStep.id)?.output ?? "";
+    sessions.set(AGENT_SESSION, { label: restartedAgent, output, timeoutSec: lastAgentStep.timeoutSec });
+  }
 
   const onCancel = () => {
     stepAbort?.abort();
@@ -424,7 +447,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       }, chat.timeoutSec * 1000);
       let outcome: StepOutcome & { sessionId?: string };
       try {
-        outcome = id === AGENT_SESSION ? await agentTurn(text, step.id, step.id, turnAbort.signal) : await slashRun(text, step.id, turnAbort.signal, chat.resume);
+        if (id === AGENT_SESSION) {
+          // On a retried run this can be the fresh ACP session's first prompt.
+          const agentText = run.trust === "untrusted" && !sessionPrompted ? `${UNTRUSTED_PREAMBLE}\n\n${text}` : text;
+          sessionPrompted = true;
+          outcome = await agentTurn(agentText, step.id, step.id, turnAbort.signal);
+        } else {
+          outcome = await slashRun(text, step.id, turnAbort.signal, chat.resume);
+        }
       } catch (err) {
         outcome = { status: "failed", error: errorText(err) };
       } finally {
@@ -646,6 +676,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         const outcome = await runStep(step, def.steps[i - 1]);
         ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
         emit({ type: "step.finished", payload: outcome }, step.id);
+        if (outcome.status === "succeeded") {
+          // Written even when empty so every succeeded step replaces any snapshot an older attempt left.
+          // Copies: gate chats mutate sessions in place, which must not rewrite earlier snapshots.
+          chatSnapshots[step.id] = Object.fromEntries([...sessions].map(([id, s]) => [id, { ...s }]));
+          await writeFile(join(runDir, CHAT_SESSIONS_FILE), JSON.stringify(chatSnapshots)).catch((err) =>
+            console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
+          );
+        }
         if (outcome.status !== "succeeded") {
           status = outcome.status;
           error = outcome.error;

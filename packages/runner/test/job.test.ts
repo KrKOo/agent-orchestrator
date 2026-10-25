@@ -733,6 +733,66 @@ describe("runJob", () => {
       expect(existsSync(join(worktree, "fresh.txt"))).toBe(true);
     });
 
+    test("an intervention retried after a cancel can chat again: slash sessions resume, the agent session is new", async () => {
+      const steps: FlowDefinitionInput["steps"] = [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan", args: "an app" },
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "hi" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ];
+      // Attempt 1 is cancelled at the gate.
+      const first = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({ steps });
+      await runJob(run, first.deps, new AbortController().signal, scriptedGate(first.deps, first.events, [{ action: "cancel" }]));
+      expect(first.sent.at(-1)).toMatchObject({ status: "cancelled" });
+
+      const retry = assigned({ steps });
+      retry.runId = run.runId;
+      retry.resume = { fromStepIdx: 2, prior: [{ stepId: "plan", output: "print:/plan an app\n" }, { stepId: "impl", output: "Hello, world" }] };
+      const second = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(second.deps, second.events, [
+        { action: "message", session: "slash:plan", text: "add tests" },
+        { action: "message", session: "agent", text: "echo again" },
+        { action: "continue", session: "agent" },
+      ]);
+      await runJob(retry, second.deps, new AbortController().signal, pending);
+
+      expect(second.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(second.events, "intervention.request");
+      expect(requests[0]!.payload.sessions).toEqual([
+        { id: "slash:plan", label: "/plan (Plan)", output: "print:/plan an app\n" },
+        { id: "agent", label: "Agent session (new after retry; last step: Implement)", output: "Hello, world" },
+      ]);
+      expect(requests[0]!.payload.session).toBe("agent");
+      // The slash session continues attempt 1's omp session; the agent session takes messages again.
+      expect(requests[1]!.payload.sessions[0]!.output).toBe("print:(resumed fake) add tests\n");
+      const finished = Object.fromEntries(ofType(second.events, "step.finished").map((e) => [e.stepId, e.payload]));
+      expect(finished.gate).toMatchObject({ status: "succeeded" });
+      expect(finished.gate!.output).toContain("echo again");
+    });
+
+    test("a retried intervention without a session snapshot still offers the agent session", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "message", session: "agent", text: "echo again" }, { action: "continue" }]);
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Implement", prompt: "hi" },
+              { kind: "intervention", id: "gate", name: "Gate" },
+            ],
+          },
+          "gate",
+        ),
+      );
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "intervention.request")[0]!.payload.sessions).toEqual([
+        { id: "agent", label: "Agent session (new after retry; last step: Implement)", output: "prior-output" },
+      ]);
+      expect(ofType(events, "step.finished")[0]!.payload.output).toContain("echo again");
+    });
+
     test("worktree gone: a mid-run retry fails; from step 0 recreates it on the existing branch", async () => {
       const steps: FlowDefinitionInput["steps"] = [
         { kind: "prompt", id: "write", name: "Write", prompt: "write hello.txt" },

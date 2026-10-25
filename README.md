@@ -60,7 +60,9 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   ref; PR-checkout runs always start from a fresh checkout of the PR head. Outputs of skipped steps come back as
   `{{steps.…}}`, and the event transcript continues in one view with continuous sequence numbers even across runner
   restarts. Agent steps resume in a fresh session (ACP has no conversation resume); the sandbox is recreated per
-  attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over.
+  attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over. A retried intervention lists the run's sessions
+  again: slash sessions continue their earlier conversation, the agent session is a new one that starts from its
+  last result.
   PR-triggered runs get a fresh check run for the new attempt (a recurring finding may post a duplicate review).
 
 ## Public control plane (M2)
