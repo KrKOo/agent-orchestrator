@@ -67,4 +67,19 @@ describe("applyRunEvents", () => {
     // Replayed events (seq <= lastSeq) are ignored.
     expect(applyRunEvents(s, events)).toBe(s);
   });
+
+  test("a non-terminal run.status clears a stale error; a terminal one keeps it", () => {
+    seq = 0;
+    const failed = applyRunEvents(initialRunViewState, [
+      ev({ type: "run.status", payload: { status: "running" } }),
+      ev({ type: "run.status", payload: { status: "failed", error: "step blew up" } }),
+    ]);
+    expect(failed.error).toBe("step blew up");
+    // Retry: the run re-enters queued; the previous attempt's banner must not stick around.
+    expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "queued" } })]).error).toBeUndefined();
+    expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "running" } })]).error).toBeUndefined();
+    // A terminal status with its own error replaces it; without one it keeps the sticky error.
+    expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "cancelled" } })]).error).toBe("step blew up");
+    expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "failed", error: "again" } })]).error).toBe("again");
+  });
 });

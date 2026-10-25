@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { and, eq } from "drizzle-orm";
 import { isEligible, isUnderRoot, RUNNER_LOST_MS, Scheduler, type RunnerState } from "../src/scheduler";
+import { schema } from "../src/db";
 import { addRun, addRunner, caps, connectRunner, flowDef, testDeps } from "./helpers";
 
 const NOW = 1_000_000_000;
@@ -87,11 +89,39 @@ describe("Scheduler.kick", () => {
     expect(a.of("job.assign").map((m) => m.run.runId)).toEqual([r1]);
     expect(b.of("job.assign").map((m) => m.run.runId)).toEqual([r2]);
     expect(a.of("job.assign")[0]!.run).toMatchObject({ trust: "owner", definition: { name: "test flow" } });
+    // Fresh runs carry neither resume payload.
+    expect(a.of("job.assign")[0]!.run.resume).toBeUndefined();
+    expect(a.of("job.assign")[0]!.run.seqFrom).toBeUndefined();
 
     // Finishing r1 frees ra; the next kick assigns r3 there.
     deps.runs.finish(r1, "succeeded");
     deps.scheduler.kick();
     expect(status(r3)).toMatchObject({ status: "assigned", runnerId: "ra" });
+  });
+
+  test("a retried run is assigned with resume.prior from run_steps and a continuing seqFrom", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const def = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "first" },
+        { id: "b", name: "B", kind: "prompt", prompt: "second" },
+      ],
+    });
+    const run = addRun(deps, { definition: def, status: "failed" });
+    deps.db
+      .update(schema.runSteps)
+      .set({ status: "succeeded", output: "A out", structured: { n: 1 } })
+      .where(and(eq(schema.runSteps.runId, run), eq(schema.runSteps.stepId, "a")))
+      .run();
+    deps.runs.retry(run, 1); // appends `run.status queued` at seq 1
+
+    deps.scheduler.kick();
+
+    const assigned = link.of("job.assign")[0]!.run;
+    expect(assigned.resume).toEqual({ fromStepIdx: 1, prior: [{ stepId: "a", output: "A out", structured: { n: 1 } }] });
+    expect(assigned.seqFrom).toBe(2); // maxSeq (the queued event) + 1
+    expect(deps.runs.get(run)).toMatchObject({ status: "assigned", resumeFrom: 1 });
   });
 
   test("leaves runs queued when only ineligible runners are online", () => {

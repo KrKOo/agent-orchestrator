@@ -1,5 +1,5 @@
 import { TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
-import { and, eq, max, type ExtractTablesWithRelations } from "drizzle-orm";
+import { and, eq, gte, max, type ExtractTablesWithRelations } from "drizzle-orm";
 import type { SQLiteBunTransaction } from "drizzle-orm/bun-sqlite/session";
 import { schema, type Db } from "./db";
 import type { Hub } from "./hub";
@@ -15,6 +15,10 @@ export type CancelOutcome = "not_found" | "already_terminal" | "cancelled" | "re
 
 /** How long a runner gets to report a requested cancel before the server marks the run cancelled itself. */
 export const CANCEL_GRACE_MS = 30_000;
+
+export type RetryOutcome =
+  | { ok: true; error?: undefined }
+  | { ok: false; error: "not_found" | "not_failed" | "bad_step" | "unfinished_steps" };
 
 /** Persistence + projection of run events, and server-side run state changes. */
 export class RunService {
@@ -84,6 +88,45 @@ export class RunService {
     const final: RunStatus = isTerminal(status) ? status : "failed";
     const err = error ?? (final === status ? undefined : `runner finished with non-terminal status ${status}`);
     this.db.transaction((tx) => this.markTerminal(tx, run, final, Date.now(), err));
+  }
+
+  /**
+   * Moves a `failed` run back to `queued` so the scheduler re-dispatches it: steps `idx >= fromStepIdx`
+   * reset to pending, earlier steps keep their outputs, and the step cursor travels with the run.
+   * Appends the server-invented `run.status {status: "queued"}` event so the transcript stays one run.
+   */
+  retry(runId: string, fromStepIdx: number): RetryOutcome {
+    const run = this.get(runId);
+    if (!run) return { ok: false, error: "not_found" };
+    if (run.status !== "failed") return { ok: false, error: "not_failed" };
+    if (fromStepIdx < 0 || fromStepIdx >= run.definition.steps.length) return { ok: false, error: "bad_step" };
+    const prior = this.db
+      .select({ idx: runSteps.idx, status: runSteps.status })
+      .from(runSteps)
+      .where(eq(runSteps.runId, runId))
+      .all();
+    if (prior.some((s) => s.idx < fromStepIdx && s.status !== "succeeded")) return { ok: false, error: "unfinished_steps" };
+    const ev: RunEvent = {
+      runId,
+      seq: this.maxSeq(runId) + 1,
+      ts: Date.now(),
+      type: "run.status",
+      payload: { status: "queued" },
+    };
+    this.db.transaction((tx) => {
+      tx.update(runSteps)
+        .set({ status: "pending", output: null, structured: null, startedAt: null, finishedAt: null })
+        .where(and(eq(runSteps.runId, runId), gte(runSteps.idx, fromStepIdx)))
+        .run();
+      tx.update(runs)
+        .set({ status: "queued", runnerId: null, error: null, finishedAt: null, resumeFrom: fromStepIdx })
+        .where(eq(runs.id, runId))
+        .run();
+      tx.insert(runEvents).values({ runId, seq: ev.seq, ts: ev.ts, type: ev.type, payload: ev.payload }).run();
+      this.project(tx, ev);
+    });
+    this.hub.publish(ev);
+    return { ok: true };
   }
 
   /**
@@ -178,7 +221,7 @@ export class RunService {
 
   private markTerminal(tx: Tx, run: RunRecord, status: RunStatus, ts: number, error: string | undefined): void {
     tx.update(runs)
-      .set({ status, finishedAt: ts, ...(error === undefined ? {} : { error }) })
+      .set({ status, finishedAt: ts, resumeFrom: null, ...(error === undefined ? {} : { error }) })
       .where(eq(runs.id, run.id))
       .run();
     // A step still marked running was interrupted. Late `step.finished` events from the runner still overwrite this.

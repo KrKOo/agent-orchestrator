@@ -43,6 +43,8 @@ export interface JobDeps {
   mcp: McpOutputServer;
   /** DockerSandboxProvider in prod, FakeSandbox in tests. */
   sandboxes: SandboxProvider;
+  /** Outbox for seq continuation on resume (`seed`); emits go through `emit`. */
+  seedOutbox(runId: string, seqFrom: number): void;
   /** → outbox.append */
   emit(draft: RunEventDraft): void;
   /** job.accepted / job.rejected / job.finished */
@@ -212,7 +214,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   const adapter = harnesses[def.harness.id]!;
   const runDir = join(deps.config.dataDir, "runs", runId);
+  // Resume: prior succeeded outputs repopulate the template context; the loop starts at the cursor.
+  const resume = run.resume;
+  const fromStepIdx = resume?.fromStepIdx ?? 0;
   const ctx: TemplateContext = { inputs: run.inputs, steps: {} };
+  for (const prior of resume?.prior ?? []) {
+    ctx.steps[prior.stepId] = { output: prior.output, ...(prior.structured !== undefined ? { structured: prior.structured } : {}) };
+  }
   let status: StepOutcome["status"] = "succeeded";
   let error: string | undefined;
   let workspace: PreparedWorkspace | null = null;
@@ -225,8 +233,15 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /** Agent step accepting MCP output, with its structured result. */
   let activeStep: { id: string; structured?: unknown } | null = null;
   let stepAbort: AbortController | null = null;
-  let sessionPrompted = false;
-  let pushed = false;
+  // A resumed run cannot continue the old ACP conversation (no ACP resume exists); treat attempt 2
+  // like a session that was already prompted so its first prompt skips the untrusted preamble only
+  // when a prior *agent* step already carried it.
+  let sessionPrompted = resume?.prior.some((p) => {
+    const s = def.steps.find((step) => step.id === p.stepId);
+    return s !== undefined && isAgentStep(s);
+  }) ?? false;
+  // `github_pr` requires an earlier `git_push`; on resume a skipped succeeded push counts.
+  let pushed = resume?.prior.some((p) => def.steps.find((step) => step.id === p.stepId)?.kind === "git_push") ?? false;
   /** Sessions an intervention can chat with: `agent` (the ACP session) and `slash:<stepId>` (resumable `omp -p` runs). */
   const sessions = new Map<string, ChatSession>();
 
@@ -601,7 +616,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       });
       checkCancelled();
 
-      tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId));
+      tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId), { fromEnd: resume !== undefined });
       tail.start();
       const mcp = deps.mcp.registerRun(runId, sink);
       mcpRegistered = true;
@@ -619,6 +634,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       }
 
       for (const [i, step] of def.steps.entries()) {
+        if (i < fromStepIdx) continue;
         if (signal.aborted) {
           status = "cancelled";
           break;
@@ -671,6 +687,7 @@ export class JobManager {
       this.deps.send({ t: "job.rejected", runId: run.runId, reason: "Runner at capacity" });
       return;
     }
+    if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
     const abort = new AbortController();
     const pending = new PendingRequests();
     const done = runJob(run, this.deps, abort.signal, pending)

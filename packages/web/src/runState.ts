@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import type { Finding, InterventionSession, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
+import { TERMINAL_STATUSES, type Finding, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -202,13 +202,16 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
   if (ev.seq <= state.lastSeq) return state;
   const s: RunViewState = { ...state, lastSeq: ev.seq };
   switch (ev.type) {
-    case "run.status":
+    case "run.status": {
+      // A retried run re-enters a non-terminal status: the previous attempt's error no longer applies.
+      const error = TERMINAL_STATUSES.includes(ev.payload.status) ? (ev.payload.error ?? s.error) : undefined;
       return {
         ...s,
         status: ev.payload.status,
-        error: ev.payload.error ?? s.error,
+        error,
         workspace: ev.payload.workspace ?? s.workspace,
       };
+    }
     case "step.started":
       return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) => ({ ...st, status: "running" }));
     case "step.finished":

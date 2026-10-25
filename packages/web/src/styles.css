@@ -823,6 +823,15 @@ textarea:focus {
   font-size: 11px;
   min-width: 0;
 }
+/* Per-step "Run from here" action shown on failed runs. */
+.step-retry {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 11px;
+}
+.step-retry:hover {
+  border-color: var(--border);
+}
 .step-header {
   position: sticky;
   /* Sticky offsets start inside .run-main's 12px top padding; -12px closes that gap (matches the margin). */

@@ -61,6 +61,19 @@ export class Outbox {
     }
   }
 
+  /**
+   * Raises the run's seq counter so the next append continues at `seq` (the server sends `seqFrom`
+   * on resume; a different runner would otherwise restart at 1 and the server would drop every
+   * event). Never lowers the counter: unacked rows from an earlier attempt replay above it and
+   * dedupe by seq server-side.
+   */
+  seed(runId: string, seq: number): void {
+    this.db.run(
+      "INSERT INTO run_seq (run_id, last_seq) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET last_seq = max(last_seq, excluded.last_seq)",
+      [runId, seq - 1],
+    );
+  }
+
   append(draft: RunEventDraft): void {
     const runId = draft.runId;
     const incoming = { ...draft, ts: draft.ts ?? Date.now() };

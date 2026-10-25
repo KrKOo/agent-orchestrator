@@ -64,7 +64,10 @@ export class RunEventStream {
         const ev = parsed.data;
         if (ev.seq <= this.lastSeq) continue;
         this.lastSeq = ev.seq;
-        if (ev.type === "run.status" && TERMINAL_STATUSES.includes(ev.payload.status)) this.terminal = true;
+        if (ev.type === "run.status") {
+          // A retried run re-enters queued: resume streaming after a terminal attempt-1 was seen.
+          this.terminal = TERMINAL_STATUSES.includes(ev.payload.status);
+        }
         this.pending.push(ev);
       }
       if (this.pending.length > 0 && this.frame === null) this.frame = requestAnimationFrame(() => this.flush());

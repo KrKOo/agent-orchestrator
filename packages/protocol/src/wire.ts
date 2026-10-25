@@ -35,6 +35,16 @@ export const AssignedRun = z.object({
   github: z
     .object({ repo: z.string(), number: z.number().int(), headSha: z.string(), baseSha: z.string() })
     .optional(),
+  /** Present on retry: the run restarts at `fromStepIdx` with prior succeeded step outputs preloaded. */
+  resume: z
+    .object({
+      fromStepIdx: z.number().int().min(0),
+      /** Outputs of succeeded steps before the cursor, in step order. */
+      prior: z.array(z.object({ stepId: z.string(), output: z.string(), structured: z.unknown().optional() })),
+    })
+    .optional(),
+  /** First event seq of this attempt; the runner seeds its outbox counter with it (absent on fresh runs). */
+  seqFrom: z.number().int().min(1).optional(),
 });
 export type AssignedRun = z.infer<typeof AssignedRun>;
 

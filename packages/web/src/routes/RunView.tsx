@@ -35,6 +35,7 @@ function RunViewInner({ runId }: { runId: string }) {
   const [pickedSession, setPickedSession] = useState<{ stepId: string; id: string } | null>(null);
   const cancel = useMutation({ mutationFn: () => api.cancelRun(runId) });
   const approve = useMutation({ mutationFn: () => api.approveRun(runId), onSuccess: () => detail.refetch() });
+  const retry = useMutation({ mutationFn: (fromStepId: string | undefined) => api.retryRun(runId, fromStepId) });
 
   // Pick up the final error/timestamps once the stream reports a terminal status.
   useEffect(() => {
@@ -103,6 +104,17 @@ function RunViewInner({ runId }: { runId: string }) {
               {approve.isPending ? "Approving…" : "Approve"}
             </button>
           )}
+          {runStatus === "failed" && (
+            <button
+              type="button"
+              className="btn primary"
+              disabled={retry.isPending}
+              title="Re-run the failed step and continue from there (fresh agent session, same workspace)"
+              onClick={() => retry.mutate(undefined)}
+            >
+              {retry.isPending ? "Retrying…" : "Retry"}
+            </button>
+          )}
           {!runTerminal && (
             <button
               type="button"
@@ -166,6 +178,7 @@ function RunViewInner({ runId }: { runId: string }) {
         )}
         {cancel.error && <p className="error">{errorMessage(cancel.error)}</p>}
         {approve.error && <p className="error">{errorMessage(approve.error)}</p>}
+        {retry.error && <p className="error">{errorMessage(retry.error)}</p>}
         {findings.length > 0 && (
           <Collapsible summary={`Findings (${findings.length})`} defaultOpen>
             <table className="table compact">
@@ -203,6 +216,7 @@ function RunViewInner({ runId }: { runId: string }) {
         <nav className="step-list">
           {steps.map((s, idx) => {
             const row = stepRows.get(s.id);
+            const failedRun = runStatus === "failed";
             return (
               <button
                 key={s.id}
@@ -218,6 +232,19 @@ function RunViewInner({ runId }: { runId: string }) {
                     {row?.startedAt && <span className="muted">{formatDuration(row.startedAt, row.finishedAt)}</span>}
                   </span>
                 </span>
+                {failedRun && (
+                  <span
+                    className="btn small step-retry"
+                    title={`Reset this step and everything after, then re-run from here (steps before it keep their outputs)`}
+                    onClick={(e) => {
+                      // The row is a selection button; the action must not change the selection.
+                      e.stopPropagation();
+                      retry.mutate(s.id);
+                    }}
+                  >
+                    Run from here
+                  </span>
+                )}
                 <StatusChip status={state.steps[s.id]?.status ?? row?.status ?? "pending"} />
               </button>
             );

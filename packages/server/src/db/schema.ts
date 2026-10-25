@@ -29,6 +29,8 @@ export const runs = sqliteTable(
     createdAt: integer("created_at").notNull(),
     startedAt: integer("started_at"),
     finishedAt: integer("finished_at"),
+    /** Set while a retried run is non-terminal: the step idx it restarts from (cleared on terminal). */
+    resumeFrom: integer("resume_from"),
     /** Host workspace (path/branch/repo) reported by the runner once the run starts. */
     workspace: text("workspace", { mode: "json" }).$type<WorkspaceInfo>(),
   },

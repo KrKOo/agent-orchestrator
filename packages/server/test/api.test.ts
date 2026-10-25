@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
+import { and, eq } from "drizzle-orm";
 import type { Catalog, FlowRow, RunDetail, RunRow } from "@orch/protocol";
 import { FS_LIST_TIMEOUT_MS } from "../src/api/runners";
 import { createApp } from "../src/app";
+import { schema } from "../src/db";
 import type { AppDeps } from "../src/deps";
 import { PatCredentials } from "../src/github/credentials";
 import { addRun, caps, connectRunner, flowDef, testDeps } from "./helpers";
@@ -146,6 +148,54 @@ describe("runs API", () => {
     ]);
     expect((await call("POST", `/api/runs/${running}/elicitations/e2`, { action: "maybe" })).status).toBe(400);
     expect((await call("POST", `/api/runs/${orphan}/permissions/p1`, { optionId: "allow" })).status).toBe(409);
+  });
+
+  test("retry: failed run requeues with the step cursor, resets later steps and keeps prior outputs", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const def = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "first" },
+        { id: "b", name: "B", kind: "prompt", prompt: "second {{steps.a.output}}" },
+        { id: "c", name: "C", kind: "prompt", prompt: "third" },
+      ],
+    });
+    const run = addRun(deps, { definition: def, status: "failed", error: "step b failed" });
+    deps.db
+      .update(schema.runSteps)
+      .set({ status: "succeeded", output: "A out", finishedAt: 1 })
+      .where(and(eq(schema.runSteps.runId, run), eq(schema.runSteps.stepId, "a")))
+      .run();
+    deps.db
+      .update(schema.runSteps)
+      .set({ status: "failed", output: "B out" })
+      .where(and(eq(schema.runSteps.runId, run), eq(schema.runSteps.stepId, "b")))
+      .run();
+    deps.runs.ingest(run, [{ runId: run, seq: 1, ts: 1, type: "run.status", payload: { status: "running" } }]);
+
+    expect((await call("POST", `/api/runs/${run}/retry`, { fromStepId: "nope" })).status).toBe(400);
+    expect((await call("POST", `/api/runs/${run}/retry`, { fromStepId: "c" })).status).toBe(409); // b not succeeded
+    expect((await call("POST", `/api/runs/${addRun(deps, { status: "succeeded" })}/retry`, {})).status).toBe(409);
+    expect((await call("POST", "/api/runs/missing/retry", {})).status).toBe(404);
+
+    expect((await call("POST", `/api/runs/${run}/retry`, {})).json).toEqual({ ok: true });
+    // The kick inside the route re-dispatches the run with its resume payload.
+    deps.scheduler.kick();
+    const row = deps.runs.get(run)!;
+    expect(row).toMatchObject({ status: "assigned", runnerId: "r1", error: null, finishedAt: null, resumeFrom: 1 });
+    const steps = deps.db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, run)).all();
+    expect(steps.find((s) => s.stepId === "a")).toMatchObject({ status: "succeeded", output: "A out" });
+    expect(steps.find((s) => s.stepId === "b")).toMatchObject({ status: "pending", output: null });
+    expect(steps.find((s) => s.stepId === "c")).toMatchObject({ status: "pending", output: null });
+    // The retry's own `run.status queued` event continues the transcript's seq.
+    expect(deps.runs.maxSeq(run)).toBe(2);
+    const assign = link.of("job.assign")[0]!.run;
+    expect(assign.resume).toEqual({ fromStepIdx: 1, prior: [{ stepId: "a", output: "A out" }] });
+    expect(assign.seqFrom).toBe(3);
+
+    // Double retry (the run is assigned again, non-terminal) is 409.
+    expect((await call("POST", `/api/runs/${run}/retry`, {})).status).toBe(409);
   });
 
   test("intervention answers are validated and relayed to the runner holding the run", async () => {
