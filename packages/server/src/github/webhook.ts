@@ -1,13 +1,13 @@
-import { PR_DIFF_PATH, wrapUntrustedText, type PullRequestInput, type RunStatus } from "@orch/protocol";
+import type { RunStatus } from "@orch/protocol";
 import type { Webhooks } from "@octokit/webhooks";
 import { and, eq, inArray } from "drizzle-orm";
-import { ulid } from "ulid";
 import { z } from "zod";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
 import { ACTIVE_STATUSES } from "../scheduler";
+import { startPullRequestRun } from "./pullRun";
 
-const { flows, runs, runSteps, webhookDeliveries } = schema;
+const { flows, runs, webhookDeliveries } = schema;
 
 const PullRequestEvent = z.object({
   action: z.string(),
@@ -126,48 +126,26 @@ function createPullRequestRuns(deps: AppDeps, ev: PullRequestEvent): { runId: st
       if (trigger.forkPolicy === "require_approval") status = "awaiting_approval";
     }
 
-    const prInput: PullRequestInput = {
-      repo,
-      number: pr.number,
-      title: wrapUntrustedText(pr.title),
-      body: wrapUntrustedText(pr.body ?? ""),
-      baseSha: pr.base.sha,
-      headSha,
-      diffPath: PR_DIFF_PATH,
-    };
-    const id = ulid();
-    const inserted = db.transaction((tx) => {
-      const rows = tx
-        .insert(runs)
-        .values({
-          id,
-          flowId: flow.id,
-          flowVersion: flow.version,
-          definition: flow.definition,
-          inputs: { pr: prInput },
-          status,
-          trust: "untrusted",
-          triggerKind: "github",
-          dedupeKey,
-          github: {
-            ...(ev.installation ? { installationId: ev.installation.id } : {}),
-            repo,
-            number: pr.number,
-            headSha,
-            baseSha: pr.base.sha,
-          },
-          createdAt: Date.now(),
-        })
-        .onConflictDoNothing()
-        .returning({ id: runs.id })
-        .all();
-      if (rows.length === 0) return false;
-      tx.insert(runSteps)
-        .values(flow.definition.steps.map((s, idx) => ({ runId: id, stepId: s.id, idx, status: "pending" as const })))
-        .run();
-      return true;
-    });
-    if (!inserted) continue;
+    const id = startPullRequestRun(
+      deps,
+      flow,
+      {
+        repo,
+        number: pr.number,
+        title: pr.title,
+        body: pr.body ?? "",
+        baseSha: pr.base.sha,
+        headSha,
+      },
+      {
+        ...(ev.installation ? { installationId: ev.installation.id } : {}),
+        dedupeKey,
+        status,
+        trust: "untrusted",
+        triggerKind: "github",
+      },
+    );
+    if (id === null) continue;
     console.log(`[webhook] ${repo}#${pr.number}@${sha7} (${ev.action}) → run ${id} (${status}) for flow ${flow.name}`);
     out.push({ runId: id, awaiting: status === "awaiting_approval" });
   }

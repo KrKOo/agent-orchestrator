@@ -48,6 +48,7 @@ function withTrigger(def: FlowDefinition, kind: FlowDefinition["trigger"]["kind"
       events: [...PR_EVENTS],
       forkPolicy: "require_approval",
       postReview: true,
+      postChecks: true,
     },
     workspace: { kind: "github_checkout" },
     inputs: [],
@@ -162,7 +163,16 @@ export function InputsPanel({
             <label className="check">
               <input
                 type="checkbox"
-                checked={trigger.postReview}
+                checked={trigger.postChecks !== false}
+                onChange={(e) => setPr({ postChecks: e.target.checked })}
+              />
+              Publish a check run on the pull request head
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={trigger.postReview && trigger.postChecks !== false}
+                disabled={trigger.postChecks === false}
                 onChange={(e) => setPr({ postReview: e.target.checked })}
               />
               Post a review with inline comments for findings

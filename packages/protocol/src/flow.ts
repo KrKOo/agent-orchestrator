@@ -93,6 +93,8 @@ export const GitHubPullRequestTrigger = z.object({
   /** Check run name; defaults to the flow name (see `checkNameOf`). */
   checkName: z.string().min(1).optional(),
   postReview: z.boolean().default(true),
+  /** Publish progress and results as a GitHub check run on the PR head; `false` keeps results in the runs view only. */
+  postChecks: z.boolean().default(true),
 });
 export type GitHubPullRequestTrigger = z.infer<typeof GitHubPullRequestTrigger>;
 export const Trigger = z.discriminatedUnion("kind", [ManualTrigger, GitHubPullRequestTrigger]);

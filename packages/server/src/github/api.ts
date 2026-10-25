@@ -3,6 +3,20 @@ import type { CheckAnnotation, CheckConclusion } from "./report";
 import type { ChangedFile } from "./review";
 
 export const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/;
+export const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/;
+
+/** PR metadata the run-creation paths need; `baseSha`/`headSha` pin the checkout. */
+export interface PullRequestInfo {
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  baseSha: string;
+  headSha: string;
+}
+
+/** The subset `startPullRequestRun` consumes. */
+export type PullRunInput = Pick<PullRequestInfo, "repo" | "number" | "title" | "body" | "baseSha" | "headSha">;
 
 export class GitHubError extends Error {
   /** `status` is the GitHub HTTP status, or 0 for invalid input / network failures. */
@@ -108,6 +122,30 @@ export class GitHubApi {
       token,
     );
     return { url: issue.html_url, repo: `${owner}/${name}`, number: issue.number, title: issue.title, body: issue.body ?? "" };
+  }
+
+  /** Resolves a PR URL to the metadata run creation needs. Deleted fork heads (`head.repo === null`) are an error. */
+  async getPull(url: string, token: string | null): Promise<PullRequestInfo> {
+    const m = PR_URL_RE.exec(url.trim());
+    if (!m) throw new GitHubError("Invalid GitHub pull request URL", 0);
+    const [, owner, name, num] = m;
+    const pr = await this.request<{
+      number: number;
+      title: string;
+      body: string | null;
+      head: { sha: string; repo: { full_name: string } | null };
+      base: { sha: string; repo: { full_name: string } };
+    }>("GET", `/repos/${owner}/${name}/pulls/${num}`, token);
+    if (pr.head.repo === null) throw new GitHubError(`Pull request ${num} head repository was deleted`, 404);
+    return {
+      // Canonical casing from GitHub, not the URL's (scheduler keys the per-repo cap on this).
+      repo: pr.base.repo.full_name,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body ?? "",
+      baseSha: pr.base.sha,
+      headSha: pr.head.sha,
+    };
   }
 
   /** Opens a PR; a null `base` targets the repository's default branch. */

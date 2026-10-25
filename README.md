@@ -79,3 +79,7 @@ GitHub App settings:
 A flow with `trigger: {kind: "github_pull_request", repos: ["owner/name"]}` and `workspace: {kind: "github_checkout"}` runs on each matching PR event, on runners with `acceptUntrusted: true`. Prompts can use `{{inputs.pr.title|body|diffPath|…}}`. Results are reported as a check run (with annotations) and a COMMENT review.
 
 Fork and first-time-contributor PRs follow `forkPolicy` (default `require_approval`; approve them from the run view).
+
+Saved PR flows can also be started by hand: the flow editor's Run button takes a pull request URL, or `POST /api/flows/<id>/runs` with `{"prUrl": "https://github.com/owner/repo/pull/123"}`. The PR's repository must be in the flow's `repos` list; manual PR runs are untrusted like webhook runs (so they need an `acceptUntrusted` runner), report to GitHub the same way, and are not deduped — running the same PR twice creates two runs.
+
+GitHub reporting is per flow: `postChecks` (default `true`) publishes the check run with progress and result annotations, and `postReview` (default `true`) posts the COMMENT review when the agent reports findings — the review rides on the check run, so `postChecks: false` disables it too. With both off, results appear only in the orchestrator's run view.

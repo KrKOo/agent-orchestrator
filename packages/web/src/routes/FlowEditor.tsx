@@ -386,12 +386,12 @@ export function FlowEditor() {
         <button
           type="button"
           className="btn"
-          disabled={isNew || dirty || prFlow}
+          disabled={isNew || dirty}
           title={
-            prFlow
-              ? "Pull request flows run on GitHub pull request events"
-              : isNew || dirty
-                ? "Save the flow before running it"
+            isNew || dirty
+              ? "Save the flow before running it"
+              : prFlow
+                ? "Run the flow on a specific pull request"
                 : undefined
           }
           onClick={() => setRunning(true)}
@@ -509,17 +509,19 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const defs = flow.definition.inputs;
+  const prFlow = flow.definition.trigger.kind === "github_pull_request";
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(defs.map((d) => [d.key, ""])),
   );
+  const [prUrl, setPrUrl] = useState("");
   const start = useMutation({
-    mutationFn: () => api.startRun(flow.id, values),
+    mutationFn: () => api.startRun(flow.id, prFlow ? { prUrl: prUrl.trim() } : { inputs: values }),
     onSuccess: (run) => {
       qc.invalidateQueries({ queryKey: ["runs"] });
       navigate(`/runs/${run.id}`);
     },
   });
-  const missing = defs.filter((d) => d.required && !values[d.key]?.trim());
+  const missing = prFlow ? (prUrl.trim() ? [] : ["pr"]) : defs.filter((d) => d.required && !values[d.key]?.trim());
 
   return (
     <Modal
@@ -541,28 +543,45 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
         </>
       }
     >
-      {defs.length === 0 && <p className="muted">This flow has no inputs.</p>}
-      {defs.map((d) => (
-        <label key={d.key} className="field">
+      {prFlow ? (
+        <label className="field">
           <span>
-            {d.label || d.key} {d.required && <span className="muted">*</span>}
+            Pull request URL <span className="muted">*</span>
           </span>
-          {d.type === "github_issue" ? (
-            <input
-              type="url"
-              placeholder="https://github.com/owner/repo/issues/123"
-              value={values[d.key] ?? ""}
-              onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
-            />
-          ) : (
-            <textarea
-              rows={3}
-              value={values[d.key] ?? ""}
-              onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
-            />
-          )}
+          <input
+            type="url"
+            placeholder="https://github.com/owner/repo/pull/123"
+            value={prUrl}
+            onChange={(e) => setPrUrl(e.target.value)}
+            autoFocus
+          />
         </label>
-      ))}
+      ) : (
+        <>
+          {defs.length === 0 && <p className="muted">This flow has no inputs.</p>}
+          {defs.map((d) => (
+            <label key={d.key} className="field">
+              <span>
+                {d.label || d.key} {d.required && <span className="muted">*</span>}
+              </span>
+              {d.type === "github_issue" ? (
+                <input
+                  type="url"
+                  placeholder="https://github.com/owner/repo/issues/123"
+                  value={values[d.key] ?? ""}
+                  onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
+                />
+              ) : (
+                <textarea
+                  rows={3}
+                  value={values[d.key] ?? ""}
+                  onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
+                />
+              )}
+            </label>
+          ))}
+        </>
+      )}
       {start.error && <p className="error">{errorMessage(start.error)}</p>}
     </Modal>
   );

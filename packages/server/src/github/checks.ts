@@ -65,6 +65,8 @@ export class CheckReporter {
   /** Creates the run's check run (status queued) and stores its id in `runs.github.checkRunId`. */
   createCheckRun(runId: string, awaitingApproval: boolean): void {
     if (!this.deps.credentials.configured) return;
+    const run = this.deps.runs.get(runId);
+    if (!run || !this.reportable(run)) return;
     this.enqueue(runId, "check run creation", async () => {
       const run = this.deps.runs.get(runId);
       const gh = run?.github;
@@ -89,11 +91,18 @@ export class CheckReporter {
     });
   }
 
+  /** True when the run carries GitHub info and its flow wants check-run reporting. */
+  private reportable(run: RunRecord): boolean {
+    if (!run.github) return false;
+    const trigger = run.definition.trigger;
+    return trigger.kind === "github_pull_request" && trigger.postChecks !== false;
+  }
+
   private onEvent(ev: RunEvent): void {
     if (!this.deps.credentials.configured) return;
     if (ev.type !== "run.status" && ev.type !== "step.finished") return;
     const run = this.deps.runs.get(ev.runId);
-    if (!run || run.triggerKind !== "github" || !run.github) return;
+    if (!run || !this.reportable(run)) return;
     if (ev.type === "step.finished") {
       this.enqueue(run.id, "step progress update", () => this.reportProgress(run.id));
       return;

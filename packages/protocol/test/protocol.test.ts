@@ -242,6 +242,7 @@ describe("validateFlow for github_pull_request flows", () => {
       events: ["opened", "synchronize", "reopened", "ready_for_review"],
       forkPolicy: "require_approval",
       postReview: true,
+      postChecks: true,
     });
   });
 
