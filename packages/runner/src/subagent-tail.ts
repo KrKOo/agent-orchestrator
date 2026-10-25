@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { open, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { RunEventOf, SubagentBlock } from "@orch/protocol";
@@ -84,15 +84,35 @@ export class SubagentTail {
   private readonly files = new Map<string, FileState>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private polling: Promise<void> | null = null;
+  /** `fromEnd`: sizes of the transcripts on disk when tailing started; only that content is skipped. */
+  private existing: Map<string, number> | null = null;
 
   constructor(
     private readonly sessionsDir: string,
     private readonly emit: (event: SubagentEvent) => void,
-    private readonly opts: { /** Skip content already on disk when first seen (resume: attempt-1 transcripts). */ fromEnd?: boolean } = {},
+    private readonly opts: { /** Skip content already on disk at start (resume: attempt-1 transcripts). */ fromEnd?: boolean } = {},
   ) {}
 
   start(): void {
+    this.snapshot();
     this.timer ??= setInterval(() => void this.poll(), POLL_MS);
+  }
+
+  /** Taken synchronously so no transcript created after `start` can be mistaken for an old one. */
+  private snapshot(): Map<string, number> {
+    if (this.existing) return this.existing;
+    this.existing = new Map();
+    if (!this.opts.fromEnd || !existsSync(this.sessionsDir)) return this.existing;
+    try {
+      for (const e of readdirSync(this.sessionsDir, { recursive: true, withFileTypes: true })) {
+        if (!e.isFile() || !e.name.endsWith(".jsonl")) continue;
+        const path = join(e.parentPath, e.name);
+        this.existing.set(path, statSync(path).size);
+      }
+    } catch (err) {
+      console.error(`[subagent-tail] snapshot ${this.sessionsDir}: ${err}`);
+    }
+    return this.existing;
   }
 
   async stop(): Promise<void> {
@@ -110,6 +130,7 @@ export class SubagentTail {
   }
 
   private async pollOnce(): Promise<void> {
+    const existing = this.snapshot();
     let paths: string[];
     try {
       paths = await listJsonl(this.sessionsDir);
@@ -122,17 +143,19 @@ export class SubagentTail {
       const parent = dirname(path);
       if (!all.has(`${parent}.jsonl`)) continue;
       try {
-        await this.readNew(path, basename(path, ".jsonl"));
+        await this.readNew(path, basename(path, ".jsonl"), existing);
       } catch (err) {
         console.error(`[subagent-tail] read ${path}: ${err}`);
       }
     }
   }
 
-  private async readNew(path: string, agentId: string): Promise<void> {
+  private async readNew(path: string, agentId: string, existing: Map<string, number>): Promise<void> {
     let state = this.files.get(path);
     if (!state) {
-      state = { offset: 0, partial: Buffer.alloc(0), parseErrorLogged: false };
+      // A resumed run's attempt-1 transcripts start where they were when tailing began, so their old
+      // subagent events are not re-streamed; transcripts created since are read from the start.
+      state = { offset: existing.get(path) ?? 0, partial: Buffer.alloc(0), parseErrorLogged: false };
       this.files.set(path, state);
     }
     const fh = await open(path, "r");
@@ -140,12 +163,6 @@ export class SubagentTail {
     try {
       const { size } = await fh.stat();
       if (size <= state.offset) return;
-      // First sight of a file with existing content (a resumed run's attempt-1 transcripts): start
-      // at the end without emitting, so old subagent events are not re-streamed.
-      if (state.offset === 0 && this.opts.fromEnd) {
-        state.offset = size;
-        return;
-      }
       chunk = Buffer.alloc(size - state.offset);
       const { bytesRead } = await fh.read(chunk, 0, chunk.length, state.offset);
       chunk = chunk.subarray(0, bytesRead);

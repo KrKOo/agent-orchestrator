@@ -93,6 +93,28 @@ describe("Outbox", () => {
     expect(sentEvents().map((e) => e.seq)).toEqual([5, 6]);
   });
 
+  test("seed drops an earlier attempt's pending rows so they never replay", () => {
+    // Attempt 1 emitted 1..4; only 1..2 were acked, 3 was sent, 4 is still unsent.
+    for (const t of ["a", "b", "c"]) outbox.append(log(t));
+    outbox.flush();
+    outbox.ack("r1", 2);
+    outbox.append(log("late"));
+    outbox.append({ ...log("other"), runId: "r2" });
+    sent = [];
+    // The server stored up to 2; the retry continues at 3, but the counter is never lowered.
+    outbox.seed("r1", 3);
+    expect(outbox.pending("r1", 0)).toEqual([]);
+    outbox.flush();
+    expect(sentEvents().map((e) => [e.runId, e.seq])).toEqual([["r2", 1]]);
+    sent = [];
+    outbox.append(log("retry"));
+    outbox.replayAll();
+    expect(sentEvents().map((e) => [e.runId, e.seq])).toEqual([
+      ["r1", 5],
+      ["r2", 1],
+    ]);
+  });
+
   test("replay after simulated reconnect resends only unacked events, seq contiguous", () => {
     for (let i = 0; i < 5; i++) outbox.append(log(`l${i}`));
     outbox.flush(); // sent while "connected"

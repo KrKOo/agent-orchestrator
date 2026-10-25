@@ -14,6 +14,7 @@ function runner(over: Partial<RunnerState> = {}): RunnerState {
     capabilities: caps(),
     lastSeenAt: NOW - 1000,
     connected: true,
+    replayed: true,
     running: 0,
     ...over,
   };
@@ -30,6 +31,10 @@ describe("isEligible", () => {
     expect(isEligible(ownerRun, runner({ connected: false }), NOW)).toBe(false);
     expect(isEligible(ownerRun, runner({ lastSeenAt: NOW - 46_000 }), NOW)).toBe(false);
     expect(isEligible(ownerRun, runner({ capabilities: null }), NOW)).toBe(false);
+  });
+
+  test("a connection that has not finished its outbox replay gets no jobs", () => {
+    expect(isEligible(ownerRun, runner({ replayed: false }), NOW)).toBe(false);
   });
 
   test("labels must be a superset of runnerLabels", () => {
@@ -122,6 +127,63 @@ describe("Scheduler.kick", () => {
     expect(assigned.resume).toEqual({ fromStepIdx: 1, prior: [{ stepId: "a", output: "A out", structured: { n: 1 } }] });
     expect(assigned.seqFrom).toBe(2); // maxSeq (the queued event) + 1
     expect(deps.runs.get(run)).toMatchObject({ status: "assigned", resumeFrom: 1 });
+  });
+
+  test("a local_path retry past step 1 is pinned to the previous runner; from step 1 it is not", () => {
+    const deps = testDeps();
+    const other = connectRunner(deps, "r0", caps()); // sorts first, so it wins any unpinned tie
+    const prev = connectRunner(deps, "r1", caps());
+    const def = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "first" },
+        { id: "b", name: "B", kind: "prompt", prompt: "second" },
+      ],
+    });
+    const pinned = addRun(deps, { definition: def, status: "failed", runnerId: "r1" });
+    deps.db
+      .update(schema.runSteps)
+      .set({ status: "succeeded", output: "A out" })
+      .where(and(eq(schema.runSteps.runId, pinned), eq(schema.runSteps.stepId, "a")))
+      .run();
+    const fresh = addRun(deps, { definition: def, status: "failed", runnerId: "r1" });
+    deps.runs.retry(pinned, 1);
+    deps.runs.retry(fresh, 0);
+    expect(deps.runs.get(pinned)).toMatchObject({ resumeRunnerId: "r1" });
+    expect(deps.runs.get(fresh)).toMatchObject({ resumeRunnerId: null });
+
+    deps.hub.detachRunner("r1", prev);
+    deps.scheduler.kick();
+    expect(deps.runs.get(pinned)!.status).toBe("queued"); // r0 is eligible but not the pinned runner
+    expect(deps.runs.get(fresh)).toMatchObject({ status: "assigned", runnerId: "r0" });
+    expect(other.of("job.assign").map((m) => m.run.runId)).toEqual([fresh]);
+
+    deps.hub.attachRunner("r1", prev);
+    deps.hub.setReplayed(prev, true);
+    deps.scheduler.kick();
+    expect(deps.runs.get(pinned)).toMatchObject({ status: "assigned", runnerId: "r1" });
+    expect(prev.of("job.assign").map((m) => m.run.runId)).toEqual([pinned]);
+  });
+
+  test("a queued run pinned to a runner unknown or offline for more than 10 minutes fails resume_runner_lost", () => {
+    const deps = testDeps();
+    const start = Date.now();
+    let now = start;
+    const scheduler = new Scheduler(deps.runs, () => now);
+    addRunner(deps, "r1", { capabilities: caps(), lastSeenAt: start }); // registered, not connected
+    const pinned = addRun(deps, { resumeFrom: 1, resumeRunnerId: "r1" });
+    const orphan = addRun(deps, { resumeFrom: 1, resumeRunnerId: "deleted" });
+
+    now = start + RUNNER_LOST_MS - 1000;
+    scheduler.kick();
+    expect(deps.runs.get(pinned)!.status).toBe("queued");
+    expect(deps.runs.get(orphan)!.status).toBe("queued");
+
+    now = start + RUNNER_LOST_MS + 1000;
+    scheduler.kick();
+    for (const id of [pinned, orphan]) {
+      // The terminal transition also clears the resume cursor and the pin.
+      expect(deps.runs.get(id)).toMatchObject({ status: "failed", error: "resume_runner_lost", resumeFrom: null, resumeRunnerId: null });
+    }
   });
 
   test("leaves runs queued when only ineligible runners are online", () => {

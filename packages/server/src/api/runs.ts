@@ -166,7 +166,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     }
   });
 
-  /** Retries a failed run: from the failed step (default) or from `fromStepId` (skipping nothing unfinished). */
+  /** Retries a failed or cancelled run: from the first unfinished step (default) or from `fromStepId` (skipping nothing unfinished). */
   app.post("/:id/retry", async (c) => {
     const id = c.req.param("id");
     const body = await readJson(c);
@@ -180,20 +180,26 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       fromStepIdx = run.definition.steps.findIndex((s) => s.id === parsed.data.fromStepId);
       if (fromStepIdx < 0) return c.json({ error: `Unknown step "${parsed.data.fromStepId}"` }, 400);
     } else {
-      // Default: retry the failed step (the first failed one; a cancelled run has none).
-      fromStepIdx = run.definition.steps.findIndex((s) => {
-        const row = db.select().from(runSteps).where(and(eq(runSteps.runId, id), eq(runSteps.stepId, s.id))).get();
-        return row?.status === "failed";
-      });
-      if (fromStepIdx < 0) return c.json({ error: "Run has no failed step" }, 409);
+      // Default: the first step (definition order) that did not succeed; the last step when all did.
+      const succeeded = new Set(
+        db
+          .select({ stepId: runSteps.stepId, status: runSteps.status })
+          .from(runSteps)
+          .where(eq(runSteps.runId, id))
+          .all()
+          .filter((s) => s.status === "succeeded")
+          .map((s) => s.stepId),
+      );
+      fromStepIdx = run.definition.steps.findIndex((s) => !succeeded.has(s.id));
+      if (fromStepIdx < 0) fromStepIdx = run.definition.steps.length - 1;
     }
     const outcome = deps.runs.retry(id, fromStepIdx);
     if (!outcome.ok) {
       switch (outcome.error) {
         case "not_found":
           return c.json({ error: "Run not found" }, 404);
-        case "not_failed":
-          return c.json({ error: `Run is ${run.status}, not failed` }, 409);
+        case "not_retryable":
+          return c.json({ error: `Run is ${run.status}; only failed or cancelled runs can be retried` }, 409);
         case "unfinished_steps":
           return c.json({ error: "Cannot skip unfinished steps" }, 409);
         case "bad_step":

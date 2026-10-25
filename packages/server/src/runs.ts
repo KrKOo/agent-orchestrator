@@ -1,4 +1,4 @@
-import { TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
+import { RETRYABLE_STATUSES, TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
 import { and, eq, gte, max, type ExtractTablesWithRelations } from "drizzle-orm";
 import type { SQLiteBunTransaction } from "drizzle-orm/bun-sqlite/session";
 import { schema, type Db } from "./db";
@@ -18,7 +18,7 @@ export const CANCEL_GRACE_MS = 30_000;
 
 export type RetryOutcome =
   | { ok: true; error?: undefined }
-  | { ok: false; error: "not_found" | "not_failed" | "bad_step" | "unfinished_steps" };
+  | { ok: false; error: "not_found" | "not_retryable" | "bad_step" | "unfinished_steps" };
 
 /** Persistence + projection of run events, and server-side run state changes. */
 export class RunService {
@@ -91,14 +91,15 @@ export class RunService {
   }
 
   /**
-   * Moves a `failed` run back to `queued` so the scheduler re-dispatches it: steps `idx >= fromStepIdx`
+   * Moves a `failed` or `cancelled` run back to `queued` so the scheduler re-dispatches it: steps `idx >= fromStepIdx`
    * reset to pending, earlier steps keep their outputs, and the step cursor travels with the run.
+   * Resuming a `local_path` workspace past step 1 pins the run to the previous runner (it holds the worktree).
    * Appends the server-invented `run.status {status: "queued"}` event so the transcript stays one run.
    */
   retry(runId: string, fromStepIdx: number): RetryOutcome {
     const run = this.get(runId);
     if (!run) return { ok: false, error: "not_found" };
-    if (run.status !== "failed") return { ok: false, error: "not_failed" };
+    if (!RETRYABLE_STATUSES.includes(run.status)) return { ok: false, error: "not_retryable" };
     if (fromStepIdx < 0 || fromStepIdx >= run.definition.steps.length) return { ok: false, error: "bad_step" };
     const prior = this.db
       .select({ idx: runSteps.idx, status: runSteps.status })
@@ -111,15 +112,16 @@ export class RunService {
       seq: this.maxSeq(runId) + 1,
       ts: Date.now(),
       type: "run.status",
-      payload: { status: "queued" },
+      payload: { status: "queued", resumeFromStepId: run.definition.steps[fromStepIdx]!.id },
     };
     this.db.transaction((tx) => {
       tx.update(runSteps)
         .set({ status: "pending", output: null, structured: null, startedAt: null, finishedAt: null })
         .where(and(eq(runSteps.runId, runId), gte(runSteps.idx, fromStepIdx)))
         .run();
+      const resumeRunnerId = fromStepIdx > 0 && run.definition.workspace.kind === "local_path" ? run.runnerId : null;
       tx.update(runs)
-        .set({ status: "queued", runnerId: null, error: null, finishedAt: null, resumeFrom: fromStepIdx })
+        .set({ status: "queued", runnerId: null, error: null, finishedAt: null, resumeFrom: fromStepIdx, resumeRunnerId })
         .where(eq(runs.id, runId))
         .run();
       tx.insert(runEvents).values({ runId, seq: ev.seq, ts: ev.ts, type: ev.type, payload: ev.payload }).run();
@@ -221,7 +223,7 @@ export class RunService {
 
   private markTerminal(tx: Tx, run: RunRecord, status: RunStatus, ts: number, error: string | undefined): void {
     tx.update(runs)
-      .set({ status, finishedAt: ts, resumeFrom: null, ...(error === undefined ? {} : { error }) })
+      .set({ status, finishedAt: ts, resumeFrom: null, resumeRunnerId: null, ...(error === undefined ? {} : { error }) })
       .where(eq(runs.id, run.id))
       .run();
     // A step still marked running was interrupted. Late `step.finished` events from the runner still overwrite this.

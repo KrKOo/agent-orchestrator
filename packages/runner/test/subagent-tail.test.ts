@@ -75,3 +75,24 @@ test("tails sibling-stem subagent transcripts with partial lines", async () => {
   });
   await tail.stop();
 });
+
+test("fromEnd skips only transcripts present at start; later ones are read from their beginning", async () => {
+  const root = join(dir, "resume");
+  mkdirSync(join(root, "S"), { recursive: true });
+  const init = (agent: string) => `${JSON.stringify({ type: "session_init", agent, task: "t" })}\n`;
+  writeFileSync(join(root, "S.jsonl"), init("main"));
+  writeFileSync(join(root, "S", "Old.jsonl"), init("old"));
+  const events: SubagentEvent[] = [];
+  const tail = new SubagentTail(root, (e) => events.push(e), { fromEnd: true });
+  tail.start();
+  // Created after the resumed run started tailing, before any poll saw the directory.
+  writeFileSync(join(root, "S", "New.jsonl"), init("new"));
+  await tail.poll();
+  appendFileSync(join(root, "S", "Old.jsonl"), init("old-again"));
+  await tail.poll();
+  await tail.stop();
+  expect(events.map((e) => [e.type, e.payload.agentId])).toEqual([
+    ["subagent.started", "New"],
+    ["subagent.started", "Old"],
+  ]);
+});

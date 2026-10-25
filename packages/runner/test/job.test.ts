@@ -590,17 +590,25 @@ describe("runJob", () => {
       run.seqFrom = 9;
       return run;
     };
+    /** Creates the worktree attempt 1 would have left, which a mid-run (`fromStepIdx > 0`) resume requires. */
+    const withWorktree = (run: AssignedRun): AssignedRun => {
+      const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
+      sh(repo, "git", "worktree", "add", "-q", "-b", branch, join(config.dataDir, "worktrees", run.runId), "HEAD");
+      return run;
+    };
 
     test("renders prior step outputs in templates and starts at the cursor", async () => {
       const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
-      const run = resumed(
-        {
-          steps: [
-            { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
-            { kind: "prompt", id: "fix", name: "Fix", prompt: "echo redo using {{steps.done.output}}" },
-          ],
-        },
-        "fix",
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "prompt", id: "fix", name: "Fix", prompt: "echo redo using {{steps.done.output}}" },
+            ],
+          },
+          "fix",
+        ),
       );
       await runJob(run, deps, new AbortController().signal);
 
@@ -636,17 +644,19 @@ describe("runJob", () => {
       const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
       deps.rpc = async <T>(method: string) =>
         method === "github.createPullRequest" ? ({ url: "https://github.com/acme/widget/pull/9" } as T) : Promise.reject(new Error(`no rpc: ${method}`));
-      const run = resumed(
-        {
-          workspace: { kind: "local_path", path: repo },
-          steps: [
-            { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
-            { kind: "git_push", id: "push", name: "Push" },
-            { kind: "github_pr", id: "pr", name: "PR", titleFrom: "done", bodyFrom: "done" },
-          ],
-        },
-        "pr",
-        ["push"],
+      const run = withWorktree(
+        resumed(
+          {
+            workspace: { kind: "local_path", path: repo },
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "git_push", id: "push", name: "Push" },
+              { kind: "github_pr", id: "pr", name: "PR", titleFrom: "done", bodyFrom: "done" },
+            ],
+          },
+          "pr",
+          ["push"],
+        ),
       );
       await runJob(run, deps, new AbortController().signal);
       // Without the derived flag this throws "github_pr requires an earlier git_push" and the run fails.
@@ -721,6 +731,80 @@ describe("runJob", () => {
       // The reset wiped attempt 1's hello.txt (write2's own output is a different file).
       expect(existsSync(join(worktree, "hello.txt"))).toBe(false);
       expect(existsSync(join(worktree, "fresh.txt"))).toBe(true);
+    });
+
+    test("worktree gone: a mid-run retry fails; from step 0 recreates it on the existing branch", async () => {
+      const steps: FlowDefinitionInput["steps"] = [
+        { kind: "prompt", id: "write", name: "Write", prompt: "write hello.txt" },
+        { kind: "slash", id: "break", name: "Break", command: "review", args: "fail" },
+      ];
+      const run = assigned({ steps });
+      await runJob(run, harnessDeps(new FakeSandboxProvider()).deps, new AbortController().signal);
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
+      // The branch survives in the repo, the worktree dir does not (e.g. dataDir wiped).
+      rmSync(worktree, { recursive: true, force: true });
+
+      const retry = resumed({ steps }, "break");
+      retry.runId = run.runId;
+      const second = harnessDeps(new FakeSandboxProvider());
+      await runJob(retry, second.deps, new AbortController().signal);
+      const failed = second.sent.at(-1);
+      expect(failed).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
+      expect(failed && "error" in failed ? failed.error : "").toContain("not on this runner");
+
+      const restart = resumed({ steps: [{ kind: "prompt", id: "write2", name: "Write", prompt: "write fresh.txt" }] }, "write2");
+      restart.runId = run.runId;
+      restart.resume!.fromStepIdx = 0;
+      const third = harnessDeps(new FakeSandboxProvider());
+      await runJob(restart, third.deps, new AbortController().signal);
+      expect(third.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(sh(worktree, "git", "rev-parse", "--abbrev-ref", "HEAD")).toBe(branch);
+      // Reset to the base ref: attempt 1's uncommitted hello.txt is gone with its dir anyway.
+      expect(existsSync(join(worktree, "hello.txt"))).toBe(false);
+      expect(existsSync(join(worktree, "fresh.txt"))).toBe(true);
+    });
+
+    test("a retry supersedes a still-running attempt: aborts and silences it, then seeds and runs", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const order: string[] = [];
+      const gateOpen = Promise.withResolvers<void>();
+      const retryDone = Promise.withResolvers<void>();
+      deps.emit = (draft) => {
+        events.push(draft);
+        if (draft.type === "intervention.request") gateOpen.resolve();
+      };
+      deps.send = (msg) => {
+        sent.push(msg);
+        if (msg.t === "job.finished") {
+          order.push("finished");
+          retryDone.resolve();
+        }
+      };
+      deps.seedOutbox = () => order.push("seed");
+      const manager = new JobManager(deps);
+      // Attempt 1 waits at a gate indefinitely (e.g. the server lost the runner and failed the run).
+      const first = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+      manager.assign(first);
+      await gateOpen.promise;
+      const eventsBefore = events.length;
+      const sentBefore = sent.length;
+
+      const retry = resumed({ steps: [{ kind: "prompt", id: "fix", name: "Fix", prompt: "x" }] }, "fix");
+      retry.runId = first.runId;
+      manager.assign(retry);
+      expect(manager.activeCount()).toBe(1);
+      await retryDone.promise;
+
+      // Only the retry's own output follows its arrival: attempt 1's cancellation never surfaces.
+      expect(order).toEqual(["seed", "finished"]);
+      expect(sent.slice(sentBefore).filter((m) => m.t === "job.finished")).toEqual([
+        { t: "job.finished", runId: first.runId, status: "succeeded" },
+      ]);
+      const later = events.slice(eventsBefore);
+      expect(ofType(later, "step.started").map((e) => e.stepId)).toEqual(["fix"]);
+      expect(ofType(later, "step.finished").map((e) => [e.stepId, e.payload.status])).toEqual([["fix", "succeeded"]]);
+      expect(ofType(later, "run.status").map((e) => e.payload.status)).not.toContain("cancelled");
     });
   });
 });

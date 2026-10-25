@@ -11,7 +11,7 @@ const MAX_BACKOFF_MS = 10_000;
  * Live run event stream over `GET /api/runs/:id/stream?afterSeq=N`.
  * Tracks the last seq, drops duplicates, and reconnects from the last seq with backoff.
  * Batches delivered events per animation frame so token streams don't re-render per frame.
- * Stops reconnecting once a terminal `run.status` has been seen and the socket closes.
+ * After a terminal `run.status` it still reconnects, but only every `MAX_BACKOFF_MS`, so a later retry's events arrive.
  */
 export class RunEventStream {
   private ws: WebSocket | null = null;
@@ -65,7 +65,7 @@ export class RunEventStream {
         if (ev.seq <= this.lastSeq) continue;
         this.lastSeq = ev.seq;
         if (ev.type === "run.status") {
-          // A retried run re-enters queued: resume streaming after a terminal attempt-1 was seen.
+          // A retried run re-enters queued: back to normal reconnect backoff.
           this.terminal = TERMINAL_STATUSES.includes(ev.payload.status);
         }
         this.pending.push(ev);
@@ -76,10 +76,14 @@ export class RunEventStream {
       if (this.ws !== ws) return;
       this.ws = null;
       this.onConnected(false);
-      if (this.closed || this.terminal) return;
+      if (this.closed) return;
       if (ev.code === WS_UNAUTHORIZED) {
         this.closed = true;
         return redirectToLogin();
+      }
+      if (this.terminal) {
+        this.timer = window.setTimeout(() => this.connect(), MAX_BACKOFF_MS);
+        return;
       }
       this.timer = window.setTimeout(() => this.connect(), this.backoff);
       this.backoff = Math.min(this.backoff * 2, MAX_BACKOFF_MS);

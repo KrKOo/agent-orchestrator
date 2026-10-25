@@ -115,16 +115,34 @@ async function prepareLocalPath(run: AssignedRun, ws: LocalPathWorkspace, config
     const branch = orchBranch(run.runId);
     const worktree = join(config.dataDir, "worktrees", run.runId);
     await mkdir(join(config.dataDir, "worktrees"), { recursive: true });
-    const existing = existsSync(worktree) ? await git(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]) : null;
-    if (existing?.code === 0 && existing.stdout.trim() === branch) {
-      // Resume: the attempt-1 worktree is still there. From step 0 restart clean from the base ref
-      // (fresh rerun semantics); otherwise keep the dirty tree — continuing where it stopped is the point.
-      if (run.resume?.fromStepIdx === 0) {
+    const continuing = (run.resume?.fromStepIdx ?? 0) > 0;
+    if (existsSync(worktree)) {
+      // `--show-toplevel`, not just `--git-dir`: a plain dir inside some other repo is not our worktree.
+      const top = await git(worktree, ["rev-parse", "--show-toplevel"]);
+      if (top.code !== 0 || (await realpath(top.stdout.trim())) !== (await realpath(worktree))) {
+        throw new Error(`${worktree} exists but is not a git worktree; move it away to run this workspace`);
+      }
+      const head = await gitOk(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]);
+      if (continuing) {
+        // Resume mid-run: keep the previous attempt's tree as-is — continuing where it stopped is the point.
+        if (head !== branch) console.warn(`[workspace] resuming ${run.runId} in ${worktree} on ${head}, not ${branch}`);
+      } else {
+        // Fresh run or resume from step 0: restart clean from the base ref.
+        if (head !== branch) await gitOk(worktree, ["checkout", "--force", branch]);
         await gitOk(worktree, ["reset", "--hard", ws.baseRef]);
         await gitOk(worktree, ["clean", "-fd"]);
       }
+    } else if (continuing) {
+      throw new Error(`The previous attempt's worktree (${worktree}) is not on this runner; retry from the first step instead`);
     } else {
-      await gitOk(path, ["worktree", "add", "-b", branch, worktree, ws.baseRef]);
+      // Drop stale registrations (worktree dir deleted) so the branch can be checked out again.
+      await gitOk(path, ["worktree", "prune"]);
+      if ((await git(path, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`])).code === 0) {
+        await gitOk(path, ["worktree", "add", worktree, branch]);
+        await gitOk(worktree, ["reset", "--hard", ws.baseRef]);
+      } else {
+        await gitOk(path, ["worktree", "add", "-b", branch, worktree, ws.baseRef]);
+      }
     }
     return {
       hostPath: worktree,

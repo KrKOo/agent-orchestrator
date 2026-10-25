@@ -109,16 +109,21 @@ export class Outbox {
   }
 
   /**
-   * Raises the run's seq counter so the next append continues at `seq` (the server sends `seqFrom`
-   * on resume; a different runner would otherwise restart at 1 and the server would drop every
-   * event). Never lowers the counter: unacked rows from an earlier attempt replay above it and
-   * dedupe by seq server-side.
+   * Starts a new attempt of `runId` (the server sends `seqFrom` on resume): drops the run's pending
+   * rows from an earlier attempt, which the server no longer wants, and raises the seq counter so the
+   * next append is `max(counter + 1, seqFrom)`. Never lowers the counter.
    */
-  seed(runId: string, seq: number): void {
-    this.db.run(
-      "INSERT INTO run_seq (run_id, last_seq) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET last_seq = max(last_seq, excluded.last_seq)",
-      [runId, seq - 1],
-    );
+  seed(runId: string, seqFrom: number): void {
+    this.db.transaction(() => {
+      this.db.run("DELETE FROM events WHERE run_id = ?", [runId]);
+      this.db.run(
+        "INSERT INTO run_seq (run_id, last_seq) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET last_seq = max(last_seq, excluded.last_seq)",
+        [runId, seqFrom - 1],
+      );
+    })();
+    this.sentUpTo.delete(runId);
+    this.tails.delete(runId);
+    this.dirty.delete(runId);
   }
 
   append(draft: RunEventDraft): void {

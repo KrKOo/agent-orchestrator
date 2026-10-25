@@ -678,24 +678,57 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 }
 
 export class JobManager {
-  private readonly jobs = new Map<string, { abort: AbortController; pending: PendingRequests; done: Promise<void> }>();
+  /** `superseded`: a retry of the same run took over; the job's emits, messages and rpcs are dropped. */
+  private readonly jobs = new Map<string, { abort: AbortController; pending: PendingRequests; superseded: boolean; done: Promise<void> }>();
 
   constructor(private readonly deps: JobDeps) {}
 
-  /** Validates, sends job.accepted | job.rejected, and runs the job in the background. */
+  /**
+   * Validates, sends job.accepted | job.rejected, and runs the job in the background. A retry for a
+   * run whose previous attempt is still here supersedes it: the old attempt is silenced (its events,
+   * messages and rpcs would land on the retried run), aborted, and the retry takes over its slot once
+   * it is done, so the outbox seed drops whatever the old attempt had queued.
+   */
   assign(run: AssignedRun): void {
-    if (this.jobs.has(run.runId)) return;
-    if (this.jobs.size >= this.deps.config.maxConcurrentJobs) {
+    const previous = this.jobs.get(run.runId);
+    if (!previous && this.jobs.size >= this.deps.config.maxConcurrentJobs) {
       this.deps.send({ t: "job.rejected", runId: run.runId, reason: "Runner at capacity" });
       return;
     }
-    if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
+    if (previous) {
+      previous.superseded = true;
+      previous.abort.abort();
+    }
     const abort = new AbortController();
     const pending = new PendingRequests();
-    const done = runJob(run, this.deps, abort.signal, pending)
+    const job = { abort, pending, superseded: false, done: Promise.resolve() };
+    const deps: JobDeps = {
+      ...this.deps,
+      emit: (draft) => {
+        if (!job.superseded) this.deps.emit(draft);
+      },
+      send: (msg) => {
+        if (!job.superseded) this.deps.send(msg);
+      },
+      rpc: <T>(method: RunnerRpcMethod, params: unknown) =>
+        job.superseded ? Promise.reject<T>(new Error("Superseded by a retry")) : this.deps.rpc<T>(method, params),
+    };
+    const start = async () => {
+      await previous?.done;
+      // Cancelled while waiting for the previous attempt: never started, let the server close it.
+      if (abort.signal.aborted) {
+        deps.send({ t: "job.finished", runId: run.runId, status: "cancelled" });
+        return;
+      }
+      if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
+      await runJob(run, deps, abort.signal, pending);
+    };
+    job.done = start()
       .catch((err) => console.error(`[job ${run.runId}] crashed: ${errorText(err)}`))
-      .finally(() => this.jobs.delete(run.runId));
-    this.jobs.set(run.runId, { abort, pending, done });
+      .finally(() => {
+        if (this.jobs.get(run.runId) === job) this.jobs.delete(run.runId);
+      });
+    this.jobs.set(run.runId, job);
   }
 
   cancel(runId: string): void {

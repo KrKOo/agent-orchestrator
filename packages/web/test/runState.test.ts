@@ -82,4 +82,33 @@ describe("applyRunEvents", () => {
     expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "cancelled" } })]).error).toBe("step blew up");
     expect(applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "failed", error: "again" } })]).error).toBe("again");
   });
+
+  test("retry resets the resume step and later steps; a restarted step drops its previous result", () => {
+    seq = 0;
+    const done = (stepId: string, status: "succeeded" | "failed") =>
+      ev({ type: "step.finished", stepId, payload: { status, output: `${stepId} out`, structured: { stepId }, error: status === "failed" ? "boom" : undefined } });
+    const failed = applyRunEvents(initialRunViewState, [
+      ev({ type: "step.started", stepId: "a", payload: {} }),
+      done("a", "succeeded"),
+      ev({ type: "step.started", stepId: "b", payload: {} }),
+      chunk("agent_message_chunk", "x"),
+      done("b", "succeeded"),
+      ev({ type: "step.started", stepId: "c", payload: {} }),
+      done("c", "failed"),
+      ev({ type: "run.status", payload: { status: "failed", error: "boom" } }),
+    ]);
+    expect(failed.stepOrder).toEqual(["a", "b", "c"]);
+
+    const retried = applyRunEvents(failed, [ev({ type: "run.status", payload: { status: "queued", resumeFromStepId: "b" } })]);
+    expect(retried.error).toBeUndefined();
+    expect(retried.steps.a).toEqual(failed.steps.a!);
+    for (const id of ["b", "c"]) {
+      expect(retried.steps[id]).toMatchObject({ status: "pending", output: undefined, structured: undefined, error: undefined });
+    }
+    // The transcript survives the reset.
+    expect(retried.steps.b!.items).toEqual(failed.steps.b!.items);
+
+    const restarted = applyRunEvents(failed, [ev({ type: "step.started", stepId: "c", payload: {} })]);
+    expect(restarted.steps.c).toMatchObject({ status: "running", output: undefined, structured: undefined, error: undefined });
+  });
 });

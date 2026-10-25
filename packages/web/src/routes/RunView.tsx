@@ -1,4 +1,4 @@
-import { isAgentStep, TERMINAL_STATUSES, type WorkspaceInfo } from "@orch/protocol";
+import { isAgentStep, RETRYABLE_STATUSES, TERMINAL_STATUSES, type WorkspaceInfo } from "@orch/protocol";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
@@ -37,12 +37,21 @@ function RunViewInner({ runId }: { runId: string }) {
   const [pickedSession, setPickedSession] = useState<{ stepId: string; id: string } | null>(null);
   const cancel = useMutation({ mutationFn: () => api.cancelRun(runId) });
   const approve = useMutation({ mutationFn: () => api.approveRun(runId), onSuccess: () => detail.refetch() });
-  const retry = useMutation({ mutationFn: (fromStepId: string | undefined) => api.retryRun(runId, fromStepId) });
+  // A retried run is live again: drop the previous attempt's "Cancelling…" state so it can be cancelled.
+  const retry = useMutation({
+    mutationFn: (fromStepId: string | undefined) => api.retryRun(runId, fromStepId),
+    onSuccess: () => cancel.reset(),
+  });
 
   // Pick up the final error/timestamps once the stream reports a terminal status.
   useEffect(() => {
     if (terminal) void detail.refetch();
   }, [terminal]);
+
+  // A retry's error belongs to the attempt it targeted; drop it once the run moves on.
+  useEffect(() => {
+    if (status !== undefined && !RETRYABLE_STATUSES.includes(status)) retry.reset();
+  }, [status]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
@@ -61,8 +70,12 @@ function RunViewInner({ runId }: { runId: string }) {
 
   const runStatus = status ?? run.status;
   const runTerminal = TERMINAL_STATUSES.includes(runStatus);
+  const retryable = RETRYABLE_STATUSES.includes(runStatus);
   const error = state.error ?? run.error;
   const stepRows = new Map(detail.data!.steps.map((s) => [s.stepId, s]));
+  const stepStatus = (stepId: string) => state.steps[stepId]?.status ?? stepRows.get(stepId)?.status ?? "pending";
+  /** "Run from here" needs every earlier step's output, so it's offered up to the first unsucceeded step. */
+  const firstUnfinished = steps.findIndex((s) => stepStatus(s.id) !== "succeeded");
   const findings = state.lastSeq > 0 ? state.findings : detail.data!.findings;
   const permission = state.permissions.find((p) => !p.resolved && !submitted.has(p.requestId));
   const elicitation = state.elicitations.find((e) => !e.resolved && !submitted.has(e.requestId));
@@ -106,12 +119,12 @@ function RunViewInner({ runId }: { runId: string }) {
               {approve.isPending ? "Approving…" : "Approve"}
             </button>
           )}
-          {runStatus === "failed" && (
+          {retryable && (
             <button
               type="button"
               className="btn primary"
               disabled={retry.isPending}
-              title="Re-run the failed step and continue from there (fresh agent session, same workspace)"
+              title="Re-run the first unfinished step and continue from there (fresh agent session, same workspace)"
               onClick={() => retry.mutate(undefined)}
             >
               {retry.isPending ? "Retrying…" : "Retry"}
@@ -218,37 +231,31 @@ function RunViewInner({ runId }: { runId: string }) {
         <nav className="step-list">
           {steps.map((s, idx) => {
             const row = stepRows.get(s.id);
-            const failedRun = runStatus === "failed";
             return (
-              <button
-                key={s.id}
-                type="button"
-                className={`step-item ${s.id === selectedId ? "active" : ""}`}
-                onClick={() => setSelected(s.id)}
-              >
-                <span className="step-index">{idx + 1}</span>
-                <span className="step-item-text">
-                  <span className="step-name">{s.name}</span>
-                  <span className="step-item-sub">
-                    <span className="step-id">{s.id}</span>
-                    {row?.startedAt && <span className="muted">{formatDuration(row.startedAt, row.finishedAt)}</span>}
+              <div key={s.id} className={`step-item ${s.id === selectedId ? "active" : ""}`}>
+                <button type="button" className="step-item-select" onClick={() => setSelected(s.id)}>
+                  <span className="step-index">{idx + 1}</span>
+                  <span className="step-item-text">
+                    <span className="step-name">{s.name}</span>
+                    <span className="step-item-sub">
+                      <span className="step-id">{s.id}</span>
+                      {row?.startedAt && <span className="muted">{formatDuration(row.startedAt, row.finishedAt)}</span>}
+                    </span>
                   </span>
-                </span>
-                {failedRun && (
-                  <span
+                </button>
+                {retryable && (firstUnfinished < 0 || idx <= firstUnfinished) && (
+                  <button
+                    type="button"
                     className="btn small step-retry"
-                    title={`Reset this step and everything after, then re-run from here (steps before it keep their outputs)`}
-                    onClick={(e) => {
-                      // The row is a selection button; the action must not change the selection.
-                      e.stopPropagation();
-                      retry.mutate(s.id);
-                    }}
+                    disabled={retry.isPending}
+                    title="Reset this step and everything after, then re-run from here (steps before it keep their outputs)"
+                    onClick={() => retry.mutate(s.id)}
                   >
                     Run from here
-                  </span>
+                  </button>
                 )}
-                <StatusChip status={state.steps[s.id]?.status ?? row?.status ?? "pending"} />
-              </button>
+                <StatusChip status={stepStatus(s.id)} />
+              </div>
             );
           })}
         </nav>

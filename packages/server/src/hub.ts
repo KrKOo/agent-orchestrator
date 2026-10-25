@@ -32,6 +32,8 @@ export class Hub {
   /** Server-side observers of every persisted event (e.g. GitHub check reporting). */
   private readonly listeners = new Set<Subscriber>();
   private readonly runners = new Map<string, RunnerLink>();
+  /** Links that finished their post-`welcome` outbox replay (`replayed`); only these get jobs. */
+  private readonly replayed = new WeakSet<RunnerLink>();
   private readonly rpcs = new Map<string, PendingRpc>();
 
   subscribe(runId: string, fn: Subscriber): () => void {
@@ -81,6 +83,18 @@ export class Hub {
 
   isConnected(runnerId: string): boolean {
     return this.runners.has(runnerId);
+  }
+
+  /** Records whether `link` finished replaying its outbox; `hello` resets it, `replayed` sets it. */
+  setReplayed(link: RunnerLink, replayed: boolean): void {
+    if (replayed) this.replayed.add(link);
+    else this.replayed.delete(link);
+  }
+
+  /** True when the runner's current connection finished replaying its outbox. */
+  isReplayed(runnerId: string): boolean {
+    const link = this.runners.get(runnerId);
+    return link !== undefined && this.replayed.has(link);
   }
 
   /** Returns false when the runner has no live connection. */
