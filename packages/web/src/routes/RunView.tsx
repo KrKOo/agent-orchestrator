@@ -8,11 +8,13 @@ import { chatSession, InterventionComposer, InterventionStart } from "../compone
 import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
-import { applyRunEvents, initialRunViewState, type StepView } from "../runState";
+import { applyRunEvents, initialRunViewState, type LogLine, type StepView } from "../runState";
 import { Collapsible, CopyButton, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
 import { useRunEventStream } from "../ws";
 
 const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, subagents: [] };
+/** The sandbox log shows only its newest chunks up to this much text until "Show all". */
+const LOG_TAIL_CHARS = 200_000;
 
 export function RunView() {
   const { id = "" } = useParams();
@@ -261,13 +263,7 @@ function RunViewInner({ runId }: { runId: string }) {
             )}
             {logs.length > 0 && (
               <Collapsible summary={`Sandbox log (${logs.length})`} className="diagnostics small">
-                <pre className="log">
-                  {logs.map((l) => (
-                    <span key={l.seq} className={l.stream === "stderr" ? "log-err" : undefined}>
-                      {l.text.endsWith("\n") ? l.text : `${l.text}\n`}
-                    </span>
-                  ))}
-                </pre>
+                <SandboxLog logs={logs} />
               </Collapsible>
             )}
           </div>
@@ -303,6 +299,42 @@ function RunViewInner({ runId }: { runId: string }) {
         )
       )}
     </div>
+  );
+}
+
+/** Log chunks as one `<pre>`; long logs (a slash step streams all of omp's NDJSON) show their tail first. */
+function SandboxLog({ logs }: { logs: LogLine[] }) {
+  const [all, setAll] = useState(false);
+  // Newest chunks within the budget, and always at least the last one.
+  let start = 0;
+  if (!all && logs.length > 0) {
+    start = logs.length - 1;
+    let chars = logs[start]!.text.length;
+    while (start > 0 && chars + logs[start - 1]!.text.length <= LOG_TAIL_CHARS) {
+      start--;
+      chars += logs[start]!.text.length;
+    }
+  }
+  return (
+    <>
+      {start > 0 && (
+        <div className="row gap muted">
+          <span>
+            Showing the last {(logs.length - start).toLocaleString()} of {logs.length.toLocaleString()} chunks
+          </span>
+          <button type="button" className="btn small" onClick={() => setAll(true)}>
+            Show all
+          </button>
+        </div>
+      )}
+      <pre className="log">
+        {logs.slice(start).map((l) => (
+          <span key={l.seq} className={l.stream === "stderr" ? "log-err" : undefined}>
+            {l.text.endsWith("\n") ? l.text : `${l.text}\n`}
+          </span>
+        ))}
+      </pre>
+    </>
   );
 }
 

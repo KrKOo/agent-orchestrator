@@ -51,9 +51,11 @@ const ToolEnd = z.object({
 
 const SessionHeader = z.object({ type: z.literal("session"), id: z.string().min(1) });
 
+// Only the final assistant message's content is read; other roles vary in shape (e.g. omp's
+// `custom` async-result notices carry a plain string) and must not invalidate the event.
 const AgentEnd = z.object({
   type: z.literal("agent_end"),
-  messages: z.array(z.looseObject({ role: z.string(), content: ContentBlocks.optional() })),
+  messages: z.array(z.looseObject({ role: z.string(), content: z.unknown().optional() })),
 });
 
 /** Text blocks of a tool result/content array; non-text entries are dropped. */
@@ -152,8 +154,9 @@ export class OmpJsonTranslator {
       return [];
     }
     if (agentEnd.success) {
-      const assistant = [...agentEnd.data.messages].reverse().find((m) => m.role === "assistant");
-      const text = textBlocks(assistant?.content).map((b) => b.text).join("");
+      const assistant = agentEnd.data.messages.findLast((m) => m.role === "assistant");
+      const content = ContentBlocks.safeParse(assistant?.content);
+      const text = content.success ? textBlocks(content.data).map((b) => b.text).join("") : "";
       if (text) this.output = text;
       return [];
     }

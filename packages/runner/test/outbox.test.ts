@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunEvent, RunEventDraft, RunnerMessage } from "@orch/protocol";
-import { MAX_BATCH, Outbox } from "../src/outbox";
+import { MAX_BATCH, MAX_BATCH_BYTES, MAX_EVENT_BYTES, Outbox, TRUNCATED_MARK } from "../src/outbox";
 
 type JobEvents = Extract<RunnerMessage, { t: "job.events" }>;
 
@@ -200,6 +200,45 @@ describe("Outbox", () => {
     const batches = sent.filter((m): m is JobEvents => m.t === "job.events");
     expect(batches.map((b) => b.events.length)).toEqual([MAX_BATCH, MAX_BATCH, 5]);
     expect(sentEvents().map((e) => e.seq)).toEqual(Array.from({ length: MAX_BATCH * 2 + 5 }, (_, i) => i + 1));
+  });
+
+  test("splits batches by serialized size so no job.events frame exceeds MAX_BATCH_BYTES", () => {
+    const big = "x".repeat(MAX_EVENT_BYTES / 2);
+    const n = Math.ceil((MAX_BATCH_BYTES * 2) / big.length);
+    for (let i = 0; i < n; i++) outbox.append(log(big));
+    outbox.flush();
+    const batches = sent.filter((m): m is JobEvents => m.t === "job.events");
+    expect(batches.length).toBeGreaterThan(2);
+    for (const b of batches) expect(Buffer.byteLength(JSON.stringify(b))).toBeLessThanOrEqual(MAX_BATCH_BYTES);
+    expect(sentEvents().map((e) => e.seq)).toEqual(Array.from({ length: n }, (_, i) => i + 1));
+  });
+
+  test("an oversized event is stored and sent cut to MAX_EVENT_BYTES, keeping its shape", () => {
+    const output = `{"a":"${"q".repeat(MAX_EVENT_BYTES * 5)}"}\n`;
+    outbox.append({ runId: "r1", ts: 1, stepId: "plan", type: "step.finished", payload: { status: "succeeded", output } });
+    outbox.flush();
+    const [ev] = sentEvents();
+    expect(Buffer.byteLength(JSON.stringify(ev))).toBeLessThanOrEqual(MAX_EVENT_BYTES);
+    expect(ev).toMatchObject({ seq: 1, stepId: "plan", type: "step.finished", payload: { status: "succeeded" } });
+    const cut = ev!.type === "step.finished" ? ev.payload.output! : "";
+    expect(cut.endsWith(TRUNCATED_MARK)).toBe(true);
+    expect(output.startsWith(cut.slice(0, -TRUNCATED_MARK.length))).toBe(true);
+    // The largest cut that fits: well over half the cap survives despite JSON escaping.
+    expect(cut.length).toBeGreaterThan(MAX_EVENT_BYTES / 4);
+  });
+
+  test("stops coalescing text chunks before the merged event outgrows MAX_EVENT_BYTES", () => {
+    const part = "y".repeat(MAX_EVENT_BYTES / 3);
+    for (let i = 0; i < 4; i++) outbox.append(chunk(part));
+    outbox.flush();
+    const events = sentEvents();
+    expect(events.length).toBeGreaterThan(1);
+    for (const e of events) expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_EVENT_BYTES);
+    const texts = events.map((e) => {
+      const content = textOf(e);
+      return content && typeof content === "object" && "text" in content ? String(content.text) : "";
+    });
+    expect(texts.join("")).toBe(part.repeat(4));
   });
 
   test("start() flushes on its own timer", async () => {

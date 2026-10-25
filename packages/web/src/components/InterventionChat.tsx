@@ -1,9 +1,9 @@
 import type { InterventionAction, InterventionSession } from "@orch/protocol";
 import { useState } from "react";
-import Markdown from "react-markdown";
 import { api, errorMessage } from "../api";
 import type { InterventionView } from "../runState";
 import { Collapsible } from "../ui";
+import { LongText } from "./LongText";
 
 /** Session the chat targets: the user's pick if still offered, else the runner's preselection, else the first. */
 export function chatSession(request: InterventionView, picked: string | undefined): InterventionSession | undefined {
@@ -19,9 +19,7 @@ export function InterventionStart({ session }: { session: InterventionSession })
         Result of <strong>{session.label}</strong> when the run paused
       </div>
       {session.output ? (
-        <div className="markdown">
-          <Markdown>{session.output}</Markdown>
-        </div>
+        <LongText text={session.output} markdown />
       ) : (
         <p className="muted">No text.</p>
       )}
@@ -121,15 +119,14 @@ export function InterventionComposer({
               <span className="muted">Continue passes on the latest reply of</span> <strong>{session.label}</strong>
               <span className="muted">:</span>{" "}
               <span className="intervention-result-preview">
-                {session.output.split("\n").find((l) => l.trim())?.replace(/^#+\s*/, "") || "(no text yet)"}
+                {/* First non-blank line, found without splitting a possibly huge output. */}
+                {/\S.*/.exec(session.output)?.[0].replace(/^#+\s*/, "") || "(no text yet)"}
               </span>
             </span>
           }
         >
           {session.output ? (
-            <div className="markdown">
-              <Markdown>{session.output}</Markdown>
-            </div>
+            <LongText text={session.output} markdown />
           ) : (
             <p className="muted">No text yet.</p>
           )}
