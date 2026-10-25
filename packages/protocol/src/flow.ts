@@ -7,7 +7,7 @@ export const DOMAIN_RE = /^\.?[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
 export const InputDef = z.object({
   key: z.string().regex(ID_RE, "input key must match /^[a-z][a-z0-9_]*$/"),
   label: z.string(),
-  type: z.enum(["text", "github_issue"]),
+  type: z.enum(["text", "github_issue", "github_pull_request"]),
   required: z.boolean().default(true),
 });
 export type InputDef = z.infer<typeof InputDef>;
@@ -31,7 +31,10 @@ export const LocalPathWorkspace = z.object({
 });
 export type LocalPathWorkspace = z.infer<typeof LocalPathWorkspace>;
 
-/** PR head checked out by the runner on the host and mounted read-only; only for `github_pull_request` flows. */
+/**
+ * Head of the flow's `github_pull_request` input, checked out by the runner on the host and mounted
+ * read-only, with the PR diff at `PR_DIFF_PATH`. Required by (and only valid for) flows with a PR input.
+ */
 export const GitHubCheckoutWorkspace = z.object({ kind: z.literal("github_checkout") });
 
 export const WorkspaceSpec = z.discriminatedUnion("kind", [LocalPathWorkspace, GitHubCheckoutWorkspace]);
@@ -85,6 +88,7 @@ export const PR_EVENTS = ["opened", "synchronize", "reopened", "ready_for_review
 export type PrEvent = (typeof PR_EVENTS)[number];
 
 export const ManualTrigger = z.object({ kind: z.literal("manual") });
+/** Starts a run on each matching PR webhook event; the PR fills the flow's `github_pull_request` input. */
 export const GitHubPullRequestTrigger = z.object({
   kind: z.literal("github_pull_request"),
   repos: z.array(z.string().regex(REPO_RE, 'repos entries must be "owner/name"')).min(1, "list at least one repo"),
@@ -92,17 +96,17 @@ export const GitHubPullRequestTrigger = z.object({
   forkPolicy: z.enum(["skip", "require_approval", "run"]).default("require_approval"),
   /** Check run name; defaults to the flow name (see `checkNameOf`). */
   checkName: z.string().min(1).optional(),
-  postReview: z.boolean().default(true),
-  /** Publish progress and results as a GitHub check run on the PR head; `false` keeps results in the runs view only. */
+  /** Publish progress and results (with finding annotations) as a GitHub check run on the PR head. */
   postChecks: z.boolean().default(true),
 });
 export type GitHubPullRequestTrigger = z.infer<typeof GitHubPullRequestTrigger>;
 export const Trigger = z.discriminatedUnion("kind", [ManualTrigger, GitHubPullRequestTrigger]);
 export type Trigger = z.infer<typeof Trigger>;
 
-/** Subfields of `inputs.pr` supplied to `github_pull_request` flows. */
-export const PR_INPUT_FIELDS = ["repo", "number", "title", "body", "baseSha", "headSha", "diffPath"] as const;
+/** Subfields exposed by a resolved `github_pull_request` input. */
+export const PR_INPUT_FIELDS = ["url", "repo", "number", "title", "body", "baseSha", "headSha", "diffPath"] as const;
 export interface PullRequestInput {
+  url: string;
   repo: string;
   number: number;
   /** Wrapped server-side in `<untrusted_pr_text>` tags. */
@@ -115,6 +119,7 @@ export interface PullRequestInput {
 }
 
 const PR_FIELD_DESCRIPTIONS: Record<(typeof PR_INPUT_FIELDS)[number], string> = {
+  url: "Pull request URL",
   repo: "Repository (owner/name)",
   number: "Pull request number",
   title: "Pull request title (untrusted, wrapped)",
@@ -196,13 +201,35 @@ export const InterventionStep = z.object({
   message: z.string().optional(),
   timeoutSec: z.number().int().positive().optional(),
 });
+/**
+ * Posts the output of `bodyFrom` as a comment on the issue or pull request of input `target` (a required
+ * `github_issue` or `github_pull_request` input), server-side with the orchestrator's GitHub credentials.
+ * Mentions are neutralized. Output is the comment URL.
+ */
+export const GitHubCommentStep = z.object({
+  ...stepBase,
+  kind: z.literal("github_comment"),
+  target: z.string().min(1),
+  bodyFrom: z.string().min(1),
+});
 
-export const Step = z.discriminatedUnion("kind", [PromptStep, SkillStep, CommandStep, SlashStep, GitCommitStep, GitPushStep, GitHubPrStep, InterventionStep]);
+export const Step = z.discriminatedUnion("kind", [
+  PromptStep,
+  SkillStep,
+  CommandStep,
+  SlashStep,
+  GitCommitStep,
+  GitPushStep,
+  GitHubPrStep,
+  InterventionStep,
+  GitHubCommentStep,
+]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
+/** Steps that change the local workspace's repository or its GitHub remote; need a writable worktree. */
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr", "intervention"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr", "intervention", "github_comment"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
@@ -210,6 +237,16 @@ export function isAgentStep(step: Step): step is AgentStep {
 
 export function isActionStep(step: Step): step is ActionStep {
   return step.kind === "git_commit" || step.kind === "git_push" || step.kind === "github_pr";
+}
+
+/** Steps whose output is free text a later step can take whole (`bodyFrom` of `github_comment`). */
+export function isTextStep(step: Step): boolean {
+  return isAgentStep(step) || step.kind === "slash" || step.kind === "intervention";
+}
+
+/** The flow's `github_pull_request` input; a flow declares at most one. */
+export function pullRequestInputOf(def: Pick<FlowDefinition, "inputs">): InputDef | undefined {
+  return def.inputs.find((i) => i.type === "github_pull_request");
 }
 
 export const FlowDefinition = z.object({
@@ -250,21 +287,22 @@ export function stepTemplates(step: Step): [string, string][] {
   }
 }
 
-function checkRef(ref: string, inputs: Map<string, InputDef>, earlier: Set<string>, prFlow: boolean): string | null {
+/** Subfields an object-valued input exposes to templates. */
+const INPUT_FIELDS: Record<Exclude<InputDef["type"], "text">, readonly string[]> = {
+  github_issue: GITHUB_ISSUE_FIELDS,
+  github_pull_request: PR_INPUT_FIELDS,
+};
+
+function checkRef(ref: string, inputs: Map<string, InputDef>, earlier: Set<string>): string | null {
   const parts = ref.split(".");
-  if (parts[0] === "inputs" && prFlow) {
-    if (parts[1] !== "pr") return `pull request flows only expose inputs.pr`;
-    if (parts.length === 2) return null;
-    if (parts.length === 3 && (PR_INPUT_FIELDS as readonly string[]).includes(parts[2]!)) return null;
-    return `inputs.pr exposes only ${PR_INPUT_FIELDS.join(", ")}`;
-  }
   if (parts[0] === "inputs") {
     const input = parts[1] === undefined ? undefined : inputs.get(parts[1]);
     if (!input) return `references undeclared input "${parts[1] ?? ""}"`;
     if (input.type === "text") return parts.length === 2 ? null : `text input "${input.key}" has no subfields`;
     if (parts.length === 2) return null;
-    if (parts.length === 3 && (GITHUB_ISSUE_FIELDS as readonly string[]).includes(parts[2]!)) return null;
-    return `github_issue input "${input.key}" exposes only ${GITHUB_ISSUE_FIELDS.join(", ")}`;
+    const fields = INPUT_FIELDS[input.type];
+    if (parts.length === 3 && fields.includes(parts[2]!)) return null;
+    return `${input.type} input "${input.key}" exposes only ${fields.join(", ")}`;
   }
   if (parts[0] === "steps") {
     const id = parts[1];
@@ -291,19 +329,17 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
   const add = (path: string, description: string) => {
     if (!vars.has(path)) vars.set(path, description);
   };
-  if (def.trigger.kind === "github_pull_request") {
-    add("inputs.pr", "Pull request (JSON)");
-    for (const f of PR_INPUT_FIELDS) add(`inputs.pr.${f}`, PR_FIELD_DESCRIPTIONS[f]);
-  } else {
-    for (const input of def.inputs) {
-      if (!ID_RE.test(input.key)) continue;
-      const label = input.label || input.key;
-      if (input.type === "text") {
-        add(`inputs.${input.key}`, label);
-        continue;
-      }
+  for (const input of def.inputs) {
+    if (!ID_RE.test(input.key)) continue;
+    const label = input.label || input.key;
+    if (input.type === "text") {
+      add(`inputs.${input.key}`, label);
+    } else if (input.type === "github_issue") {
       add(`inputs.${input.key}`, `${label} (GitHub issue, JSON)`);
       for (const f of GITHUB_ISSUE_FIELDS) add(`inputs.${input.key}.${f}`, `${label}: issue ${f}`);
+    } else {
+      add(`inputs.${input.key}`, `${label} (pull request, JSON)`);
+      for (const f of PR_INPUT_FIELDS) add(`inputs.${input.key}.${f}`, `${label}: ${PR_FIELD_DESCRIPTIONS[f]}`);
     }
   }
   for (const step of def.steps.slice(0, stepIndex)) {
@@ -332,6 +368,11 @@ export function validateFlow(input: unknown): ValidateResult {
     if (inputs.has(def.key)) errors.push(`inputs: duplicate input key "${def.key}"`);
     inputs.set(def.key, def);
   }
+  const prInputs = flow.inputs.filter((i) => i.type === "github_pull_request");
+  if (prInputs.length > 1) errors.push(`inputs: a flow takes at most one github_pull_request input`);
+  for (const i of prInputs) {
+    if (!i.required) errors.push(`inputs.${i.key}: github_pull_request inputs must be required`);
+  }
 
   for (const [role, model] of Object.entries(flow.harness.modelRoles ?? {})) {
     if (role === "default") errors.push(`harness.modelRoles.default: set harness.model instead`);
@@ -339,18 +380,27 @@ export function validateFlow(input: unknown): ValidateResult {
     else if (!ID_RE.test(role)) errors.push(`harness.modelRoles.${role}: role must match /^[a-z][a-z0-9_]*$/`);
   }
 
-  const prFlow = flow.trigger.kind === "github_pull_request";
+  // A pull request run executes untrusted code and text: read-only PR checkout, no host or open-network access.
+  const prFlow = prInputs.length > 0;
   if (prFlow) {
-    if (flow.workspace.kind !== "github_checkout") errors.push(`workspace: pull request flows require workspace kind "github_checkout"`);
-    if (flow.approval !== "auto") errors.push(`approval: pull request flows require approval "auto"`);
-    if (flow.sandbox.network.mode === "open") errors.push(`sandbox.network.mode: pull request flows cannot use "open"`);
-    if (flow.inputs.length) errors.push(`inputs: pull request flows take no inputs; the PR is available as inputs.pr`);
+    if (flow.workspace.kind !== "github_checkout") errors.push(`workspace: flows with a pull request input require workspace kind "github_checkout"`);
+    if (flow.approval !== "auto") errors.push(`approval: flows with a pull request input require approval "auto"`);
+    if (flow.sandbox.network.mode === "open") errors.push(`sandbox.network.mode: flows with a pull request input cannot use "open"`);
   } else if (flow.workspace.kind === "github_checkout") {
-    errors.push(`workspace: "github_checkout" requires a github_pull_request trigger`);
+    errors.push(`workspace: "github_checkout" requires a github_pull_request input`);
+  }
+  if (flow.trigger.kind === "github_pull_request") {
+    if (!prFlow) errors.push(`trigger: the github_pull_request trigger requires a github_pull_request input to fill`);
+    for (const i of flow.inputs) {
+      if (i.type !== "github_pull_request" && i.required) {
+        errors.push(`inputs.${i.key}: must be optional; pull request events leave other inputs empty`);
+      }
+    }
   }
 
   const seen = new Set<string>();
   const agentSteps = new Set<string>();
+  const textSteps = new Set<string>();
   let pushed = false;
   flow.steps.forEach((step, idx) => {
     const where = `steps.${idx} (${step.id})`;
@@ -358,19 +408,25 @@ export function validateFlow(input: unknown): ValidateResult {
 
     for (const [field, tpl] of stepTemplates(step)) {
       for (const ref of templateRefs(tpl)) {
-        const problem = checkRef(ref, inputs, seen, prFlow);
+        const problem = checkRef(ref, inputs, seen);
         if (problem) errors.push(`${where}.${field}: {{${ref}}} ${problem}`);
       }
     }
 
     if (isActionStep(step)) {
-      if (prFlow) errors.push(`${where}: pull request flows cannot contain ${step.kind} steps`);
+      if (prFlow) errors.push(`${where}: flows with a pull request input cannot contain ${step.kind} steps`);
       else if (flow.workspace.kind !== "local_path" || flow.workspace.isolation !== "worktree" || flow.workspace.access !== "rw") {
         errors.push(`${where}: ${step.kind} requires workspace isolation "worktree" with access "rw"`);
       }
     }
-    if (step.kind === "intervention" && prFlow) {
-      errors.push(`${where}: pull request flows cannot contain intervention steps`);
+    if (step.kind === "github_comment") {
+      const target = inputs.get(step.target);
+      if (!target || target.type === "text" || !target.required) {
+        errors.push(`${where}.target: "${step.target}" must be a required github_issue or github_pull_request input`);
+      }
+      if (!textSteps.has(step.bodyFrom)) {
+        errors.push(`${where}.bodyFrom: "${step.bodyFrom}" must be an earlier prompt/skill/command/slash/intervention step`);
+      }
     }
     const refFields: [string, string][] =
       step.kind === "git_commit"
@@ -389,6 +445,7 @@ export function validateFlow(input: unknown): ValidateResult {
 
     seen.add(step.id);
     if (isAgentStep(step)) agentSteps.add(step.id);
+    if (isTextStep(step)) textSteps.add(step.id);
   });
 
   return errors.length ? { ok: false, errors } : { ok: true, flow };

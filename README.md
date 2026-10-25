@@ -1,6 +1,6 @@
 # Agent Orchestrator
 
-Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → git commit → push → PR, or GitHub PR checks) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
+Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → git commit → push → PR, or pull request review → GitHub review) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
 
 - `packages/protocol` — flow schema + validation, templates, run events, runner wire protocol, REST types.
 - `packages/server` — Hono API, SQLite (drizzle), scheduler, runner/browser WebSockets, GitHub (PAT or App: login, webhooks, Checks, reviews).
@@ -49,8 +49,7 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   into the step's transcript. *Continue run* passes the selected session's latest reply on as
   `{{steps.<gate>.output}}`; later agent steps keep the chat in their context when they share the session.
   While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
-  while a reply is generated. Without a timeout the run waits until answered or cancelled. Not available in
-  PR-triggered flows.
+  while a reply is generated. Without a timeout the run waits until answered or cancelled.
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
   (header button) re-runs the first step that did not succeed (the last step if all did) and continues to the end;
   **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
@@ -63,23 +62,39 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over. A retried intervention lists the run's sessions
   again: slash sessions continue their earlier conversation, the agent session is a new one that starts from its
   last result.
-  PR-triggered runs get a fresh check run for the new attempt (a recurring finding may post a duplicate review).
+  Runs that publish a check run get a fresh one for the new attempt.
 
 ## Public control plane (M2)
 
 See `deploy/`: `server.Dockerfile`, `compose.yml` (server + Caddy TLS, `ORCH_DOMAIN`), `orch.server.example.json`, `orch-runner.service`, and `runner*.example.json`. Runners connect outbound over `wss://<domain>/runner/ws`. Create owner-bound tokens with `runner-token create --name <n> --owner <login>` or from the Runners page.
 
-## PR checker (M3)
+## Pull request reviews (M3)
+
+A pull request is a flow input, like a GitHub issue: declare one input of type `github_pull_request` and paste the
+PR URL into the Run dialog (or `POST /api/flows/<id>/runs` with `{"inputs": {"pr": "https://github.com/owner/repo/pull/123"}}`).
+Its fields are `{{inputs.<key>.url|repo|number|title|body|baseSha|headSha|diffPath}}`; `title` and `body` arrive wrapped in
+`<untrusted_pr_text>`. A flow with a PR input:
+
+- uses the `github_checkout` workspace (set automatically in the editor): the runner checks out the PR head on the host,
+  mounts it read-only and writes the diff to `/orch/context/pr.diff`;
+- runs untrusted, on runners with `acceptUntrusted: true`: approval `auto`, no `open` network, no git commit/push/PR steps.
+
+**`github_comment` steps** work in any flow: they post the output of an earlier prompt/skill/command/slash/intervention step
+(`bodyFrom`) as a comment on the issue or pull request of a required `github_issue`/`github_pull_request` input (`target`).
+The server posts it with its own credentials (mentions neutralized); the target comes from the run's resolved inputs, never
+from the agent. The step's output is the comment URL.
+
+Typical review flow: prompt (review `{{inputs.pr.diffPath}}`) → intervention (check and discuss the review) → prompt (write
+the final review) → `github_comment` (`target: "pr"`, `bodyFrom` the final prompt). Leave out the last step to keep the
+review in the run view.
+
+To run on PR events too, add `trigger: {kind: "github_pull_request", repos: ["owner/name"]}`: each matching event fills the
+PR input (other inputs must be optional and stay empty). Fork and first-time-contributor PRs follow `forkPolicy` — for
+webhook events and manual starts alike (default `require_approval`; approve them from the run view; `skip` rejects a manual
+start). Flows with a manual trigger have no policy. With `postChecks` (default `true`), runs of PR-triggered flows — webhook
+or manual — publish a check run on the PR head with progress and finding annotations.
 
 GitHub App settings:
-- **Permissions:** Checks RW, Pull requests RW, Contents R, Issues R, Metadata R.
+- **Permissions:** Checks RW, Pull requests RW, Contents R, Issues RW (comments on issues), Metadata R.
 - **Events:** Pull request.
 - **Webhook:** `https://<domain>/github/webhook`.
-
-A flow with `trigger: {kind: "github_pull_request", repos: ["owner/name"]}` and `workspace: {kind: "github_checkout"}` runs on each matching PR event, on runners with `acceptUntrusted: true`. Prompts can use `{{inputs.pr.title|body|diffPath|…}}`. Results are reported as a check run (with annotations) and a COMMENT review.
-
-Fork and first-time-contributor PRs follow `forkPolicy` (default `require_approval`; approve them from the run view).
-
-Saved PR flows can also be started by hand: the flow editor's Run button takes a pull request URL, or `POST /api/flows/<id>/runs` with `{"prUrl": "https://github.com/owner/repo/pull/123"}`. The PR's repository must be in the flow's `repos` list; manual PR runs are untrusted like webhook runs (so they need an `acceptUntrusted` runner), report to GitHub the same way, and are not deduped — running the same PR twice creates two runs.
-
-GitHub reporting is per flow: `postChecks` (default `true`) publishes the check run with progress and result annotations, and `postReview` (default `true`) posts the COMMENT review when the agent reports findings — the review rides on the check run, so `postChecks: false` disables it too. With both off, results appear only in the orchestrator's run view.

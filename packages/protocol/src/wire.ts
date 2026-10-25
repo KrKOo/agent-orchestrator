@@ -2,8 +2,11 @@ import { z } from "zod";
 import { RunEvent, RunStatus } from "./events";
 import { FlowDefinition, InterventionAction } from "./flow";
 
-/** 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it. */
-export const WIRE_PROTOCOL = 2;
+/**
+ * 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it.
+ * 3: pull requests are flow inputs (`github_pull_request`), `github_comment` steps and the `github.createComment` RPC.
+ */
+export const WIRE_PROTOCOL = 3;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
@@ -30,9 +33,9 @@ export const AssignedRun = z.object({
   runId: z.string(),
   trust: z.enum(["owner", "untrusted"]),
   definition: FlowDefinition,
-  /** Resolved inputs: `github_issue` inputs are `GitHubIssueInput` objects. */
+  /** Resolved inputs: `github_issue` inputs are `GitHubIssueInput`, `github_pull_request` inputs `PullRequestInput` objects. */
   inputs: z.record(z.string(), z.unknown()),
-  /** Present for `github_pull_request` runs; the runner checks out `headSha` on the host. */
+  /** The run's pull request (flows with a `github_pull_request` input); the runner checks out `headSha` on the host. */
   github: z
     .object({ repo: z.string(), number: z.number().int(), headSha: z.string(), baseSha: z.string() })
     .optional(),
@@ -79,6 +82,20 @@ export interface CreatePullRequestResult {
   number: number;
 }
 
+/**
+ * Posts the body of `github_comment` step `stepId`; the server resolves the target issue or pull request
+ * from the step's `target` input as stored with the run, never from the runner.
+ */
+export const CreateCommentParams = z.object({
+  runId: z.string(),
+  stepId: z.string(),
+  body: z.string(),
+});
+export type CreateCommentParams = z.infer<typeof CreateCommentParams>;
+export interface CreateCommentResult {
+  url: string;
+}
+
 export const FsListParams = z.object({ path: z.string() });
 export type FsListParams = z.infer<typeof FsListParams>;
 export interface FsListResult {
@@ -102,6 +119,7 @@ export const RunnerRpcCall = z.discriminatedUnion("method", [
     method: z.literal("github.createPullRequest"),
     params: CreatePullRequestParams,
   }),
+  z.object({ t: z.literal("rpc.call"), rpcId: z.string(), method: z.literal("github.createComment"), params: CreateCommentParams }),
 ]);
 export type RunnerRpcCall = z.infer<typeof RunnerRpcCall>;
 

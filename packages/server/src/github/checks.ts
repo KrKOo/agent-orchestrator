@@ -3,9 +3,8 @@ import { asc, eq } from "drizzle-orm";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
 import { findingRow } from "../rows";
-import type { CheckRunOutput } from "./api";
+import type { ChangedFile, CheckRunOutput } from "./api";
 import { buildAnnotations, checkConclusion, checkSummary, checkTitle, type SummaryStep } from "./report";
-import { buildReview, type ChangedFile } from "./review";
 import { neutralizeMentions } from "./sanitize";
 
 const { runs, runSteps, findings } = schema;
@@ -23,9 +22,8 @@ type RunRecord = typeof schema.runs.$inferSelect;
 type ReporterDeps = Pick<AppDeps, "config" | "db" | "runs" | "credentials" | "github">;
 
 /**
- * Mirrors GitHub-triggered runs into their check run (and a PR review at the end).
- * GitHub calls run off the ingestion path, serialized per run so updates land in event order;
- * failures are logged and never affect the run.
+ * Mirrors pull request runs into their check run. GitHub calls run off the ingestion path,
+ * serialized per run so updates land in event order; failures are logged and never affect the run.
  */
 export class CheckReporter {
   private readonly queues = new Map<string, Promise<void>>();
@@ -169,15 +167,5 @@ export class CheckReporter {
         ...(last ? { status: "completed", conclusion: checkConclusion(status, found), completed_at: new Date().toISOString() } : {}),
       });
     }
-
-    const trigger = run.definition.trigger;
-    if (trigger.kind !== "github_pull_request" || !trigger.postReview || found.length === 0) return;
-    const review = buildReview(found, files);
-    await this.deps.github.createReview(token, repo, gh.number, {
-      commit_id: gh.headSha,
-      event: "COMMENT",
-      body: review.body,
-      comments: review.comments,
-    });
   }
 }

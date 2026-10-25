@@ -2,6 +2,7 @@ import {
   type Catalog,
   type FlowDefinition,
   isAgentStep,
+  isTextStep,
   type Step,
   type TemplateVariable,
   templateVariables,
@@ -17,6 +18,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   git_push: "Git push",
   github_pr: "GitHub PR",
   intervention: "Intervention",
+  github_comment: "GitHub comment",
 };
 
 export const KIND_ICON: Record<Step["kind"], string> = {
@@ -28,6 +30,7 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   git_push: "⏫",
   github_pr: "🚀",
   intervention: "⏸",
+  github_comment: "📝",
 };
 
 /** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
@@ -110,16 +113,24 @@ export function StepPanel({
   onDelete: () => void;
 }) {
   const step = def.steps[index]!;
-  const earlierAgentSteps = def.steps.slice(0, index).filter(isAgentStep);
+  const earlierSteps = def.steps.slice(0, index);
+  const earlierAgentSteps = earlierSteps.filter(isAgentStep);
+  const githubInputs = def.inputs.filter((i) => i.type !== "text");
   const set = (patch: Partial<Step>) => onChange({ ...step, ...patch } as Step);
 
-  const refSelect = (label: string, value: string, patchKey: "messageFrom" | "titleFrom" | "bodyFrom") => (
+  /** Select of an earlier step whose output feeds `patchKey`; agent steps unless `sources` says otherwise. */
+  const refSelect = (
+    label: string,
+    value: string,
+    patchKey: "messageFrom" | "titleFrom" | "bodyFrom",
+    sources: { steps: Step[]; noun: string } = { steps: earlierAgentSteps, noun: "agent step" },
+  ) => (
     <label className="field">
       <span>{label}</span>
       <select value={value} onChange={(e) => set({ [patchKey]: e.target.value } as Partial<Step>)}>
-        <option value="">— choose an earlier agent step —</option>
-        {value && !earlierAgentSteps.some((s) => s.id === value) && <option value={value}>{value} (invalid)</option>}
-        {earlierAgentSteps.map((s) => (
+        <option value="">— choose an earlier {sources.noun} —</option>
+        {value && !sources.steps.some((s) => s.id === value) && <option value={value}>{value} (invalid)</option>}
+        {sources.steps.map((s) => (
           <option key={s.id} value={s.id}>
             {s.name} ({s.id})
           </option>
@@ -301,6 +312,32 @@ export function StepPanel({
             <input type="checkbox" checked={step.draft} onChange={(e) => set({ draft: e.target.checked })} />
             Open as draft
           </label>
+        </>
+      )}
+      {step.kind === "github_comment" && (
+        <>
+          <label className="field">
+            <span>Comment on</span>
+            <select value={step.target} onChange={(e) => set({ target: e.target.value })}>
+              {(!step.target || githubInputs.length === 0) && <option value="">— choose an issue or pull request input —</option>}
+              {step.target && !githubInputs.some((i) => i.key === step.target) && (
+                <option value={step.target}>{step.target} (invalid)</option>
+              )}
+              {githubInputs.map((i) => (
+                <option key={i.key} value={i.key}>
+                  {i.label || i.key} ({i.key})
+                </option>
+              ))}
+            </select>
+            {githubInputs.length === 0 && (
+              <small className="muted">Add a github_issue or github_pull_request input</small>
+            )}
+          </label>
+          {refSelect("Comment body from", step.bodyFrom, "bodyFrom", {
+            steps: earlierSteps.filter(isTextStep),
+            noun: "prompt, skill, command, slash or intervention step",
+          })}
+          <p className="muted small">Posts the body as a comment (mentions neutralized); the step output is the comment URL.</p>
         </>
       )}
     </div>

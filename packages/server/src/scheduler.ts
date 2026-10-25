@@ -57,7 +57,7 @@ export function isEligible(run: SchedulableRun, r: RunnerState, now: number): bo
 }
 
 export interface SchedulerOptions {
-  /** Non-terminal GitHub-triggered runs assigned at once per repository. */
+  /** Non-terminal pull request runs (webhook or manual) assigned at once per repository. */
   maxConcurrentPerRepo: number;
 }
 

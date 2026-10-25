@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   type AssignedRun,
   FlowDefinition,
+  type CreateCommentParams,
   type FlowDefinitionInput,
   type GitHubTokenParams,
   type RunEventDraft,
@@ -872,7 +873,7 @@ describe("runJob", () => {
 describe("runJob: untrusted pull request runs", () => {
   const prFlow = (steps: FlowDefinitionInput["steps"]): Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps"> => ({
     workspace: { kind: "github_checkout" },
-    trigger: { kind: "github_pull_request", repos: ["acme/widget"] },
+    inputs: [{ key: "pr", label: "Pull request", type: "github_pull_request", required: true }],
     steps,
   });
   const prRun = (steps: FlowDefinitionInput["steps"], trust: AssignedRun["trust"] = "untrusted"): AssignedRun => ({
@@ -927,6 +928,73 @@ describe("runJob: untrusted pull request runs", () => {
     // The checkout is deleted after the run.
     expect(existsSync(checkout)).toBe(false);
     expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("github_comment posts the comment body via RPC", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    deps.config = { ...config, acceptUntrusted: true };
+    deps.githubGitUrl = `file://${ghRoot}`;
+    const rpcCalls: { method: string; params: unknown }[] = [];
+    deps.rpc = async <T>(method: string, params: unknown) => {
+      rpcCalls.push({ method, params });
+      return (method === "github.createComment" ? { url: "https://github.com/acme/widget/pull/7#issuecomment-1" } : { token: "read-token" }) as T;
+    };
+    const run = prRun([
+      { kind: "prompt", id: "write", name: "Write", prompt: "echo comment" },
+      { kind: "github_comment", id: "post", name: "Post", target: "pr", bodyFrom: "write" },
+    ]);
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const [written, posted] = ofType(events, "step.finished").map((e) => e.payload);
+    const params: CreateCommentParams = { runId: run.runId, stepId: "post", body: written!.output! };
+    expect(rpcCalls.filter((c) => c.method === "github.createComment")).toEqual([{ method: "github.createComment", params }]);
+    expect(posted).toMatchObject({ status: "succeeded", output: "https://github.com/acme/widget/pull/7#issuecomment-1" });
+  });
+
+  test("github_comment with an empty body fails without calling the RPC", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    deps.config = { ...config, acceptUntrusted: true };
+    deps.githubGitUrl = `file://${ghRoot}`;
+    const methods: string[] = [];
+    deps.rpc = async <T>(method: string) => {
+      methods.push(method);
+      return { token: "read-token" } as T;
+    };
+    // Attempt 2 resumes at the comment step; the prior writer step produced only whitespace.
+    const run: AssignedRun = {
+      ...prRun([
+        { kind: "prompt", id: "write", name: "Write", prompt: "x" },
+        { kind: "github_comment", id: "post", name: "Post", target: "pr", bodyFrom: "write" },
+      ]),
+      resume: { fromStepIdx: 1, prior: [{ stepId: "write", output: "  \n" }] },
+    };
+    await runJob(run, deps, new AbortController().signal);
+    expect(methods).not.toContain("github.createComment");
+    expect(ofType(events, "step.finished").at(-1)!.payload).toMatchObject({ status: "failed", error: "Comment body from step write is empty" });
+  });
+
+  test("owner local-path runs can comment on a github_issue input", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const rpcCalls: { method: string; params: unknown }[] = [];
+    deps.rpc = async <T>(method: string, params: unknown) => {
+      rpcCalls.push({ method, params });
+      return { url: "https://github.com/acme/widget/issues/3#issuecomment-2" } as T;
+    };
+    const run = assigned({
+      inputs: [{ key: "issue", label: "Issue", type: "github_issue", required: true }],
+      steps: [
+        { kind: "prompt", id: "write", name: "Write", prompt: "echo triage" },
+        { kind: "github_comment", id: "post", name: "Post", target: "issue", bodyFrom: "write" },
+      ],
+    });
+    run.inputs.issue = { url: "https://github.com/acme/widget/issues/3", repo: "acme/widget", number: 3, title: "Bug", body: "Broken" };
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const [written, posted] = ofType(events, "step.finished").map((e) => e.payload);
+    expect(rpcCalls).toEqual([{ method: "github.createComment", params: { runId: run.runId, stepId: "post", body: written!.output! } }]);
+    expect(posted).toMatchObject({ status: "succeeded", output: "https://github.com/acme/widget/issues/3#issuecomment-2" });
   });
 
   test("owner runs cannot use github_checkout", async () => {

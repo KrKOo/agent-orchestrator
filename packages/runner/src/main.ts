@@ -2,7 +2,7 @@ import { WIRE_PROTOCOL, type ModelEntry, type RunnerMessage, type ServerMessage 
 import { join } from "node:path";
 import pkg from "../package.json";
 import { loadConfig, type RunnerConfig } from "./config";
-import { Connection } from "./connection";
+import { Connection, type RunnerRpcMethod } from "./connection";
 import { fsList } from "./fs-rpc";
 import { type Gateway, PortInUseError, startGateway } from "./gateway";
 import { JobManager } from "./job";
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     emit: (draft) => outbox.append(draft),
     seedOutbox: (runId, seqFrom) => outbox.seed(runId, seqFrom),
     send,
-    rpc: <T>(method: "github.token" | "github.createPullRequest", params: unknown) => {
+    rpc: <T>(method: RunnerRpcMethod, params: unknown) => {
       if (!conn) return Promise.reject(new Error("Not connected"));
       return conn.rpc<T>(method, params);
     },

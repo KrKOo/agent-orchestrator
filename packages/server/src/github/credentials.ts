@@ -1,17 +1,22 @@
 import { App } from "@octokit/app";
 import { readFileSync } from "node:fs";
 import type { GitHubConfig } from "../config";
+import { GitHubError } from "./api";
 
 /**
  * - `read`/`write`: contents + pull requests (+ issues read), for runners (checkout, push, PR creation).
- * - `report`: checks + pull requests write, for the server's own check-run and review reporting.
+ * - `report`: checks + pull requests write, for the server's own check-run reporting and pull request comments.
+ * - `comment`: issues write, for `github_comment` steps on issues.
  */
-export type TokenAccess = "read" | "write" | "report";
+export type TokenAccess = "read" | "write" | "report" | "comment";
 
 export interface GitHubCredentials {
   /** True when `tokenFor` can produce a token. */
   readonly configured: boolean;
-  /** `installationId`, when known (webhook-triggered runs), skips the App installation lookup. */
+  /**
+   * `installationId`, when known (webhook-triggered runs), skips the App installation lookup.
+   * A repo the App is not installed on rejects with a 404 `GitHubError`.
+   */
   tokenFor(repo: string, access: TokenAccess, installationId?: number): Promise<string>;
 }
 
@@ -35,6 +40,7 @@ const PERMISSIONS: Record<TokenAccess, Record<string, "read" | "write">> = {
   read: { contents: "read", pull_requests: "read", issues: "read" },
   write: { contents: "write", pull_requests: "write", issues: "read" },
   report: { checks: "write", pull_requests: "write" },
+  comment: { issues: "write" },
 };
 
 /** Tokens are reused until this long before `expires_at`. */
@@ -77,7 +83,8 @@ export class AppCredentials implements GitHubCredentials {
       });
       id = res.data.id;
     } catch (err) {
-      if (err instanceof Error && "status" in err && err.status === 404) throw new Error(`GitHub App is not installed on ${repo}`);
+      // An input problem (the user named a repo the App cannot see), unlike other lookup failures.
+      if (err instanceof Error && "status" in err && err.status === 404) throw new GitHubError(`GitHub App is not installed on ${repo}`, 404);
       throw err;
     }
     this.installations.set(key, id);

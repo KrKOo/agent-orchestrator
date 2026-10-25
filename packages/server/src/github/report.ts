@@ -1,5 +1,4 @@
 import type { Finding } from "@orch/protocol";
-import { formatFindingList } from "./review";
 import { neutralizeMentions, safeSlice, sanitizeForMarkdown } from "./sanitize";
 
 export type CheckConclusion = "success" | "failure" | "neutral" | "cancelled";
@@ -32,6 +31,33 @@ const ANNOTATION_LEVEL: Record<Finding["severity"], CheckAnnotation["annotation_
   warning: "warning",
   info: "notice",
 };
+
+/** One markdown list line for a finding; message and path are mention-neutralized. */
+function formatFindingLine(f: Finding): string {
+  const message = neutralizeMentions(f.message).replace(/\s*\n\s*/g, " ");
+  const path = neutralizeMentions(f.file, 500).replaceAll("`", "'");
+  return `- \`${path}:${f.line}\` ${f.severity}: ${message}`;
+}
+
+/**
+ * Markdown list of findings fitting within `maxChars`; overflow collapses into a final
+ * `- … and N more` line.
+ */
+export function formatFindingList(findings: Finding[], maxChars: number): string {
+  const lines = findings.map(formatFindingLine);
+  let out = "";
+  for (let i = 0; i < lines.length; i++) {
+    const candidate = out === "" ? lines[i]! : `${out}\n${lines[i]}`;
+    const left = lines.length - i - 1;
+    const reserve = left > 0 ? `\n- … and ${left} more`.length : 0;
+    if (candidate.length + reserve > maxChars) {
+      const more = `- … and ${lines.length - i} more`;
+      return out === "" ? more : `${out}\n${more}`;
+    }
+    out = candidate;
+  }
+  return out;
+}
 
 export function checkConclusion(status: TerminalStatus, findings: Finding[]): CheckConclusion {
   if (status === "cancelled") return "cancelled";

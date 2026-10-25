@@ -212,47 +212,50 @@ describe("intervention steps", () => {
     expect(isActionStep(step as never)).toBe(false);
     expect(isAgentStep(step as never)).toBe(false);
   });
-
-  test("validateFlow rejects intervention steps in pull request flows", () => {
-    const res = validateFlow({
-      ...prFlow,
-      steps: [...prFlow.steps, { id: "gate", name: "Gate", kind: "intervention", message: "ok?" }],
-    });
-    expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.errors.join()).toContain("cannot contain intervention steps");
-  });
 });
 
 const prFlow = {
-  name: "pr-check",
-  inputs: [],
+  name: "pr-review",
+  inputs: [{ key: "pr", label: "Pull request", type: "github_pull_request" }],
   workspace: { kind: "github_checkout" },
   harness: { id: "omp", model: "anthropic/claude-sonnet-4-5" },
-  trigger: { kind: "github_pull_request", repos: ["o/r"] },
   steps: [{ id: "review", name: "Review", kind: "prompt", prompt: "Review {{inputs.pr.title}} using {{inputs.pr.diffPath}}" }],
 };
 
-describe("validateFlow for github_pull_request flows", () => {
-  test("accepts a PR check flow and applies trigger defaults", () => {
-    const res = validateFlow(prFlow);
+describe("validateFlow for flows with a pull request input", () => {
+  test("accepts a manual review flow with a gate and a github_comment posting the final review", () => {
+    const res = validateFlow({
+      ...prFlow,
+      inputs: [...prFlow.inputs, { key: "focus", label: "Focus", type: "text" }],
+      steps: [
+        ...prFlow.steps,
+        { id: "gate", name: "Verify", kind: "intervention" },
+        { id: "write", name: "Write", kind: "prompt", prompt: "Write the review for {{inputs.pr.url}}: {{steps.gate.output}} {{inputs.focus}}" },
+        { id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom: "write" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.trigger).toEqual({ kind: "manual" });
+  });
+
+  test("the github_pull_request trigger fills the PR input and applies defaults", () => {
+    const res = validateFlow({ ...prFlow, trigger: { kind: "github_pull_request", repos: ["o/r"] } });
     if (!res.ok) throw new Error(res.errors.join("\n"));
     expect(res.flow.trigger).toEqual({
       kind: "github_pull_request",
       repos: ["o/r"],
       events: ["opened", "synchronize", "reopened", "ready_for_review"],
       forkPolicy: "require_approval",
-      postReview: true,
       postChecks: true,
     });
   });
 
-  test("rejects local workspaces, action steps, ask approval, open network, inputs and unknown pr fields", () => {
+  test("rejects local workspaces, action steps, ask approval, open network and unknown pr fields", () => {
     const res = validateFlow({
       ...prFlow,
       workspace: { kind: "local_path", path: "/repo" },
       approval: "ask",
       sandbox: { network: { mode: "open", allow: [] } },
-      inputs: [{ key: "x", label: "X", type: "text" }],
       steps: [
         { id: "a", name: "A", kind: "prompt", prompt: "{{inputs.pr.author}}" },
         { id: "c", name: "C", kind: "git_commit", messageFrom: "a" },
@@ -261,15 +264,90 @@ describe("validateFlow for github_pull_request flows", () => {
     expect(res.ok).toBe(false);
     if (res.ok) return;
     const all = res.errors.join("\n");
-    for (const needle of ["github_checkout", 'approval "auto"', '"open"', "take no inputs", "inputs.pr exposes only", "cannot contain git_commit"]) {
+    for (const needle of ["github_checkout", 'approval "auto"', '"open"', 'github_pull_request input "pr" exposes only', "cannot contain git_commit"]) {
       expect(all).toContain(needle);
     }
   });
 
-  test("rejects github_checkout on manual flows", () => {
-    const res = validateFlow({ ...prFlow, trigger: { kind: "manual" }, steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }] });
+  test("rejects a second or optional PR input, and required extra inputs under the PR trigger", () => {
+    const res = validateFlow({
+      ...prFlow,
+      trigger: { kind: "github_pull_request", repos: ["o/r"] },
+      inputs: [
+        ...prFlow.inputs,
+        { key: "other", label: "Other", type: "github_pull_request", required: false },
+        { key: "note", label: "Note", type: "text" },
+      ],
+    });
     expect(res.ok).toBe(false);
-    if (!res.ok) expect(res.errors.join()).toContain("requires a github_pull_request trigger");
+    if (res.ok) return;
+    const all = res.errors.join("\n");
+    for (const needle of ["at most one github_pull_request input", "inputs.other: github_pull_request inputs must be required", "inputs.note: must be optional"]) {
+      expect(all).toContain(needle);
+    }
+  });
+
+  test("github_checkout and the PR trigger need the PR input", () => {
+    const res = validateFlow({
+      ...prFlow,
+      inputs: [],
+      trigger: { kind: "github_pull_request", repos: ["o/r"] },
+      steps: [{ id: "a", name: "A", kind: "prompt", prompt: "hi" }],
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    const all = res.errors.join("\n");
+    for (const needle of ['"github_checkout" requires a github_pull_request input', "trigger requires a github_pull_request input"]) {
+      expect(all).toContain(needle);
+    }
+  });
+});
+
+describe("github_comment steps", () => {
+  test("comment on a required issue input of a local flow", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "Fix {{inputs.issue.title}}" },
+        { id: "note", name: "Note", kind: "github_comment", target: "issue", bodyFrom: "impl" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+  });
+
+  test("target must be a required GitHub input", () => {
+    const steps = (target: string) => [
+      { id: "impl", name: "Implement", kind: "prompt", prompt: "x" },
+      { id: "note", name: "Note", kind: "github_comment", target, bodyFrom: "impl" },
+    ];
+    const inputs = [
+      { key: "issue", label: "Issue", type: "github_issue", required: false },
+      { key: "text", label: "Text", type: "text" },
+    ];
+    for (const target of ["issue", "text", "missing"]) {
+      const res = validateFlow({ ...baseFlow, inputs, steps: steps(target) });
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.errors.join()).toContain(`target: "${target}" must be a required github_issue or github_pull_request input`);
+    }
+  });
+
+  test("bodyFrom must be an earlier text step", () => {
+    const later = validateFlow({
+      ...prFlow,
+      steps: [{ id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom: "review" }, ...prFlow.steps],
+    });
+    expect(later.ok).toBe(false);
+    if (!later.ok) expect(later.errors.join()).toContain('bodyFrom: "review" must be an earlier');
+    const chained = validateFlow({
+      ...prFlow,
+      steps: [
+        ...prFlow.steps,
+        { id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom: "review" },
+        { id: "again", name: "Again", kind: "github_comment", target: "pr", bodyFrom: "post" },
+      ],
+    });
+    expect(chained.ok).toBe(false);
+    if (!chained.ok) expect(chained.errors.join()).toContain('bodyFrom: "post" must be an earlier');
   });
 });
 
@@ -314,13 +392,14 @@ describe("templateVariables", () => {
     for (let i = 0; i < def.steps.length; i++) expectAllValid(def, i);
   });
 
-  test("pull request flows expose inputs.pr and its fields", () => {
+  test("pull request inputs expose their fields", () => {
     const def = parse({
       ...prFlow,
       steps: [...prFlow.steps, { id: "summary", name: "Summary", kind: "prompt", prompt: "sum up" }],
     });
     const paths = templateVariables(def, 1).map((v) => v.path);
     expect(paths).toContain("inputs.pr");
+    expect(paths).toContain("inputs.pr.url");
     expect(paths).toContain("inputs.pr.diffPath");
     expect(paths).toContain("steps.review.structured");
     expectAllValid(def, 1);

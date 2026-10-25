@@ -68,8 +68,8 @@ export const api = {
   createFlow: (def: FlowDefinitionInput) => request<FlowRow>("POST", "/api/flows", def),
   updateFlow: (id: string, def: FlowDefinitionInput) => request<FlowRow>("PUT", `/api/flows/${enc(id)}`, def),
   deleteFlow: (id: string) => request<void>("DELETE", `/api/flows/${enc(id)}`),
-  startRun: (flowId: string, body: { inputs?: Record<string, string>; prUrl?: string }) =>
-    request<RunRow>("POST", `/api/flows/${enc(flowId)}/runs`, body),
+  startRun: (flowId: string, inputs: Record<string, string>) =>
+    request<RunRow>("POST", `/api/flows/${enc(flowId)}/runs`, { inputs }),
 
   listRuns: (flowId?: string) => request<RunRow[]>("GET", `/api/runs${flowId ? `?flowId=${enc(flowId)}` : ""}`),
   getRun: (id: string) => request<RunDetail>("GET", `/api/runs/${enc(id)}`),
