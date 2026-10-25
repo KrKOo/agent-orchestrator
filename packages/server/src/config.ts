@@ -19,7 +19,7 @@ const trimSlash = (u: string): string => u.replace(/\/+$/, "");
 const GitHubCommon = {
   apiBaseUrl: z.url().default("https://api.github.com").transform(trimSlash),
   webBaseUrl: z.url().default("https://github.com").transform(trimSlash),
-  /** At most this many non-terminal GitHub-triggered runs per repo are assigned at once. */
+  /** At most this many non-terminal pull request runs (webhook or manual) per repo are assigned at once. */
   maxConcurrentPerRepo: z.number().int().min(1).default(2),
 };
 

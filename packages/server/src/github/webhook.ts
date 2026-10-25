@@ -1,19 +1,21 @@
-import { PR_DIFF_PATH, wrapUntrustedText, type PullRequestInput, type RunStatus } from "@orch/protocol";
+import { pullRequestInputOf, type RunStatus } from "@orch/protocol";
 import type { Webhooks } from "@octokit/webhooks";
 import { and, eq, inArray } from "drizzle-orm";
-import { ulid } from "ulid";
 import { z } from "zod";
+import { initialPullRunStatus, insertRun, pullRequestInput } from "../createRun";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
 import { ACTIVE_STATUSES } from "../scheduler";
+import { isUntrustedPullSource } from "./api";
 
-const { flows, runs, runSteps, webhookDeliveries } = schema;
+const { flows, runs, webhookDeliveries } = schema;
 
 const PullRequestEvent = z.object({
   action: z.string(),
   installation: z.object({ id: z.number().int() }).optional(),
   repository: z.object({ full_name: z.string() }),
   pull_request: z.object({
+    html_url: z.string(),
     number: z.number().int(),
     title: z.string(),
     body: z.string().nullable(),
@@ -24,8 +26,6 @@ const PullRequestEvent = z.object({
 });
 type PullRequestEvent = z.infer<typeof PullRequestEvent>;
 
-/** Authors GitHub reports with these associations are treated like fork PRs. */
-const UNTRUSTED_ASSOCIATIONS = new Set(["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE"]);
 const PENDING_STATUSES: RunStatus[] = ["queued", "awaiting_approval"];
 
 export interface WebhookRequest {
@@ -53,7 +53,8 @@ export async function verifySignature(webhooks: Webhooks, body: string, signatur
 
 /**
  * `POST /github/webhook`: signature check, delivery dedupe, then for `pull_request` events one run per
- * matching flow (with supersede and fork policy). Runs never execute inline; GitHub calls are queued.
+ * matching flow (with supersede and fork policy); the PR fills the flow's `github_pull_request` input.
+ * Runs never execute inline; GitHub calls are queued.
  */
 export async function handleWebhook(deps: AppDeps, webhooks: Webhooks, req: WebhookRequest): Promise<WebhookResult> {
   if (!(await verifySignature(webhooks, req.body, req.signature))) return { status: 401, body: { error: "invalid signature" } };
@@ -91,12 +92,13 @@ function createPullRequestRuns(deps: AppDeps, ev: PullRequestEvent): { runId: st
   const repo = ev.repository.full_name;
   const headSha = pr.head.sha;
   const sha7 = headSha.slice(0, 7);
-  const untrustedSource = pr.head.repo?.full_name !== pr.base.repo.full_name || UNTRUSTED_ASSOCIATIONS.has(pr.author_association);
+  const untrustedSource = isUntrustedPullSource(pr.head.repo?.full_name, pr.base.repo.full_name, pr.author_association);
   const out: { runId: string; awaiting: boolean }[] = [];
 
   for (const flow of db.select().from(flows).all()) {
     const trigger = flow.definition.trigger;
-    if (trigger.kind !== "github_pull_request") continue;
+    const prDef = pullRequestInputOf(flow.definition);
+    if (trigger.kind !== "github_pull_request" || !prDef) continue;
     if (!trigger.events.some((e) => e === ev.action)) continue;
     if (!trigger.repos.some((r) => r.toLowerCase() === repo.toLowerCase())) continue;
 
@@ -120,54 +122,29 @@ function createPullRequestRuns(deps: AppDeps, ev: PullRequestEvent): { runId: st
       console.log(`[webhook] run ${old.id} superseded by ${sha7}`);
     }
 
-    let status: RunStatus = "queued";
-    if (untrustedSource) {
-      if (trigger.forkPolicy === "skip") continue;
-      if (trigger.forkPolicy === "require_approval") status = "awaiting_approval";
-    }
+    const status = initialPullRunStatus(trigger, untrustedSource);
+    if (status === null) continue;
 
-    const prInput: PullRequestInput = {
+    // Other inputs are optional on PR-triggered flows (validateFlow); leave them empty.
+    const inputs: Record<string, unknown> = {};
+    for (const d of flow.definition.inputs) inputs[d.key] = d.type === "text" ? "" : null;
+    inputs[prDef.key] = pullRequestInput({
+      url: pr.html_url,
       repo,
       number: pr.number,
-      title: wrapUntrustedText(pr.title),
-      body: wrapUntrustedText(pr.body ?? ""),
+      title: pr.title,
+      body: pr.body ?? "",
       baseSha: pr.base.sha,
       headSha,
-      diffPath: PR_DIFF_PATH,
-    };
-    const id = ulid();
-    const inserted = db.transaction((tx) => {
-      const rows = tx
-        .insert(runs)
-        .values({
-          id,
-          flowId: flow.id,
-          flowVersion: flow.version,
-          definition: flow.definition,
-          inputs: { pr: prInput },
-          status,
-          trust: "untrusted",
-          triggerKind: "github",
-          dedupeKey,
-          github: {
-            ...(ev.installation ? { installationId: ev.installation.id } : {}),
-            repo,
-            number: pr.number,
-            headSha,
-            baseSha: pr.base.sha,
-          },
-          createdAt: Date.now(),
-        })
-        .onConflictDoNothing()
-        .returning({ id: runs.id })
-        .all();
-      if (rows.length === 0) return false;
-      tx.insert(runSteps)
-        .values(flow.definition.steps.map((s, idx) => ({ runId: id, stepId: s.id, idx, status: "pending" as const })))
-        .run();
-      return true;
+      untrustedSource,
     });
-    if (!inserted) continue;
+    const id = insertRun(deps, flow, inputs, {
+      ...(ev.installation ? { installationId: ev.installation.id } : {}),
+      dedupeKey,
+      status,
+      triggerKind: "github",
+    });
+    if (id === null) continue;
     console.log(`[webhook] ${repo}#${pr.number}@${sha7} (${ev.action}) → run ${id} (${status}) for flow ${flow.name}`);
     out.push({ runId: id, awaiting: status === "awaiting_approval" });
   }

@@ -1,11 +1,18 @@
-import { ElicitationAction, InterventionAction, type GitHubIssueInput, type InputDef, type RunDetail } from "@orch/protocol";
+import {
+  ElicitationAction,
+  InterventionAction,
+  type GitHubIssueInput,
+  type InputDef,
+  type PullRequestInput,
+  type RunDetail,
+} from "@orch/protocol";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { ulid } from "ulid";
 import { z } from "zod";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
-import { GitHubError, ISSUE_URL_RE } from "../github/api";
+import { initialPullRunStatus, insertRun, pullRequestInput } from "../createRun";
+import { GitHubError, parseIssueUrl, parsePullUrl } from "../github/api";
 import { findingRow, runRow, stepRow } from "../rows";
 import { isTerminal } from "../runs";
 import { eventsAfter } from "../ws/browser";
@@ -13,7 +20,7 @@ import { issueMessages, readJson } from "./util";
 
 const { flows, runs, runSteps, findings } = schema;
 
-const CreateRunBody = z.object({ inputs: z.record(z.string(), z.string()).default({}) });
+const CreateRunBody = z.object({ inputs: z.record(z.string(), z.string()).optional() });
 const PermissionBody = z.object({ optionId: z.string().min(1).nullable() });
 const RetryBody = z.object({ fromStepId: z.string().min(1).optional() });
 const ElicitationBody = z.object({ action: ElicitationAction, content: z.record(z.string(), z.unknown()).optional() });
@@ -30,12 +37,13 @@ const InterventionBody = z
   });
 
 export type InputResolution =
-  | { ok: true; inputs: Record<string, unknown> }
+  | { ok: true; inputs: Record<string, unknown>; untrustedPullSource: boolean }
   | { ok: false; status: 400 | 502; body: { error: string } | { errors: string[] } };
 
 /**
- * Checks raw string inputs against the flow's `InputDef`s and resolves `github_issue` inputs.
- * Optional inputs left empty become `""` (text) or `null` (github_issue).
+ * Checks raw string inputs against the flow's `InputDef`s and resolves `github_issue` and
+ * `github_pull_request` URLs. Optional inputs left empty become `""` (text) or `null` (GitHub inputs).
+ * `untrustedPullSource` reports a fork or first-time-contributor pull request input.
  */
 export async function resolveInputs(
   deps: Pick<AppDeps, "credentials" | "github">,
@@ -51,6 +59,7 @@ export async function resolveInputs(
   if (errors.length) return { ok: false, status: 400, body: { errors } };
 
   const inputs: Record<string, unknown> = {};
+  let untrustedPullSource = false;
   for (const d of defs) {
     const value = raw[d.key] ?? "";
     if (d.type === "text") {
@@ -62,22 +71,33 @@ export async function resolveInputs(
       continue;
     }
     try {
-      inputs[d.key] = await fetchIssue(deps, value);
+      const resolved = await fetchGitHubInput(deps, d.type, value);
+      inputs[d.key] = resolved.value;
+      untrustedPullSource ||= resolved.untrustedSource;
     } catch (err) {
       if (!(err instanceof GitHubError)) throw err;
-      if (err.message === "Invalid GitHub issue URL") return { ok: false, status: 400, body: { error: err.message } };
+      if (err.message === INVALID_URL[d.type]) return { ok: false, status: 400, body: { error: err.message } };
       const clientSide = err.status >= 400 && err.status < 500;
       return { ok: false, status: clientSide ? 400 : 502, body: { error: `inputs.${d.key}: ${err.message}` } };
     }
   }
-  return { ok: true, inputs };
+  return { ok: true, inputs, untrustedPullSource };
 }
 
-async function fetchIssue(deps: Pick<AppDeps, "credentials" | "github">, url: string): Promise<GitHubIssueInput> {
-  const m = ISSUE_URL_RE.exec(url.trim());
-  if (!m) throw new GitHubError("Invalid GitHub issue URL", 0);
-  const token = deps.credentials.configured ? await deps.credentials.tokenFor(`${m[1]}/${m[2]}`, "read") : null;
-  return deps.github.getIssue(url, token);
+const INVALID_URL = { github_issue: "Invalid GitHub issue URL", github_pull_request: "Invalid GitHub pull request URL" } as const;
+
+async function fetchGitHubInput(
+  deps: Pick<AppDeps, "credentials" | "github">,
+  type: "github_issue" | "github_pull_request",
+  url: string,
+): Promise<{ value: GitHubIssueInput | PullRequestInput; untrustedSource: boolean }> {
+  const ref = type === "github_issue" ? parseIssueUrl(url) : parsePullUrl(url);
+  if (!ref) throw new GitHubError(INVALID_URL[type], 0);
+  // A repo the App cannot access is a 4xx GitHubError (an input problem); other credential failures are server errors.
+  const token = deps.credentials.configured ? await deps.credentials.tokenFor(ref.repo, "read") : null;
+  if (type === "github_issue") return { value: await deps.github.getIssue(ref, token), untrustedSource: false };
+  const pr = await deps.github.getPull(ref, token);
+  return { value: pullRequestInput(pr), untrustedSource: pr.untrustedSource };
 }
 
 export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
@@ -91,33 +111,20 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     if (!body.ok) return body.response;
     const parsed = CreateRunBody.safeParse(body.value);
     if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
-    const resolved = await resolveInputs(deps, flow.definition.inputs, parsed.data.inputs);
+    const resolved = await resolveInputs(deps, flow.definition.inputs, parsed.data.inputs ?? {});
     if (!resolved.ok) return c.json(resolved.body, resolved.status);
-
-    if (flow.definition.trigger.kind !== "manual") {
-      return c.json({ error: "This flow runs on GitHub pull requests and cannot be started manually" }, 400);
+    const status = initialPullRunStatus(flow.definition.trigger, resolved.untrustedPullSource);
+    if (status === null) {
+      return c.json({ error: 'Flow forkPolicy is "skip": fork and first-time-contributor pull requests never run' }, 403);
     }
-    const id = ulid();
-    const now = Date.now();
-    db.transaction((tx) => {
-      tx.insert(runs)
-        .values({
-          id,
-          flowId: flow.id,
-          flowVersion: flow.version,
-          definition: flow.definition,
-          inputs: resolved.inputs,
-          status: "queued",
-          trust: "owner",
-          triggerKind: "manual",
-          createdBy: c.get("user")?.id ?? null,
-          createdAt: now,
-        })
-        .run();
-      tx.insert(runSteps)
-        .values(flow.definition.steps.map((s, idx) => ({ runId: id, stepId: s.id, idx, status: "pending" as const })))
-        .run();
-    });
+
+    const id = insertRun(deps, flow, resolved.inputs, { triggerKind: "manual", createdBy: c.get("user")?.id ?? null, status });
+    if (id === null) throw new Error("unreachable: manual runs have no dedupe key");
+    const github = deps.runs.get(id)!.github;
+    if (github) {
+      console.log(`[runs] flow ${flow.name} started on ${github.repo}#${github.number} → run ${id} (${status})`);
+      deps.checks.createCheckRun(id, status === "awaiting_approval");
+    }
     deps.scheduler.kick();
     return c.json(runRow(deps.runs.get(id)!), 201);
   });
@@ -207,7 +214,8 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       }
     }
     console.log(`[runs] run ${id} retry from step ${run.definition.steps[fromStepIdx]?.id ?? fromStepIdx}`);
-    if (run.triggerKind === "github") deps.checks.createCheckRun(id, false);
+    // Any PR run (webhook or manual) needs a fresh check run for the retried execution.
+    if (run.github) deps.checks.createCheckRun(id, false);
     deps.scheduler.kick();
     return c.json({ ok: true });
   });

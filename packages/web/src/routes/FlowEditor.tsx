@@ -2,6 +2,8 @@ import {
   type FlowDefinition,
   type FlowRow,
   isAgentStep,
+  isTextStep,
+  pullRequestInputOf,
   type Step,
   STEP_KINDS,
   type StepKind,
@@ -45,7 +47,7 @@ const NEW_FLOW: FlowDefinition = {
   steps: [{ id: "prompt_1", kind: "prompt", name: "Prompt", prompt: "", freshSession: false, timeoutSec: 1800 }],
 };
 
-function newStep(kind: StepKind, id: string, earlier: Step[]): Step {
+function newStep(kind: StepKind, id: string, earlier: Step[], inputs: FlowDefinition["inputs"]): Step {
   const base = { id, name: KIND_LABEL[kind], timeoutSec: 1800 };
   const lastAgent = earlier.filter(isAgentStep).at(-1)?.id ?? "";
   switch (kind) {
@@ -65,6 +67,10 @@ function newStep(kind: StepKind, id: string, earlier: Step[]): Step {
       return { ...base, kind, titleFrom: lastAgent, bodyFrom: lastAgent, draft: false };
     case "intervention":
       return { id, name: KIND_LABEL[kind], kind, message: "" };
+    case "github_comment": {
+      const target = pullRequestInputOf({ inputs }) ?? inputs.find((i) => i.required && i.type !== "text");
+      return { ...base, kind, target: target?.key ?? "", bodyFrom: earlier.filter(isTextStep).at(-1)?.id ?? "" };
+    }
   }
 }
 
@@ -174,9 +180,8 @@ function settingsSubtitle(def: FlowDefinition): string {
   if (def.trigger.kind === "github_pull_request") {
     return `on PRs · ${def.trigger.repos.join(", ") || "(no repositories)"}`;
   }
-  return def.workspace.kind === "local_path"
-    ? def.workspace.path || "(choose a workspace path)"
-    : "manual · PR checkout workspace";
+  if (pullRequestInputOf(def)) return "manual · pull request checkout";
+  return def.workspace.kind === "local_path" ? def.workspace.path || "(choose a workspace path)" : "manual";
 }
 
 function stepSubtitle(step: Step): string {
@@ -197,6 +202,8 @@ function stepSubtitle(step: Step): string {
       return `title ${step.titleFrom || "?"} · body ${step.bodyFrom || "?"}`;
     case "intervention":
       return step.message?.split("\n")[0] || "wait for user";
+    case "github_comment":
+      return `on ${step.target || "?"} · body ${step.bodyFrom || "?"}`;
   }
 }
 
@@ -262,7 +269,7 @@ export function FlowEditor() {
         position: { x: 0, y: 0 },
         style: { width: NODE_WIDTH },
         data: {
-          icon: draft.trigger.kind === "github_pull_request" ? "⇄" : "⚙",
+          icon: pullRequestInputOf(draft) ? "⇄" : "⚙",
           title: "Trigger, Inputs & Workspace",
           subtitle: settingsSubtitle(draft),
           errors: errorsByNode.get("inputs") ?? [],
@@ -313,7 +320,7 @@ export function FlowEditor() {
   const insertStep = (kind: StepKind, at: number) => {
     let n = 1;
     while (draft.steps.some((s) => s.id === `${kind}_${n}`)) n++;
-    const step = newStep(kind, `${kind}_${n}`, draft.steps.slice(0, at));
+    const step = newStep(kind, `${kind}_${n}`, draft.steps.slice(0, at), draft.inputs);
     setSteps([...draft.steps.slice(0, at), step, ...draft.steps.slice(at)]);
     setSelection(at);
     setInsertAt(null);
@@ -343,7 +350,6 @@ export function FlowEditor() {
   };
 
   const selectedIdx = typeof selection === "number" && selection < draft.steps.length ? selection : null;
-  const prFlow = draft.trigger.kind === "github_pull_request";
 
   return (
     <div className="editor">
@@ -386,14 +392,8 @@ export function FlowEditor() {
         <button
           type="button"
           className="btn"
-          disabled={isNew || dirty || prFlow}
-          title={
-            prFlow
-              ? "Pull request flows run on GitHub pull request events"
-              : isNew || dirty
-                ? "Save the flow before running it"
-                : undefined
-          }
+          disabled={isNew || dirty}
+          title={isNew || dirty ? "Save the flow before running it" : undefined}
           onClick={() => setRunning(true)}
         >
           Run…
@@ -503,6 +503,7 @@ const KIND_HELP: Record<StepKind, string> = {
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",
   intervention: "Pause and chat with the run's agent sessions, then continue",
+  github_comment: "Post a comment on an issue or pull request input",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
@@ -547,16 +548,20 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
           <span>
             {d.label || d.key} {d.required && <span className="muted">*</span>}
           </span>
-          {d.type === "github_issue" ? (
-            <input
-              type="url"
-              placeholder="https://github.com/owner/repo/issues/123"
+          {d.type === "text" ? (
+            <textarea
+              rows={3}
               value={values[d.key] ?? ""}
               onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
             />
           ) : (
-            <textarea
-              rows={3}
+            <input
+              type="url"
+              placeholder={
+                d.type === "github_pull_request"
+                  ? "https://github.com/owner/repo/pull/123"
+                  : "https://github.com/owner/repo/issues/123"
+              }
               value={values[d.key] ?? ""}
               onChange={(e) => setValues({ ...values, [d.key]: e.target.value })}
             />

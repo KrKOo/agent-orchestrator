@@ -7,8 +7,8 @@ import {
   type ModelEntry,
   MODEL_ROLE_LABELS,
   PR_EVENTS,
-  PR_INPUT_FIELDS,
   type PrEvent,
+  pullRequestInputOf,
 } from "@orch/protocol";
 import { useEffect, useState } from "react";
 import { PathPicker } from "./PathPicker";
@@ -28,31 +28,56 @@ const FORK_POLICY_LABEL: Record<GitHubPullRequestTrigger["forkPolicy"], string> 
 };
 
 /**
- * Switches the trigger kind. Pull request flows get the PR checkout workspace, no inputs (the PR arrives as
- * `inputs.pr`) and auto approval; returning to manual restores a local workspace.
+ * Replaces the flow's inputs and keeps the workspace consistent with them: a pull request input implies the PR
+ * checkout workspace, auto approval and no open network; without one, a PR checkout falls back to a local workspace.
+ */
+function withInputs(def: FlowDefinition, inputs: InputDef[]): FlowDefinition {
+  if (pullRequestInputOf({ inputs })) {
+    const network = def.sandbox.network;
+    return {
+      ...def,
+      inputs,
+      workspace: { kind: "github_checkout" },
+      approval: "auto",
+      sandbox: network.mode === "open" ? { ...def.sandbox, network: { ...network, mode: "gateway_only" } } : def.sandbox,
+    };
+  }
+  return { ...def, inputs, workspace: def.workspace.kind === "github_checkout" ? DEFAULT_LOCAL_WORKSPACE : def.workspace };
+}
+
+/** First of `pr`, `pr_2`, … not used as an input key. */
+function freePrKey(inputs: InputDef[]): string {
+  const keys = new Set(inputs.map((i) => i.key));
+  if (!keys.has("pr")) return "pr";
+  let n = 2;
+  while (keys.has(`pr_${n}`)) n++;
+  return `pr_${n}`;
+}
+
+/**
+ * Switches the trigger kind. The pull request trigger fills the flow's PR input, so one is added when missing and
+ * every other input becomes optional; returning to manual only changes the trigger.
  */
 function withTrigger(def: FlowDefinition, kind: FlowDefinition["trigger"]["kind"]): FlowDefinition {
   if (kind === def.trigger.kind) return def;
-  if (kind === "manual") {
-    return {
+  if (kind === "manual") return { ...def, trigger: { kind: "manual" } };
+  const others = def.inputs.map((i): InputDef => (i.type === "github_pull_request" ? i : { ...i, required: false }));
+  const inputs: InputDef[] = pullRequestInputOf(def)
+    ? others
+    : [...others, { key: freePrKey(def.inputs), label: "Pull request", type: "github_pull_request", required: true }];
+  return withInputs(
+    {
       ...def,
-      trigger: { kind: "manual" },
-      workspace: def.workspace.kind === "local_path" ? def.workspace : DEFAULT_LOCAL_WORKSPACE,
-    };
-  }
-  return {
-    ...def,
-    trigger: {
-      kind: "github_pull_request",
-      repos: [],
-      events: [...PR_EVENTS],
-      forkPolicy: "require_approval",
-      postReview: true,
+      trigger: {
+        kind: "github_pull_request",
+        repos: [],
+        events: [...PR_EVENTS],
+        forkPolicy: "require_approval",
+        postChecks: true,
+      },
     },
-    workspace: { kind: "github_checkout" },
-    inputs: [],
-    approval: "auto",
-  };
+    inputs,
+  );
 }
 
 /** Editor for flow-level settings: trigger, inputs, workspace, sandbox network, harness, approval, runner labels. */
@@ -71,9 +96,16 @@ export function InputsPanel({
   const ws = def.workspace;
   const net = def.sandbox.network;
   const trigger = def.trigger;
-  const prFlow = trigger.kind === "github_pull_request";
+  const prInput = pullRequestInputOf(def);
+  const setInputs = (inputs: InputDef[]) => onChange(withInputs(def, inputs));
   const setInput = (idx: number, patch: Partial<InputDef>) =>
-    onChange({ ...def, inputs: def.inputs.map((i, n) => (n === idx ? { ...i, ...patch } : i)) });
+    setInputs(
+      def.inputs.map((i, n) => {
+        if (n !== idx) return i;
+        const next = { ...i, ...patch };
+        return next.type === "github_pull_request" ? { ...next, required: true } : next;
+      }),
+    );
   const setLocal = (patch: Partial<LocalPathWorkspace>) =>
     onChange({ ...def, workspace: { ...(ws.kind === "local_path" ? ws : DEFAULT_LOCAL_WORKSPACE), ...patch } });
   const setPr = (patch: Partial<GitHubPullRequestTrigger>) => {
@@ -162,10 +194,10 @@ export function InputsPanel({
             <label className="check">
               <input
                 type="checkbox"
-                checked={trigger.postReview}
-                onChange={(e) => setPr({ postReview: e.target.checked })}
+                checked={trigger.postChecks !== false}
+                onChange={(e) => setPr({ postChecks: e.target.checked })}
               />
-              Post a review with inline comments for findings
+              Publish a check run on the pull request head
             </label>
           </>
         )}
@@ -173,32 +205,14 @@ export function InputsPanel({
 
       <section>
         <h4>Inputs</h4>
-        {prFlow ? (
-          <>
-            <p className="muted small">The pull request is supplied automatically. Template variables:</p>
-            <ul className="hint-list mono small">
-              {PR_INPUT_FIELDS.map((f) => (
-                <li key={f}>{`{{inputs.pr.${f}}}`}</li>
-              ))}
-            </ul>
-            <p className="muted small">
-              <span className="mono">title</span> and <span className="mono">body</span> arrive wrapped in{" "}
-              <span className="mono">&lt;untrusted_pr_text&gt;</span>; the diff is at{" "}
-              <span className="mono">inputs.pr.diffPath</span>.
-            </p>
-            {def.inputs.length > 0 && (
-              <button type="button" className="btn small danger" onClick={() => onChange({ ...def, inputs: [] })}>
-                Remove {def.inputs.length} declared {def.inputs.length === 1 ? "input" : "inputs"}
-              </button>
-            )}
-          </>
-        ) : (
-          <>
-            {def.inputs.length === 0 && (
-              <p className="muted small">No inputs. Reference inputs as {"{{inputs.<key>}}"}.</p>
-            )}
-            {def.inputs.map((input, idx) => (
-              <div key={idx} className="input-row">
+        {def.inputs.length === 0 && (
+          <p className="muted small">No inputs. Reference inputs as {"{{inputs.<key>}}"}.</p>
+        )}
+        {def.inputs.map((input, idx) => {
+          const isPr = input.type === "github_pull_request";
+          return (
+            <div key={idx}>
+              <div className="input-row">
                 <input
                   className="mono"
                   placeholder="key"
@@ -212,11 +226,15 @@ export function InputsPanel({
                 >
                   <option value="text">text</option>
                   <option value="github_issue">github_issue</option>
+                  <option value="github_pull_request" disabled={!!prInput && !isPr}>
+                    github_pull_request
+                  </option>
                 </select>
-                <label className="check" title="Required">
+                <label className="check" title={isPr ? "A pull request input is always required" : "Required"}>
                   <input
                     type="checkbox"
-                    checked={input.required}
+                    checked={isPr || input.required}
+                    disabled={isPr}
                     onChange={(e) => setInput(idx, { required: e.target.checked })}
                   />
                   req
@@ -225,53 +243,38 @@ export function InputsPanel({
                   type="button"
                   className="icon-btn"
                   aria-label="Remove input"
-                  onClick={() => onChange({ ...def, inputs: def.inputs.filter((_, n) => n !== idx) })}
+                  onClick={() => setInputs(def.inputs.filter((_, n) => n !== idx))}
                 >
                   ×
                 </button>
               </div>
-            ))}
-            <button
-              type="button"
-              className="btn small"
-              onClick={() =>
-                onChange({
-                  ...def,
-                  inputs: [
-                    ...def.inputs,
-                    { key: `input_${def.inputs.length + 1}`, label: "", type: "text", required: true },
-                  ],
-                })
-              }
-            >
-              + Add input
-            </button>
-          </>
-        )}
+              {isPr && (
+                <p className="muted small">
+                  <span className="mono">title</span> and <span className="mono">body</span> arrive wrapped in{" "}
+                  <span className="mono">&lt;untrusted_pr_text&gt;</span>; the diff is at{" "}
+                  <span className="mono">{`{{inputs.${input.key}.diffPath}}`}</span>.
+                </p>
+              )}
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          className="btn small"
+          onClick={() =>
+            setInputs([...def.inputs, { key: `input_${def.inputs.length + 1}`, label: "", type: "text", required: true }])
+          }
+        >
+          + Add input
+        </button>
       </section>
 
       <section>
         <h4>Workspace</h4>
-        <label className="field">
-          <span>Kind</span>
-          <select
-            aria-label="Workspace kind"
-            value={ws.kind}
-            onChange={(e) =>
-              onChange({
-                ...def,
-                workspace: e.target.value === "github_checkout" ? { kind: "github_checkout" } : DEFAULT_LOCAL_WORKSPACE,
-              })
-            }
-          >
-            <option value="local_path">local path on the runner</option>
-            <option value="github_checkout">pull request checkout (read-only)</option>
-          </select>
-        </label>
         {ws.kind === "github_checkout" ? (
           <p className="muted small">
-            The runner checks out the PR head on the host and mounts it read-only; the diff against the base is at{" "}
-            <span className="mono">/orch/context/pr.diff</span>.
+            The runner checks out the head of the pull request input on the host and mounts it read-only; the diff
+            against the base is at <span className="mono">/orch/context/pr.diff</span>.
           </p>
         ) : (
           <>
@@ -326,8 +329,8 @@ export function InputsPanel({
           <select value={net.mode} onChange={(e) => setNetwork({ mode: e.target.value as typeof net.mode })}>
             <option value="gateway_only">gateway only (model calls)</option>
             <option value="allowlist">allowlist</option>
-            <option value="open" disabled={prFlow}>
-              open (any http/https){prFlow ? " — not allowed for pull request flows" : ""}
+            <option value="open" disabled={!!prInput}>
+              open (any http/https){prInput ? " — not allowed with a pull request input" : ""}
             </option>
           </select>
         </label>
@@ -370,8 +373,8 @@ export function InputsPanel({
               onChange={(e) => onChange({ ...def, approval: e.target.value as FlowDefinition["approval"] })}
             >
               <option value="auto">auto (no prompts)</option>
-              <option value="ask" disabled={prFlow}>
-                ask (approve in run view){prFlow ? " — not allowed for pull request flows" : ""}
+              <option value="ask" disabled={!!prInput}>
+                ask (approve in run view){prInput ? " — not allowed with a pull request input" : ""}
               </option>
             </select>
           </label>

@@ -6,6 +6,8 @@ import {
   type AssignedRun,
   type CreatePullRequestParams,
   type CreatePullRequestResult,
+  type CreateCommentParams,
+  type CreateCommentResult,
   ElicitationAction,
   type GitHubTokenParams,
   type GitHubTokenResult,
@@ -523,7 +525,18 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     return outcome;
   };
 
-  const runActionStep = async (step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "intervention" }>, abort: AbortSignal): Promise<StepOutcome> => {
+  const runCommentStep = async (step: Extract<Step, { kind: "github_comment" }>, abort: AbortSignal): Promise<StepOutcome> => {
+    const body = ctx.steps[step.bodyFrom]?.output ?? "";
+    if (!body.trim()) throw new Error(`Comment body from step ${step.bodyFrom} is empty`);
+    const params: CreateCommentParams = { runId, stepId: step.id, body };
+    const comment = await rejectWhenAborted(deps.rpc<CreateCommentResult>("github.createComment", params), abort);
+    return { status: "succeeded", output: comment.url };
+  };
+
+  const runActionStep = async (
+    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "intervention" } | { kind: "github_comment" }>,
+    abort: AbortSignal,
+  ): Promise<StepOutcome> => {
     const ws = workspace!;
     if (step.kind === "git_commit") {
       const message = plainText(ctx.steps[step.messageFrom]?.output ?? "");
@@ -583,7 +596,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           ? await runSlashStep(step, abort.signal)
           : step.kind === "intervention"
             ? await runInterventionStep(step, previous, abort.signal)
-            : await runActionStep(step, abort.signal);
+            : step.kind === "github_comment"
+              ? await runCommentStep(step, abort.signal)
+              : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };

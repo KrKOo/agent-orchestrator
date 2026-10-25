@@ -1,8 +1,44 @@
-import type { CreatePullRequestResult, GitHubIssueInput } from "@orch/protocol";
+import type { CreateCommentResult, CreatePullRequestResult, GitHubIssueInput } from "@orch/protocol";
 import type { CheckAnnotation, CheckConclusion } from "./report";
-import type { ChangedFile } from "./review";
 
-export const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/;
+// A trailing path, query or fragment (`/files`, `#discussion_r1`) is allowed; anything else after the number is not.
+const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/?#]+)\/([^/?#]+)\/issues\/(\d+)(?:[/?#].*)?$/;
+const PR_URL_RE = /^https:\/\/github\.com\/([^/?#]+)\/([^/?#]+)\/pull\/(\d+)(?:[/?#].*)?$/;
+
+/** An issue or pull request parsed from its github.com URL. */
+export interface GitHubRef {
+  repo: string;
+  number: number;
+}
+
+function parseRef(re: RegExp, url: string): GitHubRef | null {
+  const m = re.exec(url.trim());
+  return m ? { repo: `${m[1]}/${m[2]}`, number: Number(m[3]) } : null;
+}
+
+export const parseIssueUrl = (url: string): GitHubRef | null => parseRef(ISSUE_URL_RE, url);
+export const parsePullUrl = (url: string): GitHubRef | null => parseRef(PR_URL_RE, url);
+
+/** Authors GitHub reports with these associations are treated like fork PRs. */
+const UNTRUSTED_ASSOCIATIONS = new Set(["FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE"]);
+
+/** Fork and first-time-contributor PRs are subject to the trigger's `forkPolicy`. */
+export function isUntrustedPullSource(headRepo: string | undefined, baseRepo: string, authorAssociation: string): boolean {
+  return headRepo !== baseRepo || UNTRUSTED_ASSOCIATIONS.has(authorAssociation);
+}
+
+/** PR metadata run creation needs; `baseSha`/`headSha` pin the checkout. */
+export interface PullRequestInfo {
+  url: string;
+  repo: string;
+  number: number;
+  title: string;
+  body: string;
+  baseSha: string;
+  headSha: string;
+  /** Fork or first-time-contributor PR (see `isUntrustedPullSource`). */
+  untrustedSource: boolean;
+}
 
 export class GitHubError extends Error {
   /** `status` is the GitHub HTTP status, or 0 for invalid input / network failures. */
@@ -46,11 +82,10 @@ export interface UpdateCheckRun {
   output?: CheckRunOutput;
 }
 
-export interface CreateReview {
-  commit_id: string;
-  event: "COMMENT";
-  body: string;
-  comments: { path: string; line: number; side: "RIGHT"; body: string }[];
+/** Entry of `GET /repos/{o}/{r}/pulls/{n}/files`; `patch` is absent for binary or huge diffs. */
+export interface ChangedFile {
+  filename: string;
+  patch?: string;
 }
 
 /** Upper bound on `GET /pulls/{n}/files` pages (GitHub lists at most 3000 files). */
@@ -97,17 +132,39 @@ export class GitHubApi {
     return (await res.json()) as T;
   }
 
-  /** Resolves an issue URL; `token` null fetches unauthenticated. */
-  async getIssue(url: string, token: string | null): Promise<GitHubIssueInput> {
-    const m = ISSUE_URL_RE.exec(url.trim());
-    if (!m) throw new GitHubError("Invalid GitHub issue URL", 0);
-    const [, owner, name, num] = m;
+  /** Resolves an issue; `token` null fetches unauthenticated. */
+  async getIssue(ref: GitHubRef, token: string | null): Promise<GitHubIssueInput> {
     const issue = await this.request<{ html_url: string; number: number; title: string; body: string | null }>(
       "GET",
-      `/repos/${owner}/${name}/issues/${num}`,
+      `/repos/${ref.repo}/issues/${ref.number}`,
       token,
     );
-    return { url: issue.html_url, repo: `${owner}/${name}`, number: issue.number, title: issue.title, body: issue.body ?? "" };
+    return { url: issue.html_url, repo: ref.repo, number: issue.number, title: issue.title, body: issue.body ?? "" };
+  }
+
+  /** Resolves a PR to the metadata run creation needs. Deleted fork heads (`head.repo === null`) are an error. */
+  async getPull(ref: GitHubRef, token: string | null): Promise<PullRequestInfo> {
+    const pr = await this.request<{
+      html_url: string;
+      number: number;
+      title: string;
+      body: string | null;
+      author_association: string;
+      head: { sha: string; repo: { full_name: string } | null };
+      base: { sha: string; repo: { full_name: string } };
+    }>("GET", `/repos/${ref.repo}/pulls/${ref.number}`, token);
+    if (pr.head.repo === null) throw new GitHubError(`Pull request ${ref.number} head repository was deleted`, 404);
+    return {
+      url: pr.html_url,
+      // Canonical casing from GitHub, not the URL's (scheduler keys the per-repo cap on this).
+      repo: pr.base.repo.full_name,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body ?? "",
+      baseSha: pr.base.sha,
+      headSha: pr.head.sha,
+      untrustedSource: isUntrustedPullSource(pr.head.repo.full_name, pr.base.repo.full_name, pr.author_association),
+    };
   }
 
   /** Opens a PR; a null `base` targets the repository's default branch. */
@@ -148,8 +205,10 @@ export class GitHubApi {
     return files;
   }
 
-  async createReview(token: string, repo: string, number: number, review: CreateReview): Promise<void> {
-    await this.request<unknown>("POST", `/repos/${repo}/pulls/${number}/reviews`, token, review);
+  /** Comments on an issue or pull request conversation (PRs share the issue comments API). */
+  async createIssueComment(token: string, repo: string, number: number, body: string): Promise<CreateCommentResult> {
+    const created = await this.request<{ html_url: string }>("POST", `/repos/${repo}/issues/${number}/comments`, token, { body });
+    return { url: created.html_url };
   }
 
   /** `GET /user` with a user access token. */

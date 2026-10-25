@@ -57,7 +57,7 @@ export function isEligible(run: SchedulableRun, r: RunnerState, now: number): bo
 }
 
 export interface SchedulerOptions {
-  /** Non-terminal GitHub-triggered runs assigned at once per repository. */
+  /** Non-terminal pull request runs (webhook or manual) assigned at once per repository. */
   maxConcurrentPerRepo: number;
 }
 
@@ -169,12 +169,12 @@ export class Scheduler {
     for (const r of db
       .select({ github: runs.github })
       .from(runs)
-      .where(and(eq(runs.triggerKind, "github"), inArray(runs.status, [...ACTIVE_STATUSES])))
+      .where(and(isNotNull(runs.github), inArray(runs.status, [...ACTIVE_STATUSES])))
       .all()) {
       if (r.github) perRepo.set(r.github.repo, (perRepo.get(r.github.repo) ?? 0) + 1);
     }
     for (const run of queued) {
-      const repo = run.triggerKind === "github" ? run.github?.repo : undefined;
+      const repo = run.github?.repo;
       if (repo !== undefined && (perRepo.get(repo) ?? 0) >= this.opts.maxConcurrentPerRepo) continue;
       const target = states
         .filter((r) => (run.resumeRunnerId === null || r.id === run.resumeRunnerId) && isEligible(run, r, now))

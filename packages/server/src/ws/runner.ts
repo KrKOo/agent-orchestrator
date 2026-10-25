@@ -10,11 +10,15 @@ import { upgradeWebSocket } from "hono/bun";
 import { createHash } from "node:crypto";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
+import { neutralizeMentions } from "../github/sanitize";
 import type { RunnerLink } from "../hub";
 import { isTerminal } from "../runs";
 import { ACTIVE_STATUSES } from "../scheduler";
 
 const { runners, runs, runEvents } = schema;
+
+/** GitHub caps comment bodies at 65 536 chars; stay well below. */
+const MAX_COMMENT_CHARS = 60_000;
 
 export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
@@ -32,6 +36,7 @@ export function authenticateRunner(deps: Pick<AppDeps, "db">, authorization: str
  * Answers a runner-initiated RPC; only the runner holding the (non-terminal) run may call.
  * - `github.token` `read`: owner runs, or untrusted runs for their own PR repository.
  * - `github.token` `write` and `github.createPullRequest`: owner runs only.
+ * - `github.createComment`: a `github_comment` step of the run; the target issue/PR comes from the run's stored inputs.
  * Everything else gets `forbidden`.
  */
 export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: RunnerRpcCall): Promise<RpcResult> {
@@ -40,11 +45,11 @@ export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: Run
   const run = deps.runs.get(call.params.runId);
   if (!run || run.runnerId !== runnerId || isTerminal(run.status)) return forbidden;
   const gh = run.github;
-  const ownRepo = gh !== null && call.params.repo.toLowerCase() === gh.repo.toLowerCase();
   try {
     switch (call.method) {
       case "github.token": {
         const { repo, access } = call.params;
+        const ownRepo = gh !== null && repo.toLowerCase() === gh.repo.toLowerCase();
         const allowed = run.trust === "owner" || (access === "read" && ownRepo);
         if (!allowed) return forbidden;
         const token = await deps.credentials.tokenFor(repo, access, ownRepo ? gh?.installationId : undefined);
@@ -55,6 +60,20 @@ export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: Run
         const { repo, head, base, title, body, draft } = call.params;
         const token = await deps.credentials.tokenFor(repo, "write");
         const result = await deps.github.createPullRequest(token, { repo, head, base, title, body, draft });
+        return { t: "rpc.result", rpcId, ok: true, result };
+      }
+      case "github.createComment": {
+        const step = run.definition.steps.find((s) => s.id === call.params.stepId);
+        if (step?.kind !== "github_comment") return forbidden;
+        const def = run.definition.inputs.find((i) => i.key === step.target);
+        const target = run.inputs[step.target] as { repo: string; number: number } | null | undefined;
+        if (!def || !target) throw new Error(`Input "${step.target}" has no issue or pull request`);
+        const ownRepo = gh !== null && target.repo.toLowerCase() === gh.repo.toLowerCase();
+        // PR conversations take pull_requests write (the reporting token); issues need issues write.
+        const access = def.type === "github_pull_request" ? "report" : "comment";
+        const token = await deps.credentials.tokenFor(target.repo, access, ownRepo ? gh?.installationId : undefined);
+        const body = neutralizeMentions(call.params.body.trim(), MAX_COMMENT_CHARS);
+        const result = await deps.github.createIssueComment(token, target.repo, target.number, body);
         return { t: "rpc.result", rpcId, ok: true, result };
       }
     }

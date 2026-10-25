@@ -6,6 +6,7 @@ import {
   checkConclusion,
   checkSummary,
   checkTitle,
+  formatFindingList,
   MAX_SUMMARY_CHARS,
 } from "../src/github/report";
 
@@ -141,5 +142,21 @@ describe("buildAnnotations", () => {
   test("truncates neutralized messages to 2000 chars", () => {
     const { annotations } = buildAnnotations([{ ...err, message: "@".repeat(2000) }], new Set(["a.py"]));
     expect(annotations[0]!.message.length).toBeLessThanOrEqual(2000);
+  });
+});
+
+describe("formatFindingList", () => {
+  const finding = (line: number, message: string): Finding => ({ file: "a.py", line, severity: "error", message });
+
+  test("collapses overflow into an 'and N more' line within the budget", () => {
+    const findings = Array.from({ length: 100 }, (_, i) => finding(i + 1, "x".repeat(50)));
+    const list = formatFindingList(findings, 500);
+    expect(list.length).toBeLessThanOrEqual(500);
+    const lines = list.split("\n");
+    expect(lines.at(-1)).toBe(`- … and ${100 - (lines.length - 1)} more`);
+  });
+
+  test("flattens multi-line messages and neutralizes mentions", () => {
+    expect(formatFindingList([finding(1, "one\n\ntwo @x")], 1000)).toBe("- `a.py:1` error: one two @\u200bx");
   });
 });
