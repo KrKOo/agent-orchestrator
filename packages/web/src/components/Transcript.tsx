@@ -1,6 +1,6 @@
-import Markdown from "react-markdown";
 import type { StepView } from "../runState";
 import { Collapsible } from "../ui";
+import { LongText } from "./LongText";
 import { SubagentPanel } from "./SubagentPanel";
 import { ToolCallCard } from "./ToolCallCard";
 
@@ -13,11 +13,7 @@ export function Transcript({ step }: { step: StepView }) {
       {step.items.map((item, i) => {
         switch (item.kind) {
           case "assistant":
-            return (
-              <div key={i} className="msg-assistant markdown">
-                <Markdown>{item.text}</Markdown>
-              </div>
-            );
+            return <LongText key={i} className="msg-assistant" text={item.text} markdown />;
           case "thought":
             return (
               <Collapsible key={i} className="thought" summary={<span className="muted">Thinking</span>}>
@@ -77,13 +73,7 @@ export function StepResult({ step, stepId, markdown }: { step: StepView; stepId:
             <strong>Output</strong>
             <code className="small">{`{{steps.${stepId}.output}}`}</code>
           </div>
-          {markdown ? (
-            <div className="markdown output-card-body">
-              <Markdown>{step.output}</Markdown>
-            </div>
-          ) : (
-            <pre className="output-card-body mono">{step.output}</pre>
-          )}
+          <LongText className={markdown ? "output-card-body" : "output-card-body mono"} text={step.output!} markdown={markdown} />
         </section>
       )}
       {step.structured !== undefined && (

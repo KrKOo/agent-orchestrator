@@ -95,6 +95,7 @@ async function main(): Promise<void> {
     mcp,
     sandboxes: new DockerSandboxProvider(config),
     emit: (draft) => outbox.append(draft),
+    seedOutbox: (runId, seqFrom) => outbox.seed(runId, seqFrom),
     send,
     rpc: <T>(method: "github.token" | "github.createPullRequest", params: unknown) => {
       if (!conn) return Promise.reject(new Error("Not connected"));
@@ -131,7 +132,9 @@ async function main(): Promise<void> {
     switch (msg.t) {
       case "welcome":
         for (const [runId, seq] of Object.entries(msg.lastAckedSeq)) outbox.ack(runId, seq);
+        // replayAll sends synchronously, so `replayed` follows every replayed frame on the socket.
         outbox.replayAll();
+        send({ t: "replayed" });
         return;
       case "job.assign":
         jobs.assign(msg.run);

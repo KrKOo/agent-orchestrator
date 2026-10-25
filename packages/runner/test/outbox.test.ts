@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RunEvent, RunEventDraft, RunnerMessage } from "@orch/protocol";
-import { MAX_BATCH, Outbox } from "../src/outbox";
+import { MAX_BATCH, MAX_BATCH_BYTES, MAX_EVENT_BYTES, Outbox, TRUNCATED_MARK } from "../src/outbox";
 
 type JobEvents = Extract<RunnerMessage, { t: "job.events" }>;
 
@@ -70,6 +70,49 @@ describe("Outbox", () => {
     expect(outbox.pending("r1", 0)).toEqual([]);
     outbox.append(log("c"));
     expect(outbox.pending("r1", 0).map((e) => e.seq)).toEqual([3]);
+  });
+
+  test("seed continues seq across a fresh Outbox db", () => {
+    // Attempt 1 on this runner emitted seqs 1..3 and all were acked (rows gone).
+    for (const t of ["a", "b", "c"]) outbox.append(log(t));
+    outbox.flush();
+    outbox.ack("r1", 3);
+    outbox.close();
+    sent = [];
+    // Attempt 2, possibly after a runner restart: the server says the transcript is at seq 3, so the
+    // first new event must be seq 5 (the retry's own run.status is seq 4, sent by the server).
+    outbox = new Outbox(join(dir, "outbox.sqlite"), (m) => sent.push(m));
+    outbox.seed("r1", 5);
+    outbox.append(log("resumed"));
+    outbox.flush();
+    expect(sentEvents().map((e) => e.seq)).toEqual([5]);
+    // Seeding lower never rewinds the counter.
+    outbox.seed("r1", 2);
+    outbox.append(log("later"));
+    outbox.flush();
+    expect(sentEvents().map((e) => e.seq)).toEqual([5, 6]);
+  });
+
+  test("seed drops an earlier attempt's pending rows so they never replay", () => {
+    // Attempt 1 emitted 1..4; only 1..2 were acked, 3 was sent, 4 is still unsent.
+    for (const t of ["a", "b", "c"]) outbox.append(log(t));
+    outbox.flush();
+    outbox.ack("r1", 2);
+    outbox.append(log("late"));
+    outbox.append({ ...log("other"), runId: "r2" });
+    sent = [];
+    // The server stored up to 2; the retry continues at 3, but the counter is never lowered.
+    outbox.seed("r1", 3);
+    expect(outbox.pending("r1", 0)).toEqual([]);
+    outbox.flush();
+    expect(sentEvents().map((e) => [e.runId, e.seq])).toEqual([["r2", 1]]);
+    sent = [];
+    outbox.append(log("retry"));
+    outbox.replayAll();
+    expect(sentEvents().map((e) => [e.runId, e.seq])).toEqual([
+      ["r1", 5],
+      ["r2", 1],
+    ]);
   });
 
   test("replay after simulated reconnect resends only unacked events, seq contiguous", () => {
@@ -200,6 +243,45 @@ describe("Outbox", () => {
     const batches = sent.filter((m): m is JobEvents => m.t === "job.events");
     expect(batches.map((b) => b.events.length)).toEqual([MAX_BATCH, MAX_BATCH, 5]);
     expect(sentEvents().map((e) => e.seq)).toEqual(Array.from({ length: MAX_BATCH * 2 + 5 }, (_, i) => i + 1));
+  });
+
+  test("splits batches by serialized size so no job.events frame exceeds MAX_BATCH_BYTES", () => {
+    const big = "x".repeat(MAX_EVENT_BYTES / 2);
+    const n = Math.ceil((MAX_BATCH_BYTES * 2) / big.length);
+    for (let i = 0; i < n; i++) outbox.append(log(big));
+    outbox.flush();
+    const batches = sent.filter((m): m is JobEvents => m.t === "job.events");
+    expect(batches.length).toBeGreaterThan(2);
+    for (const b of batches) expect(Buffer.byteLength(JSON.stringify(b))).toBeLessThanOrEqual(MAX_BATCH_BYTES);
+    expect(sentEvents().map((e) => e.seq)).toEqual(Array.from({ length: n }, (_, i) => i + 1));
+  });
+
+  test("an oversized event is stored and sent cut to MAX_EVENT_BYTES, keeping its shape", () => {
+    const output = `{"a":"${"q".repeat(MAX_EVENT_BYTES * 5)}"}\n`;
+    outbox.append({ runId: "r1", ts: 1, stepId: "plan", type: "step.finished", payload: { status: "succeeded", output } });
+    outbox.flush();
+    const [ev] = sentEvents();
+    expect(Buffer.byteLength(JSON.stringify(ev))).toBeLessThanOrEqual(MAX_EVENT_BYTES);
+    expect(ev).toMatchObject({ seq: 1, stepId: "plan", type: "step.finished", payload: { status: "succeeded" } });
+    const cut = ev!.type === "step.finished" ? ev.payload.output! : "";
+    expect(cut.endsWith(TRUNCATED_MARK)).toBe(true);
+    expect(output.startsWith(cut.slice(0, -TRUNCATED_MARK.length))).toBe(true);
+    // The largest cut that fits: well over half the cap survives despite JSON escaping.
+    expect(cut.length).toBeGreaterThan(MAX_EVENT_BYTES / 4);
+  });
+
+  test("stops coalescing text chunks before the merged event outgrows MAX_EVENT_BYTES", () => {
+    const part = "y".repeat(MAX_EVENT_BYTES / 3);
+    for (let i = 0; i < 4; i++) outbox.append(chunk(part));
+    outbox.flush();
+    const events = sentEvents();
+    expect(events.length).toBeGreaterThan(1);
+    for (const e of events) expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_EVENT_BYTES);
+    const texts = events.map((e) => {
+      const content = textOf(e);
+      return content && typeof content === "object" && "text" in content ? String(content.text) : "";
+    });
+    expect(texts.join("")).toBe(part.repeat(4));
   });
 
   test("start() flushes on its own timer", async () => {

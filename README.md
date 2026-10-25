@@ -51,6 +51,19 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
   while a reply is generated. Without a timeout the run waits until answered or cancelled. Not available in
   PR-triggered flows.
+- **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
+  (header button) re-runs the first step that did not succeed (the last step if all did) and continues to the end;
+  **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
+  from bad upstream output without rerunning what worked. Retrying from a later step of a local-path flow runs on
+  the runner that ran the previous attempt and adopts its worktree as left; if that runner stays offline, the run
+  fails with `resume_runner_lost` (retry from step 1 instead). Retrying from step 1 resets the worktree to the base
+  ref; PR-checkout runs always start from a fresh checkout of the PR head. Outputs of skipped steps come back as
+  `{{steps.…}}`, and the event transcript continues in one view with continuous sequence numbers even across runner
+  restarts. Agent steps resume in a fresh session (ACP has no conversation resume); the sandbox is recreated per
+  attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over. A retried intervention lists the run's sessions
+  again: slash sessions continue their earlier conversation, the agent session is a new one that starts from its
+  last result.
+  PR-triggered runs get a fresh check run for the new attempt (a recurring finding may post a duplicate review).
 
 ## Public control plane (M2)
 

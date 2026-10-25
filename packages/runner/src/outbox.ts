@@ -5,6 +5,13 @@ import type { RunEvent, RunEventDraft, RunnerMessage } from "@orch/protocol";
 
 export const FLUSH_INTERVAL_MS = 50;
 export const MAX_BATCH = 200;
+/** Serialized size cap of one `job.events` batch; Bun's server WebSocket rejects frames over 16 MiB. */
+export const MAX_BATCH_BYTES = 4 * 1024 * 1024;
+/** Serialized size cap of one event; strings inside a larger event are cut until it fits. */
+export const MAX_EVENT_BYTES = 1024 * 1024;
+export const TRUNCATED_MARK = "\n… (truncated)";
+/** Strings up to this length are never cut (ids, type literals, statuses). */
+const MIN_STRING_CAP = 1024;
 
 const COALESCIBLE = ["agent_message_chunk", "agent_thought_chunk"];
 
@@ -29,6 +36,46 @@ function textChunk(event: RunEvent | RunEventDraft): TextChunk | null {
   if (!content || typeof content !== "object" || !("type" in content) || content.type !== "text") return null;
   if (!("text" in content) || typeof content.text !== "string") return null;
   return { sessionUpdate: update.sessionUpdate, messageId: update.messageId ?? null, text: content.text };
+}
+
+/** `value` with every string longer than `max` chars cut to `max` plus {@link TRUNCATED_MARK}. */
+function capStrings(value: unknown, max: number): unknown {
+  if (typeof value === "string") {
+    if (value.length <= max) return value;
+    const code = value.charCodeAt(max - 1);
+    // Never split a surrogate pair.
+    return value.slice(0, code >= 0xd800 && code <= 0xdbff ? max - 1 : max) + TRUNCATED_MARK;
+  }
+  if (Array.isArray(value)) return value.map((v) => capStrings(v, max));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, capStrings(v, max)]));
+  }
+  return value;
+}
+
+function longestString(value: unknown): number {
+  if (typeof value === "string") return value.length;
+  if (value === null || typeof value !== "object") return 0;
+  let max = 0;
+  for (const v of Object.values(value)) max = Math.max(max, longestString(v));
+  return max;
+}
+
+/**
+ * JSON of `event` within {@link MAX_EVENT_BYTES}: an oversized event keeps its shape, with its long
+ * strings cut to the largest common length that fits, so no event can exceed a WebSocket frame.
+ */
+function serialize(event: RunEvent): string {
+  const json = JSON.stringify(event);
+  if (Buffer.byteLength(json) <= MAX_EVENT_BYTES) return json;
+  let lo = MIN_STRING_CAP;
+  let hi = longestString(event);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (Buffer.byteLength(JSON.stringify(capStrings(event, mid))) <= MAX_EVENT_BYTES) lo = mid;
+    else hi = mid - 1;
+  }
+  return JSON.stringify(capStrings(event, lo));
 }
 
 /**
@@ -61,6 +108,24 @@ export class Outbox {
     }
   }
 
+  /**
+   * Starts a new attempt of `runId` (the server sends `seqFrom` on resume): drops the run's pending
+   * rows from an earlier attempt, which the server no longer wants, and raises the seq counter so the
+   * next append is `max(counter + 1, seqFrom)`. Never lowers the counter.
+   */
+  seed(runId: string, seqFrom: number): void {
+    this.db.transaction(() => {
+      this.db.run("DELETE FROM events WHERE run_id = ?", [runId]);
+      this.db.run(
+        "INSERT INTO run_seq (run_id, last_seq) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET last_seq = max(last_seq, excluded.last_seq)",
+        [runId, seqFrom - 1],
+      );
+    })();
+    this.sentUpTo.delete(runId);
+    this.tails.delete(runId);
+    this.dirty.delete(runId);
+  }
+
   append(draft: RunEventDraft): void {
     const runId = draft.runId;
     const incoming = { ...draft, ts: draft.ts ?? Date.now() };
@@ -75,11 +140,16 @@ export class Outbox {
         prev.messageId === chunk.messageId &&
         tail.event.stepId === draft.stepId
       ) {
-        tail.text += chunk.text;
-        const merged = this.withText(tail.event, tail.text);
-        tail.event = merged;
-        this.db.run("UPDATE events SET json = ? WHERE run_id = ? AND seq = ?", [JSON.stringify(merged), runId, tail.seq]);
-        return;
+        const text = tail.text + chunk.text;
+        const merged = this.withText(tail.event, text);
+        const json = JSON.stringify(merged);
+        // A merge that would outgrow the event cap starts a new event instead.
+        if (Buffer.byteLength(json) <= MAX_EVENT_BYTES) {
+          tail.text = text;
+          tail.event = merged;
+          this.db.run("UPDATE events SET json = ? WHERE run_id = ? AND seq = ?", [json, runId, tail.seq]);
+          return;
+        }
       }
     }
 
@@ -94,7 +164,7 @@ export class Outbox {
         "INSERT INTO run_seq (run_id, last_seq) VALUES (?, ?) ON CONFLICT(run_id) DO UPDATE SET last_seq = excluded.last_seq",
         [runId, seq],
       );
-      this.db.run("INSERT INTO events (run_id, seq, json) VALUES (?, ?, ?)", [runId, seq, JSON.stringify(ev)]);
+      this.db.run("INSERT INTO events (run_id, seq, json) VALUES (?, ?, ?)", [runId, seq, serialize(ev)]);
       return ev;
     })();
 
@@ -111,10 +181,13 @@ export class Outbox {
   }
 
   pending(runId: string, afterSeq: number): RunEvent[] {
+    return this.rows(runId, afterSeq).map((r) => JSON.parse(r.json) as RunEvent);
+  }
+
+  private rows(runId: string, afterSeq: number): Array<{ json: string }> {
     return this.db
       .query<{ json: string }, [string, number]>("SELECT json FROM events WHERE run_id = ? AND seq > ? ORDER BY seq")
-      .all(runId, afterSeq)
-      .map((r) => JSON.parse(r.json) as RunEvent);
+      .all(runId, afterSeq);
   }
 
   ack(runId: string, seq: number): void {
@@ -133,19 +206,28 @@ export class Outbox {
     this.flush();
   }
 
-  /** Sends unsent pending events as `job.events` batches of at most MAX_BATCH. */
+  /** Sends unsent pending events as `job.events` batches of at most MAX_BATCH events and MAX_BATCH_BYTES. */
   flush(): void {
     // Anything flushed is on the wire: it can no longer absorb chunks.
     this.tails.clear();
     const runs = [...this.dirty];
     this.dirty.clear();
     for (const runId of runs) {
-      const events = this.pending(runId, this.sentUpTo.get(runId) ?? 0);
-      for (let i = 0; i < events.length; i += MAX_BATCH) {
-        const batch = events.slice(i, i + MAX_BATCH);
+      let batch: RunEvent[] = [];
+      let bytes = 0;
+      const sendBatch = () => {
         this.send({ t: "job.events", runId, events: batch });
         this.sentUpTo.set(runId, batch[batch.length - 1].seq);
+        batch = [];
+        bytes = 0;
+      };
+      for (const { json } of this.rows(runId, this.sentUpTo.get(runId) ?? 0)) {
+        const size = Buffer.byteLength(json);
+        if (batch.length > 0 && (batch.length >= MAX_BATCH || bytes + size > MAX_BATCH_BYTES)) sendBatch();
+        batch.push(JSON.parse(json) as RunEvent);
+        bytes += size;
       }
+      if (batch.length > 0) sendBatch();
     }
   }
 

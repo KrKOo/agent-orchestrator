@@ -155,6 +155,7 @@ describe("RunnerSession", () => {
   test("job.finished makes the run terminal and frees capacity for queued runs", async () => {
     const { deps, link, session } = setup();
     await session.handle(JSON.stringify({ ...hello, capabilities: caps({ maxConcurrentJobs: 1 }) }));
+    await session.handle(JSON.stringify({ t: "replayed" }));
     const first = addRun(deps, { status: "running", runnerId: "r1", createdAt: 1 });
     const second = addRun(deps, { createdAt: 2 });
     deps.scheduler.kick();
@@ -180,6 +181,28 @@ describe("RunnerSession", () => {
     await session.handle(JSON.stringify({ t: "job.rejected", runId, reason: "Unknown harness: x" }));
     expect(deps.runs.get(runId)).toMatchObject({ status: "failed", error: "Unknown harness: x" });
     expect(seen).toMatchObject([{ seq: 1, type: "run.status", payload: { status: "failed", error: "Unknown harness: x" } }]);
+  });
+
+  test("no job.assign before replayed; replayed rows of a run since retried are acked but not stored", async () => {
+    const { deps, link, session } = setup();
+    const runId = addRun(deps, { status: "failed", runnerId: "r1" });
+    deps.runs.retry(runId, 0); // queued again at seq 1, held by nobody
+
+    await session.handle(JSON.stringify(hello));
+    deps.scheduler.kick();
+    expect(link.of("job.assign")).toEqual([]);
+
+    // The previous attempt's outbox rows replay against the queued run: acked so they drain, never ingested.
+    await session.handle(JSON.stringify({ t: "job.events", runId, events: [ev(runId, 2, "step.started", {}, "impl")] }));
+    expect(link.of("job.ack")).toEqual([{ t: "job.ack", runId, seq: 2 }]);
+    expect(eventsAfter(deps, runId, 0).map((e) => e.seq)).toEqual([1]);
+
+    await session.handle(JSON.stringify({ t: "replayed" }));
+    expect(link.of("job.assign").map((m) => m.run)).toMatchObject([{ runId, seqFrom: 2 }]);
+
+    // A new hello on the same connection closes the gate again until the next replay.
+    await session.handle(JSON.stringify(hello));
+    expect(deps.hub.isReplayed("r1")).toBe(false);
   });
 
   test("rpc.result resolves a pending server RPC only for the runner it was sent to", async () => {
@@ -227,6 +250,7 @@ describe("server restart", () => {
         JSON.stringify({ t: "job.events", runId: running, events: [ev(running, 2, "step.started", {}, "impl"), ev(running, 3, "sandbox.log", { stream: "stdout", text: "x" })] }),
       );
       expect(eventsAfter(after, running, 0).map((e) => e.seq)).toEqual([1, 2, 3]);
+      await session.handle(JSON.stringify({ t: "replayed" }));
       expect(link.of("job.assign")).toEqual([]); // nothing is re-assigned
       after.db.$client.close();
     } finally {

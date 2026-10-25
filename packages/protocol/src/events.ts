@@ -6,6 +6,8 @@ export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running
 export const RunStatus = z.enum(RUN_STATUSES);
 export type RunStatus = z.infer<typeof RunStatus>;
 export const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "cancelled"];
+/** Terminal statuses a run can be retried from (same run, from a step cursor). */
+export const RETRYABLE_STATUSES: readonly RunStatus[] = ["failed", "cancelled"];
 
 export const StepStatus = z.enum(["pending", "running", "succeeded", "failed", "cancelled"]);
 export type StepStatus = z.infer<typeof StepStatus>;
@@ -60,6 +62,8 @@ export const RunEvent = z.discriminatedUnion("type", [
       error: z.string().optional(),
       /** Set on `running`: host workspace (worktree or direct path), orchestrator branch, and GitHub origin repo if any. */
       workspace: z.object({ path: z.string(), branch: z.string().optional(), repo: z.string().optional() }).optional(),
+      /** Set on the server's retry `queued` event: steps from this one on were reset to pending. */
+      resumeFromStepId: z.string().optional(),
     }),
   }),
   z.object({ ...base, type: z.literal("step.started"), payload: z.object({}) }),

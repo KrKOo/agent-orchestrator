@@ -82,11 +82,12 @@ export class FakeLink {
   }
 }
 
-/** Runner online in the hub with stored capabilities. */
+/** Runner online in the hub (outbox replayed, so assignable) with stored capabilities. */
 export function connectRunner(deps: AppDeps, id: string, capabilities: RunnerCapabilities, over: Partial<typeof schema.runners.$inferInsert> = {}): FakeLink {
   addRunner(deps, id, { capabilities, ...over });
   const link = new FakeLink();
   deps.hub.attachRunner(id, link);
+  deps.hub.setReplayed(link, true);
   return link;
 }
 

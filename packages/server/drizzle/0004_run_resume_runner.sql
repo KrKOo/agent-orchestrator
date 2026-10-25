@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `resume_runner_id` text;

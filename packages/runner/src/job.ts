@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
@@ -43,6 +43,8 @@ export interface JobDeps {
   mcp: McpOutputServer;
   /** DockerSandboxProvider in prod, FakeSandbox in tests. */
   sandboxes: SandboxProvider;
+  /** Outbox for seq continuation on resume (`seed`); emits go through `emit`. */
+  seedOutbox(runId: string, seqFrom: number): void;
   /** → outbox.append */
   emit(draft: RunEventDraft): void;
   /** job.accepted / job.rejected / job.finished */
@@ -80,6 +82,19 @@ interface ChatSession {
   /** Cap for one chat turn: the timeout of the step that last used the session. */
   timeoutSec: number;
   resume?: string;
+}
+
+/** Per succeeded step: the chat sessions as they were right after it (in the run dir, so it outlives attempts). */
+const CHAT_SESSIONS_FILE = "chat-sessions.json";
+type ChatSnapshots = Record<string, Record<string, ChatSession>>;
+
+async function readChatSnapshots(runDir: string): Promise<ChatSnapshots> {
+  try {
+    return JSON.parse(await readFile(join(runDir, CHAT_SESSIONS_FILE), "utf8")) as ChatSnapshots;
+  } catch {
+    // First attempt here (e.g. a PR checkout retried on another runner): no sessions to restore.
+    return {};
+  }
 }
 
 type Answer = { optionId: string | null } | { action: ElicitationAction; content?: Record<string, unknown> } | InterventionAnswer;
@@ -212,7 +227,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   const adapter = harnesses[def.harness.id]!;
   const runDir = join(deps.config.dataDir, "runs", runId);
+  // Resume: prior succeeded outputs repopulate the template context; the loop starts at the cursor.
+  const resume = run.resume;
+  const fromStepIdx = resume?.fromStepIdx ?? 0;
   const ctx: TemplateContext = { inputs: run.inputs, steps: {} };
+  for (const prior of resume?.prior ?? []) {
+    ctx.steps[prior.stepId] = { output: prior.output, ...(prior.structured !== undefined ? { structured: prior.structured } : {}) };
+  }
   let status: StepOutcome["status"] = "succeeded";
   let error: string | undefined;
   let workspace: PreparedWorkspace | null = null;
@@ -225,10 +246,27 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /** Agent step accepting MCP output, with its structured result. */
   let activeStep: { id: string; structured?: unknown } | null = null;
   let stepAbort: AbortController | null = null;
+  /** Whether the current ACP session has been prompted; its first prompt carries the untrusted preamble.
+   * A resumed run starts a fresh ACP session (ACP has no conversation resume), so this starts false. */
   let sessionPrompted = false;
-  let pushed = false;
+  // `github_pr` requires an earlier `git_push`; on resume a skipped succeeded push counts.
+  let pushed = resume?.prior.some((p) => def.steps.find((step) => step.id === p.stepId)?.kind === "git_push") ?? false;
   /** Sessions an intervention can chat with: `agent` (the ACP session) and `slash:<stepId>` (resumable `omp -p` runs). */
   const sessions = new Map<string, ChatSession>();
+  // Chat sessions as of the cursor (the snapshot after the step before it), for interventions past it.
+  // Slash sessions resume their omp session, whose file is in the run dir; the ACP agent session is new
+  // and keeps only its last result.
+  const chatSnapshots: ChatSnapshots = fromStepIdx > 0 ? await readChatSnapshots(runDir) : {};
+  const lastAgentStep = def.steps.slice(0, fromStepIdx).findLast(isAgentStep);
+  const restartedAgent = `Agent session (new after retry; last step: ${lastAgentStep?.name ?? "?"})`;
+  for (const [id, chat] of Object.entries(chatSnapshots[def.steps[fromStepIdx - 1]?.id ?? ""] ?? {})) {
+    sessions.set(id, { ...chat, ...(id === AGENT_SESSION ? { label: restartedAgent } : {}) });
+  }
+  // No snapshot (attempt 1 predates them, or ran on another runner): the agent step's output still seeds it.
+  if (lastAgentStep && !sessions.has(AGENT_SESSION)) {
+    const output = resume?.prior.find((p) => p.stepId === lastAgentStep.id)?.output ?? "";
+    sessions.set(AGENT_SESSION, { label: restartedAgent, output, timeoutSec: lastAgentStep.timeoutSec });
+  }
 
   const onCancel = () => {
     stepAbort?.abort();
@@ -409,7 +447,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       }, chat.timeoutSec * 1000);
       let outcome: StepOutcome & { sessionId?: string };
       try {
-        outcome = id === AGENT_SESSION ? await agentTurn(text, step.id, step.id, turnAbort.signal) : await slashRun(text, step.id, turnAbort.signal, chat.resume);
+        if (id === AGENT_SESSION) {
+          // On a retried run this can be the fresh ACP session's first prompt.
+          const agentText = run.trust === "untrusted" && !sessionPrompted ? `${UNTRUSTED_PREAMBLE}\n\n${text}` : text;
+          sessionPrompted = true;
+          outcome = await agentTurn(agentText, step.id, step.id, turnAbort.signal);
+        } else {
+          outcome = await slashRun(text, step.id, turnAbort.signal, chat.resume);
+        }
       } catch (err) {
         outcome = { status: "failed", error: errorText(err) };
       } finally {
@@ -436,27 +481,29 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
     void proc.stdin.close();
     const translator = new OmpJsonTranslator();
+    // stdout is NDJSON for the translator, never output itself; only stderr is kept (for errors).
     const drain = async (stream: ReadableStream<Uint8Array>, stream2: "stdout" | "stderr"): Promise<string> => {
       const decoder = new TextDecoder();
       let text = "";
       for await (const chunk of stream) {
         const part = decoder.decode(chunk, { stream: true });
-        text += part;
         if (stream2 === "stdout") {
           // Translate before emitting so text deltas and tool cards stream like agent steps do.
           for (const update of translator.push(part)) emit({ type: "acp.update", payload: { update } }, eventStepId);
+        } else {
+          text += part;
         }
         emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, eventStepId);
       }
       return text;
     };
     try {
-      const [stdout, stderr, exitCode] = await rejectWhenAborted(
+      const [, stderr, exitCode] = await rejectWhenAborted(
         Promise.all([drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"), proc.exited]),
         abort,
       );
       for (const update of translator.end()) emit({ type: "acp.update", payload: { update } }, eventStepId);
-      const output = translator.result() ?? stdout;
+      const output = translator.result();
       const sessionId = translator.sessionId();
       if (abort.aborted) return { status: "cancelled", output };
       if (exitCode !== 0) return { status: "failed", output, error: `omp -p exited with code ${exitCode}: ${stderr.trim().slice(-500)}` };
@@ -601,7 +648,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       });
       checkCancelled();
 
-      tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId));
+      tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId), { fromEnd: resume !== undefined });
       tail.start();
       const mcp = deps.mcp.registerRun(runId, sink);
       mcpRegistered = true;
@@ -619,6 +666,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       }
 
       for (const [i, step] of def.steps.entries()) {
+        if (i < fromStepIdx) continue;
         if (signal.aborted) {
           status = "cancelled";
           break;
@@ -628,6 +676,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         const outcome = await runStep(step, def.steps[i - 1]);
         ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
         emit({ type: "step.finished", payload: outcome }, step.id);
+        if (outcome.status === "succeeded") {
+          // Written even when empty so every succeeded step replaces any snapshot an older attempt left.
+          // Copies: gate chats mutate sessions in place, which must not rewrite earlier snapshots.
+          chatSnapshots[step.id] = Object.fromEntries([...sessions].map(([id, s]) => [id, { ...s }]));
+          await writeFile(join(runDir, CHAT_SESSIONS_FILE), JSON.stringify(chatSnapshots)).catch((err) =>
+            console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
+          );
+        }
         if (outcome.status !== "succeeded") {
           status = outcome.status;
           error = outcome.error;
@@ -660,23 +716,57 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 }
 
 export class JobManager {
-  private readonly jobs = new Map<string, { abort: AbortController; pending: PendingRequests; done: Promise<void> }>();
+  /** `superseded`: a retry of the same run took over; the job's emits, messages and rpcs are dropped. */
+  private readonly jobs = new Map<string, { abort: AbortController; pending: PendingRequests; superseded: boolean; done: Promise<void> }>();
 
   constructor(private readonly deps: JobDeps) {}
 
-  /** Validates, sends job.accepted | job.rejected, and runs the job in the background. */
+  /**
+   * Validates, sends job.accepted | job.rejected, and runs the job in the background. A retry for a
+   * run whose previous attempt is still here supersedes it: the old attempt is silenced (its events,
+   * messages and rpcs would land on the retried run), aborted, and the retry takes over its slot once
+   * it is done, so the outbox seed drops whatever the old attempt had queued.
+   */
   assign(run: AssignedRun): void {
-    if (this.jobs.has(run.runId)) return;
-    if (this.jobs.size >= this.deps.config.maxConcurrentJobs) {
+    const previous = this.jobs.get(run.runId);
+    if (!previous && this.jobs.size >= this.deps.config.maxConcurrentJobs) {
       this.deps.send({ t: "job.rejected", runId: run.runId, reason: "Runner at capacity" });
       return;
     }
+    if (previous) {
+      previous.superseded = true;
+      previous.abort.abort();
+    }
     const abort = new AbortController();
     const pending = new PendingRequests();
-    const done = runJob(run, this.deps, abort.signal, pending)
+    const job = { abort, pending, superseded: false, done: Promise.resolve() };
+    const deps: JobDeps = {
+      ...this.deps,
+      emit: (draft) => {
+        if (!job.superseded) this.deps.emit(draft);
+      },
+      send: (msg) => {
+        if (!job.superseded) this.deps.send(msg);
+      },
+      rpc: <T>(method: RunnerRpcMethod, params: unknown) =>
+        job.superseded ? Promise.reject<T>(new Error("Superseded by a retry")) : this.deps.rpc<T>(method, params),
+    };
+    const start = async () => {
+      await previous?.done;
+      // Cancelled while waiting for the previous attempt: never started, let the server close it.
+      if (abort.signal.aborted) {
+        deps.send({ t: "job.finished", runId: run.runId, status: "cancelled" });
+        return;
+      }
+      if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
+      await runJob(run, deps, abort.signal, pending);
+    };
+    job.done = start()
       .catch((err) => console.error(`[job ${run.runId}] crashed: ${errorText(err)}`))
-      .finally(() => this.jobs.delete(run.runId));
-    this.jobs.set(run.runId, { abort, pending, done });
+      .finally(() => {
+        if (this.jobs.get(run.runId) === job) this.jobs.delete(run.runId);
+      });
+    this.jobs.set(run.runId, job);
   }
 
   cancel(runId: string): void {

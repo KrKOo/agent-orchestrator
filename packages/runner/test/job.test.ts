@@ -10,12 +10,13 @@ import {
   type RunEventDraft,
   type RunnerMessage,
   UNTRUSTED_PREAMBLE,
+  TERMINAL_STATUSES,
   type SessionUpdate,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
-import { PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
+import { JobManager, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
 import type { McpOutputServer } from "../src/mcp-output";
 import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/types";
@@ -100,6 +101,7 @@ function harnessDeps(sandboxes: SandboxProvider) {
     mcp,
     sandboxes,
     emit: (draft) => events.push(draft),
+    seedOutbox: () => {},
     send: (msg) => sent.push(msg),
     rpc: () => Promise.reject(new Error("no rpc in tests")),
   };
@@ -161,6 +163,9 @@ beforeAll(() => {
   headSha = sh(work, "git", "rev-parse", "HEAD");
   mkdirSync(join(ghRoot, "acme"), { recursive: true });
   sh(root, "git", "clone", "-q", "--bare", work, join(ghRoot, "acme", "widget.git"));
+  // The worktree repo gets a GitHub-shaped origin (parsed by `parseGitHubRemote`) so action steps
+  // (git_push/github_pr) see `repo`; this test never fetches or pushes through it.
+  sh(repo, "git", "remote", "add", "origin", "https://github.com/acme/widget.git");
   return library.scan();
 });
 
@@ -193,7 +198,7 @@ describe("runJob", () => {
     const statuses = ofType(events, "run.status").map((e) => e.payload);
     expect(statuses.map((s) => s.status)).toEqual(["running", "succeeded"]);
     const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
-    expect(statuses[0]!.workspace).toEqual({ path: join(config.dataDir, "worktrees", run.runId), branch });
+    expect(statuses[0]!.workspace).toEqual({ path: join(config.dataDir, "worktrees", run.runId), branch, repo: "acme/widget" });
 
     const updates = ofType(events, "acp.update").map((e) => e.payload.update.sessionUpdate);
     expect(updates.filter((u) => u === "agent_message_chunk")).toHaveLength(3);
@@ -565,6 +570,302 @@ describe("runJob", () => {
     const run = assigned({ workspace: { kind: "local_path", path: tmpdir() }, steps: [{ kind: "prompt", id: "p", name: "P", prompt: "x" }] });
     await runJob(run, deps, new AbortController().signal);
     expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Path outside allowedRoots" }]);
+  });
+
+  describe("resumed runs", () => {
+    /** A run assigned for attempt 2: step `done` succeeded in attempt 1, `fromStepId` failed. */
+    const resumed = (
+      flow: Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps">,
+      fromStepId: string,
+      /** Extra succeeded prior steps besides `done` (e.g. a skipped `git_push`). */
+      priorIds: string[] = [],
+    ): AssignedRun => {
+      const run = assigned(flow);
+      const idx = run.definition.steps.findIndex((s) => s.id === fromStepId);
+      run.resume = {
+        fromStepIdx: idx,
+        prior: [{ stepId: "done", output: "prior-output", structured: { n: 1 } }, ...priorIds.map((stepId) => ({ stepId, output: stepId }))]
+          .filter((p) => run.definition.steps.some((s) => s.id === p.stepId) && p.stepId !== fromStepId),
+      };
+      run.seqFrom = 9;
+      return run;
+    };
+    /** Creates the worktree attempt 1 would have left, which a mid-run (`fromStepIdx > 0`) resume requires. */
+    const withWorktree = (run: AssignedRun): AssignedRun => {
+      const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
+      sh(repo, "git", "worktree", "add", "-q", "-b", branch, join(config.dataDir, "worktrees", run.runId), "HEAD");
+      return run;
+    };
+
+    test("renders prior step outputs in templates and starts at the cursor", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "prompt", id: "fix", name: "Fix", prompt: "echo redo using {{steps.done.output}}" },
+            ],
+          },
+          "fix",
+        ),
+      );
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      // The earlier step never executes: only the cursor's step runs.
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["fix"]);
+      // `{{steps.done.output}}` renders the persisted output instead of throwing.
+      const output = ofType(events, "step.finished")[0]!.payload.output;
+      expect(output).toContain("redo using prior-output");
+    });
+
+    test("emits with seqs at or above seqFrom", async () => {
+      // `seqFrom` seeds the outbox in JobManager.assign; runJob only sees the event stream through
+      // `emit`, so assert the seed wiring with a fake outbox instead of draft events (no seqs yet).
+      const seeded: Array<[string, number]> = [];
+      const { deps, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.seedOutbox = (runId, seqFrom) => seeded.push([runId, seqFrom]);
+      const finished = Promise.withResolvers<void>();
+      const emit = deps.emit;
+      deps.emit = (draft) => {
+        emit(draft);
+        if (draft.type === "run.status" && TERMINAL_STATUSES.includes(draft.payload.status)) finished.resolve();
+      };
+      const manager = new JobManager(deps);
+      const run = resumed({ steps: [{ kind: "prompt", id: "fix", name: "Fix", prompt: "x" }] }, "fix");
+      manager.assign(run);
+      await finished.promise;
+      expect(seeded).toEqual([[run.runId, 9]]);
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    });
+
+    test("derives pushed so github_pr works after a skipped git_push", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.rpc = async <T>(method: string) =>
+        method === "github.createPullRequest" ? ({ url: "https://github.com/acme/widget/pull/9" } as T) : Promise.reject(new Error(`no rpc: ${method}`));
+      const run = withWorktree(
+        resumed(
+          {
+            workspace: { kind: "local_path", path: repo },
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "git_push", id: "push", name: "Push" },
+              { kind: "github_pr", id: "pr", name: "PR", titleFrom: "done", bodyFrom: "done" },
+            ],
+          },
+          "pr",
+          ["push"],
+        ),
+      );
+      await runJob(run, deps, new AbortController().signal);
+      // Without the derived flag this throws "github_pr requires an earlier git_push" and the run fails.
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["pr"]);
+    });
+
+    test("tail skips pre-existing session files", async () => {
+      const { deps, events } = harnessDeps(new FakeSandboxProvider());
+      const run = resumed({ steps: [{ kind: "prompt", id: "fix", name: "Fix", prompt: "x" }] }, "fix");
+      // Pre-existing attempt-1 subagent transcript in the run's sessions dir.
+      const sessionsDir = join(config.dataDir, "runs", run.runId, "sessions");
+      mkdirSync(join(sessionsDir, "attempt1"), { recursive: true });
+      writeFileSync(join(sessionsDir, "attempt1.jsonl"), "{}\n");
+      writeFileSync(join(sessionsDir, "attempt1", "Agent1.jsonl"), `${JSON.stringify({ agentId: "Agent1", role: "assistant", content: "old" })}\n`);
+      await runJob(run, deps, new AbortController().signal);
+      expect(ofType(events, "subagent.message")).toEqual([]);
+    });
+
+    test("worktree adopt: retry keeps the attempt-1 tree; from step 0 resets it to the base ref", async () => {
+      // Attempt 1 (fresh): the write step creates hello.txt, the slash step fails (fake-print exits 3
+      // on "fail") and stops the run with the worktree dirty.
+      const { deps } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "prompt", id: "write", name: "Write", prompt: "write hello.txt" },
+          { kind: "slash", id: "break", name: "Break", command: "review", args: "fail" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      expect(sh(worktree, "git", "rev-parse", "--abbrev-ref", "HEAD")).toBe(`orch/${run.runId.slice(0, 10).toLowerCase()}`);
+      expect(existsSync(join(worktree, "hello.txt"))).toBe(true);
+
+      // Attempt 2 from step 1 adopts the worktree (no `worktree add` failure) and keeps the tree:
+      // the file attempt 1 wrote is still there for the resumed step.
+      const attempt2 = resumed(
+        {
+          steps: [
+            { kind: "prompt", id: "write", name: "Write", prompt: "write hello.txt" },
+            { kind: "slash", id: "break", name: "Break", command: "review", args: "fail" },
+            { kind: "prompt", id: "fix", name: "Fix", prompt: "read hello.txt" },
+          ],
+        },
+        "fix",
+      );
+      attempt2.runId = run.runId;
+      const second = harnessDeps(new FakeSandboxProvider());
+      await runJob(attempt2, second.deps, new AbortController().signal);
+      expect(second.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(sh(worktree, "git", "rev-parse", "--abbrev-ref", "HEAD")).toBe(`orch/${run.runId.slice(0, 10).toLowerCase()}`);
+      expect(existsSync(join(worktree, "hello.txt"))).toBe(true);
+      const fixOutput = ofType(second.events, "step.finished")[0]!.payload.output;
+      expect(fixOutput).toContain("hi");
+
+      // Attempt 2 from step 0 is a fresh rerun: the worktree resets to the base ref (no hello.txt);
+      // the flow rerun is all-green so it can run every step again.
+      const restart = resumed(
+        {
+          steps: [
+            { kind: "prompt", id: "write2", name: "Write", prompt: "write fresh.txt" },
+            { kind: "prompt", id: "fix2", name: "Fix", prompt: "read fresh.txt" },
+          ],
+        },
+        "write2",
+      );
+      restart.runId = run.runId;
+      restart.resume!.fromStepIdx = 0;
+      const third = harnessDeps(new FakeSandboxProvider());
+      await runJob(restart, third.deps, new AbortController().signal);
+      expect(third.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      // The reset wiped attempt 1's hello.txt (write2's own output is a different file).
+      expect(existsSync(join(worktree, "hello.txt"))).toBe(false);
+      expect(existsSync(join(worktree, "fresh.txt"))).toBe(true);
+    });
+
+    test("an intervention retried after a cancel can chat again: slash sessions resume, the agent session is new", async () => {
+      const steps: FlowDefinitionInput["steps"] = [
+        { kind: "slash", id: "plan", name: "Plan", command: "plan", args: "an app" },
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "hi" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+      ];
+      // Attempt 1 is cancelled at the gate.
+      const first = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({ steps });
+      await runJob(run, first.deps, new AbortController().signal, scriptedGate(first.deps, first.events, [{ action: "cancel" }]));
+      expect(first.sent.at(-1)).toMatchObject({ status: "cancelled" });
+
+      const retry = assigned({ steps });
+      retry.runId = run.runId;
+      retry.resume = { fromStepIdx: 2, prior: [{ stepId: "plan", output: "print:/plan an app\n" }, { stepId: "impl", output: "Hello, world" }] };
+      const second = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(second.deps, second.events, [
+        { action: "message", session: "slash:plan", text: "add tests" },
+        { action: "message", session: "agent", text: "echo again" },
+        { action: "continue", session: "agent" },
+      ]);
+      await runJob(retry, second.deps, new AbortController().signal, pending);
+
+      expect(second.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(second.events, "intervention.request");
+      expect(requests[0]!.payload.sessions).toEqual([
+        { id: "slash:plan", label: "/plan (Plan)", output: "print:/plan an app\n" },
+        { id: "agent", label: "Agent session (new after retry; last step: Implement)", output: "Hello, world" },
+      ]);
+      expect(requests[0]!.payload.session).toBe("agent");
+      // The slash session continues attempt 1's omp session; the agent session takes messages again.
+      expect(requests[1]!.payload.sessions[0]!.output).toBe("print:(resumed fake) add tests\n");
+      const finished = Object.fromEntries(ofType(second.events, "step.finished").map((e) => [e.stepId, e.payload]));
+      expect(finished.gate).toMatchObject({ status: "succeeded" });
+      expect(finished.gate!.output).toContain("echo again");
+    });
+
+    test("a retried intervention without a session snapshot still offers the agent session", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "message", session: "agent", text: "echo again" }, { action: "continue" }]);
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Implement", prompt: "hi" },
+              { kind: "intervention", id: "gate", name: "Gate" },
+            ],
+          },
+          "gate",
+        ),
+      );
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "intervention.request")[0]!.payload.sessions).toEqual([
+        { id: "agent", label: "Agent session (new after retry; last step: Implement)", output: "prior-output" },
+      ]);
+      expect(ofType(events, "step.finished")[0]!.payload.output).toContain("echo again");
+    });
+
+    test("worktree gone: a mid-run retry fails; from step 0 recreates it on the existing branch", async () => {
+      const steps: FlowDefinitionInput["steps"] = [
+        { kind: "prompt", id: "write", name: "Write", prompt: "write hello.txt" },
+        { kind: "slash", id: "break", name: "Break", command: "review", args: "fail" },
+      ];
+      const run = assigned({ steps });
+      await runJob(run, harnessDeps(new FakeSandboxProvider()).deps, new AbortController().signal);
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
+      // The branch survives in the repo, the worktree dir does not (e.g. dataDir wiped).
+      rmSync(worktree, { recursive: true, force: true });
+
+      const retry = resumed({ steps }, "break");
+      retry.runId = run.runId;
+      const second = harnessDeps(new FakeSandboxProvider());
+      await runJob(retry, second.deps, new AbortController().signal);
+      const failed = second.sent.at(-1);
+      expect(failed).toMatchObject({ t: "job.finished", runId: run.runId, status: "failed" });
+      expect(failed && "error" in failed ? failed.error : "").toContain("not on this runner");
+
+      const restart = resumed({ steps: [{ kind: "prompt", id: "write2", name: "Write", prompt: "write fresh.txt" }] }, "write2");
+      restart.runId = run.runId;
+      restart.resume!.fromStepIdx = 0;
+      const third = harnessDeps(new FakeSandboxProvider());
+      await runJob(restart, third.deps, new AbortController().signal);
+      expect(third.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(sh(worktree, "git", "rev-parse", "--abbrev-ref", "HEAD")).toBe(branch);
+      // Reset to the base ref: attempt 1's uncommitted hello.txt is gone with its dir anyway.
+      expect(existsSync(join(worktree, "hello.txt"))).toBe(false);
+      expect(existsSync(join(worktree, "fresh.txt"))).toBe(true);
+    });
+
+    test("a retry supersedes a still-running attempt: aborts and silences it, then seeds and runs", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const order: string[] = [];
+      const gateOpen = Promise.withResolvers<void>();
+      const retryDone = Promise.withResolvers<void>();
+      deps.emit = (draft) => {
+        events.push(draft);
+        if (draft.type === "intervention.request") gateOpen.resolve();
+      };
+      deps.send = (msg) => {
+        sent.push(msg);
+        if (msg.t === "job.finished") {
+          order.push("finished");
+          retryDone.resolve();
+        }
+      };
+      deps.seedOutbox = () => order.push("seed");
+      const manager = new JobManager(deps);
+      // Attempt 1 waits at a gate indefinitely (e.g. the server lost the runner and failed the run).
+      const first = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+      manager.assign(first);
+      await gateOpen.promise;
+      const eventsBefore = events.length;
+      const sentBefore = sent.length;
+
+      const retry = resumed({ steps: [{ kind: "prompt", id: "fix", name: "Fix", prompt: "x" }] }, "fix");
+      retry.runId = first.runId;
+      manager.assign(retry);
+      expect(manager.activeCount()).toBe(1);
+      await retryDone.promise;
+
+      // Only the retry's own output follows its arrival: attempt 1's cancellation never surfaces.
+      expect(order).toEqual(["seed", "finished"]);
+      expect(sent.slice(sentBefore).filter((m) => m.t === "job.finished")).toEqual([
+        { t: "job.finished", runId: first.runId, status: "succeeded" },
+      ]);
+      const later = events.slice(eventsBefore);
+      expect(ofType(later, "step.started").map((e) => e.stepId)).toEqual(["fix"]);
+      expect(ofType(later, "step.finished").map((e) => [e.stepId, e.payload.status])).toEqual([["fix", "succeeded"]]);
+      expect(ofType(later, "run.status").map((e) => e.payload.status)).not.toContain("cancelled");
+    });
   });
 });
 

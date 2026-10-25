@@ -779,7 +779,6 @@ textarea:focus {
   gap: 2px;
 }
 .step-item {
-  font: inherit;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -787,6 +786,17 @@ textarea:focus {
   padding: 6px;
   border: 1px solid transparent;
   border-radius: 5px;
+}
+/* The row's selection target; the "Run from here" action is its sibling, not nested in it. */
+.step-item-select {
+  font: inherit;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: none;
   background: none;
   color: var(--text);
   cursor: pointer;
@@ -822,6 +832,15 @@ textarea:focus {
   gap: 6px;
   font-size: 11px;
   min-width: 0;
+}
+/* Per-step "Run from here" action shown on failed runs. */
+.step-retry {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 11px;
+}
+.step-retry:hover {
+  border-color: var(--border);
 }
 .step-header {
   position: sticky;

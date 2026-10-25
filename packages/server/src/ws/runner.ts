@@ -127,11 +127,17 @@ export class RunnerSession {
           deps.hub.attachRunner(this.runnerId, this.link);
           this.attached = true;
         }
+        // No jobs until the runner has replayed its outbox in answer to this welcome (`replayed`).
+        deps.hub.setReplayed(this.link, false);
         this.send({ t: "welcome", lastAckedSeq: this.lastAckedSeq() });
         console.log(`[runner ${this.runnerId}] hello v${msg.version}, labels=${msg.capabilities.labels.join(",") || "-"}`);
-        deps.scheduler.kick();
         return;
       }
+      case "replayed":
+        if (!this.attached) return;
+        deps.hub.setReplayed(this.link, true);
+        deps.scheduler.kick();
+        return;
       case "ping":
         this.touch();
         this.send({ t: "pong" });

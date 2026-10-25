@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import type { Finding, InterventionSession, RunEvent, RunStatus, StepStatus, SubagentBlock, WorkspaceInfo } from "@orch/protocol";
+import { TERMINAL_STATUSES, type Finding, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -94,6 +94,8 @@ export interface RunViewState {
   workspace?: WorkspaceInfo;
   currentStepId?: string;
   steps: Record<string, StepView>;
+  /** Step ids in the order their first event arrived (the run's execution order). */
+  stepOrder: string[];
   findings: (Finding & { stepId?: string })[];
   permissions: PermissionView[];
   elicitations: ElicitationView[];
@@ -104,6 +106,7 @@ export interface RunViewState {
 export const initialRunViewState: RunViewState = {
   lastSeq: 0,
   steps: {},
+  stepOrder: [],
   findings: [],
   permissions: [],
   elicitations: [],
@@ -195,22 +198,45 @@ function applyUpdate(step: StepView, update: { sessionUpdate: string; [k: string
 
 function withStep(state: RunViewState, stepId: string | undefined, fn: (s: StepView) => StepView): RunViewState {
   const key = stepId ?? NO_STEP;
-  return { ...state, steps: { ...state.steps, [key]: fn(state.steps[key] ?? emptyStep) } };
+  const known = key in state.steps;
+  return {
+    ...state,
+    steps: { ...state.steps, [key]: fn(state.steps[key] ?? emptyStep) },
+    stepOrder: known || key === NO_STEP ? state.stepOrder : [...state.stepOrder, key],
+  };
+}
+
+/** Drops the attempt-scoped result of a step; its transcript stays (a retry appends to it). */
+function resetAttempt(st: StepView, status: StepStatus): StepView {
+  return { ...st, status, output: undefined, structured: undefined, error: undefined };
+}
+
+/** A retry reset `fromStepId` and every step after it to pending. */
+function resetFrom(state: RunViewState, fromStepId: string): RunViewState {
+  const idx = state.stepOrder.indexOf(fromStepId);
+  if (idx < 0) return state;
+  const steps = { ...state.steps };
+  for (const id of state.stepOrder.slice(idx)) steps[id] = resetAttempt(steps[id]!, "pending");
+  return { ...state, steps };
 }
 
 export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
   if (ev.seq <= state.lastSeq) return state;
   const s: RunViewState = { ...state, lastSeq: ev.seq };
   switch (ev.type) {
-    case "run.status":
+    case "run.status": {
+      // A retried run re-enters a non-terminal status: the previous attempt's error no longer applies.
+      const error = TERMINAL_STATUSES.includes(ev.payload.status) ? (ev.payload.error ?? s.error) : undefined;
+      const from = ev.payload.resumeFromStepId;
       return {
-        ...s,
+        ...(from === undefined ? s : resetFrom(s, from)),
         status: ev.payload.status,
-        error: ev.payload.error ?? s.error,
+        error,
         workspace: ev.payload.workspace ?? s.workspace,
       };
+    }
     case "step.started":
-      return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) => ({ ...st, status: "running" }));
+      return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) => resetAttempt(st, "running"));
     case "step.finished":
       return withStep(s, ev.stepId, (st) => ({
         ...st,

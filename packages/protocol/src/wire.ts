@@ -2,7 +2,8 @@ import { z } from "zod";
 import { RunEvent, RunStatus } from "./events";
 import { FlowDefinition, InterventionAction } from "./flow";
 
-export const WIRE_PROTOCOL = 1;
+/** 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it. */
+export const WIRE_PROTOCOL = 2;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
@@ -35,6 +36,19 @@ export const AssignedRun = z.object({
   github: z
     .object({ repo: z.string(), number: z.number().int(), headSha: z.string(), baseSha: z.string() })
     .optional(),
+  /** Present on retry: the run restarts at `fromStepIdx` with prior succeeded step outputs preloaded. */
+  resume: z
+    .object({
+      fromStepIdx: z.number().int().min(0),
+      /** Outputs of succeeded steps before the cursor, in step order. */
+      prior: z.array(z.object({ stepId: z.string(), output: z.string(), structured: z.unknown().optional() })),
+    })
+    .optional(),
+  /**
+   * First event seq of this attempt (absent on fresh runs). The runner drops the run's pending outbox rows
+   * (they belong to the previous attempt) and continues its seq counter at `max(own counter + 1, seqFrom)`.
+   */
+  seqFrom: z.number().int().min(1).optional(),
 });
 export type AssignedRun = z.infer<typeof AssignedRun>;
 
@@ -103,6 +117,12 @@ export const RunnerMessage = z.union([
   z.object({ t: z.literal("job.rejected"), runId: z.string(), reason: z.string() }),
   z.object({ t: z.literal("job.events"), runId: z.string(), events: z.array(RunEvent) }),
   z.object({ t: z.literal("job.finished"), runId: z.string(), status: RunStatus, error: z.string().optional() }),
+  /**
+   * Sent once per connection right after the runner replayed its outbox in response to `welcome`. Until then
+   * the server assigns no jobs to it, so replayed rows of runs it no longer holds (e.g. the previous attempt
+   * of a run since retried) are acked without being stored instead of landing in a fresh assignment.
+   */
+  z.object({ t: z.literal("replayed") }),
   RpcResult,
   RunnerRpcCall,
   z.object({ t: z.literal("ping") }),

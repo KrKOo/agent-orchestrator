@@ -1,11 +1,11 @@
 import type { FlowDefinition, RunnerCapabilities } from "@orch/protocol";
-import { and, asc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { posix } from "node:path";
 import { schema } from "./db";
 import { DEFAULT_MAX_CONCURRENT_PER_REPO } from "./config";
 import type { RunService } from "./runs";
 
-const { runs, runners } = schema;
+const { runs, runSteps, runners } = schema;
 
 /** A runner counts as online while connected and seen within this window. */
 export const ONLINE_WINDOW_MS = 45_000;
@@ -22,6 +22,8 @@ export interface RunnerState {
   capabilities: RunnerCapabilities | null;
   lastSeenAt: number | null;
   connected: boolean;
+  /** The current connection finished replaying its outbox (`replayed`); no jobs before that. */
+  replayed: boolean;
   /** Runs currently `assigned`/`running` on this runner. */
   running: number;
 }
@@ -45,7 +47,7 @@ export function isUnderRoot(path: string, root: string): boolean {
 
 export function isEligible(run: SchedulableRun, r: RunnerState, now: number): boolean {
   const caps = r.capabilities;
-  if (!caps || !isOnline(r, now)) return false;
+  if (!caps || !isOnline(r, now) || !r.replayed) return false;
   if (r.running >= caps.maxConcurrentJobs) return false;
   if (!run.definition.runnerLabels.every((l) => r.labels.includes(l))) return false;
   if (run.trust === "owner" ? r.ownerUserId !== run.createdBy : !caps.acceptUntrusted) return false;
@@ -104,11 +106,12 @@ export class Scheduler {
         capabilities: r.capabilities,
         lastSeenAt: r.lastSeenAt,
         connected: hub.isConnected(r.id),
+        replayed: hub.isReplayed(r.id),
         running: counts.get(r.id) ?? 0,
       }));
   }
 
-  /** Fails lost runners' runs, then assigns queued runs (oldest first) to the least-loaded eligible runner. */
+  /** Fails lost runners' runs (held or pinned), then assigns queued runs (oldest first) to the least-loaded eligible runner. */
   kick(): void {
     if (this.kicking) return;
     this.kicking = true;
@@ -124,6 +127,12 @@ export class Scheduler {
     }
   }
 
+  /** Unknown, or offline for longer than `RUNNER_LOST_MS`; downtime of the server itself does not count. */
+  private isLost(r: RunnerState | undefined, now: number): boolean {
+    if (r && isOnline(r, now)) return false;
+    return now - Math.max(r?.lastSeenAt ?? 0, this.startedAt) > RUNNER_LOST_MS;
+  }
+
   private failLostRuns(states: RunnerState[], now: number): void {
     const { db } = this.runService;
     const byId = new Map(states.map((s) => [s.id, s]));
@@ -134,13 +143,21 @@ export class Scheduler {
       .all();
     for (const run of held) {
       const r = byId.get(run.runnerId!);
-      if (r && isOnline(r, now)) continue;
-      // Downtime of the server itself does not count against the runner.
-      const offlineSince = Math.max(r?.lastSeenAt ?? 0, this.startedAt);
-      if (now - offlineSince <= RUNNER_LOST_MS) continue;
+      if (!this.isLost(r, now)) continue;
       console.warn(`[scheduler] run ${run.id}: runner ${run.runnerId} lost`);
       this.runService.terminate(run.id, "failed", "runner_lost");
       if (r) r.running = Math.max(0, r.running - 1);
+    }
+    // A retry pinned to the runner holding its worktree cannot run elsewhere; retrying from step 1 unpins it.
+    const pinned = db
+      .select({ id: runs.id, resumeRunnerId: runs.resumeRunnerId })
+      .from(runs)
+      .where(and(isNotNull(runs.resumeRunnerId), eq(runs.status, "queued")))
+      .all();
+    for (const run of pinned) {
+      if (!this.isLost(byId.get(run.resumeRunnerId!), now)) continue;
+      console.warn(`[scheduler] run ${run.id}: resume runner ${run.resumeRunnerId} lost`);
+      this.runService.terminate(run.id, "failed", "resume_runner_lost");
     }
   }
 
@@ -160,7 +177,7 @@ export class Scheduler {
       const repo = run.triggerKind === "github" ? run.github?.repo : undefined;
       if (repo !== undefined && (perRepo.get(repo) ?? 0) >= this.opts.maxConcurrentPerRepo) continue;
       const target = states
-        .filter((r) => isEligible(run, r, now))
+        .filter((r) => (run.resumeRunnerId === null || r.id === run.resumeRunnerId) && isEligible(run, r, now))
         .sort((a, b) => a.running - b.running || a.id.localeCompare(b.id))[0];
       if (!target) continue;
       const claimed = db
@@ -171,6 +188,18 @@ export class Scheduler {
         .all();
       if (claimed.length === 0) continue;
       const gh = run.github;
+      // Retried runs carry the step cursor plus prior succeeded outputs; `seqFrom` continues the
+      // transcript's seq numbering even when a different runner resumes (its outbox restarts at 1).
+      const prior =
+        run.resumeFrom !== null
+          ? db
+              .select({ stepId: runSteps.stepId, output: runSteps.output, structured: runSteps.structured })
+              .from(runSteps)
+              .where(and(eq(runSteps.runId, run.id), lt(runSteps.idx, run.resumeFrom), eq(runSteps.status, "succeeded")))
+              .orderBy(asc(runSteps.idx))
+              .all()
+              .map((s) => ({ stepId: s.stepId, output: s.output ?? "", ...(s.structured === null ? {} : { structured: s.structured }) }))
+          : undefined;
       const sent = hub.sendToRunner(target.id, {
         t: "job.assign",
         run: {
@@ -179,6 +208,8 @@ export class Scheduler {
           definition: run.definition,
           inputs: run.inputs,
           ...(gh ? { github: { repo: gh.repo, number: gh.number, headSha: gh.headSha, baseSha: gh.baseSha } } : {}),
+          ...(prior !== undefined ? { resume: { fromStepIdx: run.resumeFrom!, prior } } : {}),
+          ...(prior !== undefined ? { seqFrom: this.runService.maxSeq(run.id) + 1 } : {}),
         },
       });
       if (!sent) {
