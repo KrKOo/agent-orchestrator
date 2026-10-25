@@ -1,11 +1,11 @@
 import type { FlowDefinition, RunnerCapabilities } from "@orch/protocol";
-import { and, asc, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { posix } from "node:path";
 import { schema } from "./db";
 import { DEFAULT_MAX_CONCURRENT_PER_REPO } from "./config";
 import type { RunService } from "./runs";
 
-const { runs, runners } = schema;
+const { runs, runSteps, runners } = schema;
 
 /** A runner counts as online while connected and seen within this window. */
 export const ONLINE_WINDOW_MS = 45_000;
@@ -171,6 +171,18 @@ export class Scheduler {
         .all();
       if (claimed.length === 0) continue;
       const gh = run.github;
+      // Retried runs carry the step cursor plus prior succeeded outputs; `seqFrom` continues the
+      // transcript's seq numbering even when a different runner resumes (its outbox restarts at 1).
+      const prior =
+        run.resumeFrom !== null
+          ? db
+              .select({ stepId: runSteps.stepId, output: runSteps.output, structured: runSteps.structured })
+              .from(runSteps)
+              .where(and(eq(runSteps.runId, run.id), lt(runSteps.idx, run.resumeFrom), eq(runSteps.status, "succeeded")))
+              .orderBy(asc(runSteps.idx))
+              .all()
+              .map((s) => ({ stepId: s.stepId, output: s.output ?? "", ...(s.structured === null ? {} : { structured: s.structured }) }))
+          : undefined;
       const sent = hub.sendToRunner(target.id, {
         t: "job.assign",
         run: {
@@ -179,6 +191,8 @@ export class Scheduler {
           definition: run.definition,
           inputs: run.inputs,
           ...(gh ? { github: { repo: gh.repo, number: gh.number, headSha: gh.headSha, baseSha: gh.baseSha } } : {}),
+          ...(prior !== undefined ? { resume: { fromStepIdx: run.resumeFrom!, prior } } : {}),
+          ...(prior !== undefined ? { seqFrom: this.runService.maxSeq(run.id) + 1 } : {}),
         },
       });
       if (!sent) {

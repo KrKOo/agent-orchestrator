@@ -15,6 +15,7 @@ const { flows, runs, runSteps, findings } = schema;
 
 const CreateRunBody = z.object({ inputs: z.record(z.string(), z.string()).default({}) });
 const PermissionBody = z.object({ optionId: z.string().min(1).nullable() });
+const RetryBody = z.object({ fromStepId: z.string().min(1).optional() });
 const ElicitationBody = z.object({ action: ElicitationAction, content: z.record(z.string(), z.unknown()).optional() });
 const InterventionBody = z
   .object({
@@ -163,6 +164,46 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       default:
         return c.json({ ok: true });
     }
+  });
+
+  /** Retries a failed run: from the failed step (default) or from `fromStepId` (skipping nothing unfinished). */
+  app.post("/:id/retry", async (c) => {
+    const id = c.req.param("id");
+    const body = await readJson(c);
+    if (!body.ok) return body.response;
+    const parsed = RetryBody.safeParse(body.value);
+    if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
+    const run = deps.runs.get(id);
+    if (!run) return c.json({ error: "Run not found" }, 404);
+    let fromStepIdx = 0;
+    if (parsed.data.fromStepId !== undefined) {
+      fromStepIdx = run.definition.steps.findIndex((s) => s.id === parsed.data.fromStepId);
+      if (fromStepIdx < 0) return c.json({ error: `Unknown step "${parsed.data.fromStepId}"` }, 400);
+    } else {
+      // Default: retry the failed step (the first failed one; a cancelled run has none).
+      fromStepIdx = run.definition.steps.findIndex((s) => {
+        const row = db.select().from(runSteps).where(and(eq(runSteps.runId, id), eq(runSteps.stepId, s.id))).get();
+        return row?.status === "failed";
+      });
+      if (fromStepIdx < 0) return c.json({ error: "Run has no failed step" }, 409);
+    }
+    const outcome = deps.runs.retry(id, fromStepIdx);
+    if (!outcome.ok) {
+      switch (outcome.error) {
+        case "not_found":
+          return c.json({ error: "Run not found" }, 404);
+        case "not_failed":
+          return c.json({ error: `Run is ${run.status}, not failed` }, 409);
+        case "unfinished_steps":
+          return c.json({ error: "Cannot skip unfinished steps" }, 409);
+        case "bad_step":
+          return c.json({ error: "Invalid step index" }, 400);
+      }
+    }
+    console.log(`[runs] run ${id} retry from step ${run.definition.steps[fromStepIdx]?.id ?? fromStepIdx}`);
+    if (run.triggerKind === "github") deps.checks.createCheckRun(id, false);
+    deps.scheduler.kick();
+    return c.json({ ok: true });
   });
 
   app.post("/:id/approve", (c) => {

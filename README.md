@@ -51,6 +51,14 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
   while a reply is generated. Without a timeout the run waits until answered or cancelled. Not available in
   PR-triggered flows.
+- **Retrying a failed run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
+  (header button) re-runs the failed step and continues to the end; **Run from here** (per step) resets that step
+  and everything after it, keeping earlier outputs — use it to recover from bad upstream output without rerunning
+  what worked. The workspace (git worktree) is adopted as it was left (from step 0 it is reset to the base ref
+  instead), outputs of skipped steps come back as `{{steps.…}}`, and the event transcript continues in one view
+  with continuous sequence numbers even across runner restarts. Agent steps resume in a fresh session (ACP has no
+  conversation resume); the sandbox is recreated per attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over.
+  PR-triggered runs get a fresh check run for the new attempt (a recurring finding may post a duplicate review).
 
 ## Public control plane (M2)
 

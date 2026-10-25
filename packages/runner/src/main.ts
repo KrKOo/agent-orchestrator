@@ -95,6 +95,7 @@ async function main(): Promise<void> {
     mcp,
     sandboxes: new DockerSandboxProvider(config),
     emit: (draft) => outbox.append(draft),
+    seedOutbox: (runId, seqFrom) => outbox.seed(runId, seqFrom),
     send,
     rpc: <T>(method: "github.token" | "github.createPullRequest", params: unknown) => {
       if (!conn) return Promise.reject(new Error("Not connected"));

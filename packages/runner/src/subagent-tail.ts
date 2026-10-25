@@ -88,6 +88,7 @@ export class SubagentTail {
   constructor(
     private readonly sessionsDir: string,
     private readonly emit: (event: SubagentEvent) => void,
+    private readonly opts: { /** Skip content already on disk when first seen (resume: attempt-1 transcripts). */ fromEnd?: boolean } = {},
   ) {}
 
   start(): void {
@@ -139,6 +140,12 @@ export class SubagentTail {
     try {
       const { size } = await fh.stat();
       if (size <= state.offset) return;
+      // First sight of a file with existing content (a resumed run's attempt-1 transcripts): start
+      // at the end without emitting, so old subagent events are not re-streamed.
+      if (state.offset === 0 && this.opts.fromEnd) {
+        state.offset = size;
+        return;
+      }
       chunk = Buffer.alloc(size - state.offset);
       const { bytesRead } = await fh.read(chunk, 0, chunk.length, state.offset);
       chunk = chunk.subarray(0, bytesRead);

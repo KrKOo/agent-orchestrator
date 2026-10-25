@@ -72,6 +72,27 @@ describe("Outbox", () => {
     expect(outbox.pending("r1", 0).map((e) => e.seq)).toEqual([3]);
   });
 
+  test("seed continues seq across a fresh Outbox db", () => {
+    // Attempt 1 on this runner emitted seqs 1..3 and all were acked (rows gone).
+    for (const t of ["a", "b", "c"]) outbox.append(log(t));
+    outbox.flush();
+    outbox.ack("r1", 3);
+    outbox.close();
+    sent = [];
+    // Attempt 2, possibly after a runner restart: the server says the transcript is at seq 3, so the
+    // first new event must be seq 5 (the retry's own run.status is seq 4, sent by the server).
+    outbox = new Outbox(join(dir, "outbox.sqlite"), (m) => sent.push(m));
+    outbox.seed("r1", 5);
+    outbox.append(log("resumed"));
+    outbox.flush();
+    expect(sentEvents().map((e) => e.seq)).toEqual([5]);
+    // Seeding lower never rewinds the counter.
+    outbox.seed("r1", 2);
+    outbox.append(log("later"));
+    outbox.flush();
+    expect(sentEvents().map((e) => e.seq)).toEqual([5, 6]);
+  });
+
   test("replay after simulated reconnect resends only unacked events, seq contiguous", () => {
     for (let i = 0; i < 5; i++) outbox.append(log(`l${i}`));
     outbox.flush(); // sent while "connected"

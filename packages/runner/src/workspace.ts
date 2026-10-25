@@ -115,7 +115,17 @@ async function prepareLocalPath(run: AssignedRun, ws: LocalPathWorkspace, config
     const branch = orchBranch(run.runId);
     const worktree = join(config.dataDir, "worktrees", run.runId);
     await mkdir(join(config.dataDir, "worktrees"), { recursive: true });
-    await gitOk(path, ["worktree", "add", "-b", branch, worktree, ws.baseRef]);
+    const existing = existsSync(worktree) ? await git(worktree, ["rev-parse", "--abbrev-ref", "HEAD"]) : null;
+    if (existing?.code === 0 && existing.stdout.trim() === branch) {
+      // Resume: the attempt-1 worktree is still there. From step 0 restart clean from the base ref
+      // (fresh rerun semantics); otherwise keep the dirty tree — continuing where it stopped is the point.
+      if (run.resume?.fromStepIdx === 0) {
+        await gitOk(worktree, ["reset", "--hard", ws.baseRef]);
+        await gitOk(worktree, ["clean", "-fd"]);
+      }
+    } else {
+      await gitOk(path, ["worktree", "add", "-b", branch, worktree, ws.baseRef]);
+    }
     return {
       hostPath: worktree,
       branch,
