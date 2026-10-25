@@ -212,7 +212,7 @@ export function StepPanel({
         <span>Timeout (seconds)</span>
         <input
           type="number"
-          min={1}
+          min={0}
           value={step.timeoutSec}
           onChange={(e) =>
             set(
@@ -222,6 +222,9 @@ export function StepPanel({
             )
           }
         />
+        {step.timeoutSec === 0 && (
+          <small className="muted">0 = no timeout (runs until the step finishes or the run is cancelled)</small>
+        )}
         {step.kind === "intervention" && step.timeoutSec === undefined && (
           <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
         )}

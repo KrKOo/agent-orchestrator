@@ -61,6 +61,23 @@ describe("validateFlow", () => {
     expect(res.flow.steps[0]!.timeoutSec).toBe(1800);
   });
 
+  test("accepts timeoutSec 0 as an infinite timeout and keeps it", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "Implement it", timeoutSec: 0 },
+        { id: "gate", name: "Gate", kind: "intervention", timeoutSec: 0 },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps[0]!.timeoutSec).toBe(0);
+    expect(res.flow.steps[1]!.timeoutSec).toBe(0);
+
+    // Fractional and negative values stay invalid.
+    expect(validateFlow({ ...baseFlow, steps: [{ id: "s", name: "S", kind: "git_push", timeoutSec: 1.5 }] }).ok).toBe(false);
+    expect(validateFlow({ ...baseFlow, steps: [{ id: "s", name: "S", kind: "git_push", timeoutSec: -1 }] }).ok).toBe(false);
+  });
+
   test("rejects forward step references in templates and *From fields", () => {
     const res = validateFlow({
       ...baseFlow,
