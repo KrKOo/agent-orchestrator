@@ -81,8 +81,8 @@ interface ChatSession {
   label: string;
   /** Latest result: the last non-empty reply of the session. */
   output: string;
-  /** Cap for one chat turn: the timeout of the step that last used the session. */
-  timeoutSec: number;
+  /** Cap for one chat turn: the timeout of the step that last used the session; `0` or `undefined` = no cap. */
+  timeoutSec: number | undefined;
   resume?: string;
 }
 
@@ -107,9 +107,11 @@ export class PendingRequests {
 
   /**
    * Resolves with the answer, or null on timeout / cancellation. A `undefined` timeout waits
-   * indefinitely (intervention gates); the default caps permission/elicitation answers at 30 min.
+   * indefinitely (intervention gates without a cap); permission/elicitation answers pass
+   * `ANSWER_TIMEOUT_MS` (30 min). Not a default parameter: an explicit `undefined` must mean
+   * "wait forever", not fall back to the 30 min cap.
    */
-  wait(requestId: string, timeoutMs: number | undefined = ANSWER_TIMEOUT_MS): Promise<Answer | null> {
+  wait(requestId: string, timeoutMs: number | undefined): Promise<Answer | null> {
     const { promise, resolve } = Promise.withResolvers<Answer | null>();
     const timer = timeoutMs === undefined ? undefined : setTimeout(() => this.settle(requestId, null), timeoutMs);
     this.waiters.set(requestId, (answer) => {
@@ -301,7 +303,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const requestId = ulid();
     const stepId = currentStepId;
     emit({ type: "acp.permission_request", payload: { requestId, toolCall: req.toolCall, options } }, stepId);
-    const answer = await pending.wait(requestId);
+    const answer = await pending.wait(requestId, ANSWER_TIMEOUT_MS);
     const chosen = answer && "optionId" in answer ? answer.optionId : null;
     const optionId = options.some((o) => o.optionId === chosen) ? chosen : null;
     emit({ type: "acp.permission_resolved", payload: { requestId, optionId } }, stepId);
@@ -313,7 +315,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const requestId = ulid();
     const stepId = currentStepId;
     emit({ type: "acp.elicitation_request", payload: { requestId, message: req.message, requestedSchema: req.requestedSchema } }, stepId);
-    const answer = await pending.wait(requestId);
+    const answer = await pending.wait(requestId, ANSWER_TIMEOUT_MS);
     const action: ElicitationAction = answer && "action" in answer && "content" in answer ? answer.action : "cancel";
     emit({ type: "acp.elicitation_resolved", payload: { requestId, action } }, stepId);
     if (action === "accept" && answer && "action" in answer && "content" in answer) return { action, content: elicitationContent(answer.content) ?? {} };
@@ -416,13 +418,12 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         step.id,
       );
       emit({ type: "run.status", payload: { status: "awaiting_input" } });
-      const answer = await pending.wait(requestId, step.timeoutSec === undefined ? undefined : step.timeoutSec * 1000);
+      const waitMs = step.timeoutSec ? step.timeoutSec * 1000 : undefined;
+      const answer = await pending.wait(requestId, waitMs);
       if (!answer || !("action" in answer) || answer.action === "cancel") {
         emit({ type: "intervention.resolved", payload: { requestId, action: "cancel" } }, step.id);
         // A null answer without a run cancel is the per-wait timeout.
-        return !answer && !abort.aborted && step.timeoutSec !== undefined
-          ? { status: "failed", error: `No answer within ${step.timeoutSec}s` }
-          : { status: "cancelled" };
+        return !answer && !abort.aborted && waitMs !== undefined ? { status: "failed", error: `No answer within ${step.timeoutSec}s` } : { status: "cancelled" };
       }
       const { action, session: id = selected, text } = answer as InterventionAnswer;
       emit({ type: "intervention.resolved", payload: { requestId, action } }, step.id);
@@ -443,10 +444,10 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       const onAbort = () => turnAbort.abort();
       abort.addEventListener("abort", onAbort, { once: true });
       let timedOut = false;
-      const timer = setTimeout(() => {
+      const timer = chat.timeoutSec ? setTimeout(() => {
         timedOut = true;
         turnAbort.abort();
-      }, chat.timeoutSec * 1000);
+      }, chat.timeoutSec * 1000) : undefined;
       let outcome: StepOutcome & { sessionId?: string };
       try {
         if (id === AGENT_SESSION) {
@@ -467,7 +468,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       if (outcome.sessionId !== undefined) chat.resume = outcome.sessionId;
       // A turn that only ran tools keeps the previous result.
       if (outcome.status === "succeeded" && outcome.output?.trim()) chat.output = outcome.output;
-      error = outcome.status === "succeeded" ? undefined : timedOut ? `No reply within ${chat.timeoutSec}s` : (outcome.error ?? "The turn failed.");
+      error = outcome.status === "succeeded" ? undefined : timedOut && chat.timeoutSec ? `No reply within ${chat.timeoutSec}s` : (outcome.error ?? "The turn failed.");
     }
   };
 
@@ -576,9 +577,10 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const abort = new AbortController();
     stepAbort = abort;
     let timedOut = false;
-    // Gates cap each wait for an answer themselves (revisions run under the reviewed step's timeout).
+    // Gates cap each wait for an answer themselves (revisions run under the reviewed step's timeout);
+    // `timeoutSec: 0` runs without a cap.
     const timer =
-      step.kind === "intervention"
+      step.kind === "intervention" || step.timeoutSec === 0
         ? undefined
         : setTimeout(() => {
             timedOut = true;

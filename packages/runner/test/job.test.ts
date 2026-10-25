@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -537,6 +537,33 @@ describe("runJob", () => {
     expect(ofType(events, "intervention.resolved")[0]!.payload.action).toBe("cancel");
   });
 
+  test("intervention gate: timeoutSec 0 waits forever for an answer", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = new PendingRequests();
+      deps.emit = (draft) => {
+        events.push(draft);
+        if (draft.type === "intervention.request") {
+          // Advance the clock past the 30-min permission cap (ANSWER_TIMEOUT_MS) before answering:
+          // a wrongly-armed timer — the step cap or a `wait` fallback — fires here and nulls the
+          // answer; only then is the real answer delivered.
+          queueMicrotask(() => {
+            vi.advanceTimersByTime(1_800_001);
+            pending.settle(draft.payload.requestId, { action: "continue" });
+          });
+        }
+      };
+      const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate", timeoutSec: 0 }] });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.finished")[0]!.payload.status).toBe("succeeded");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("cancel ends the step and the run cancelled", async () => {
     const sandboxes = new FakeSandboxProvider();
     const { deps, events, sent } = harnessDeps(sandboxes);
@@ -553,6 +580,17 @@ describe("runJob", () => {
     expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "cancelled" });
     expect(ofType(events, "sandbox.log").map((e) => e.payload.text)).toContain("fake-agent: waiting for cancel");
     expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("prompt step with timeoutSec 0 never times out", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    // A wrongly-armed watchdog would abort at ~0ms, long before the fake agent's first reply;
+    // with 0 the step must complete normally.
+    const run = assigned({ steps: [{ kind: "prompt", id: "p", name: "P", prompt: "hi", timeoutSec: 0 }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(ofType(events, "step.finished")[0]!.payload.status).toBe("succeeded");
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished", runId: run.runId, status: "succeeded" });
   });
 
   test("untrusted local_path runs are rejected", async () => {

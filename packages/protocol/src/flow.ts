@@ -140,7 +140,8 @@ export function wrapUntrustedText(text: string): string {
 const stepBase = {
   id: z.string().regex(ID_RE, "step id must match /^[a-z][a-z0-9_]*$/"),
   name: z.string().min(1),
-  timeoutSec: z.number().int().positive().default(1800),
+  /** `0` means no timeout: the step runs until it finishes or the run is cancelled. */
+  timeoutSec: z.number().int().min(0).default(1800),
 };
 
 export const PromptStep = z.object({
@@ -193,13 +194,13 @@ export const GitHubPrStep = z.object({
  * Pauses the run so the user can chat with the run's agent sessions from the web UI: the shared
  * ACP session of prompt/skill/command steps, or the resumable `omp -p` session of an earlier slash
  * step. On continue, the latest result of the selected session becomes this step's output.
- * No `timeoutSec` means wait until answered or cancelled; otherwise each wait for the user is capped.
+ * No `timeoutSec` (or `0`) means wait until answered or cancelled; otherwise each wait for the user is capped.
  */
 export const InterventionStep = z.object({
   ...stepBase,
   kind: z.literal("intervention"),
   message: z.string().optional(),
-  timeoutSec: z.number().int().positive().optional(),
+  timeoutSec: z.number().int().min(0).optional(),
 });
 /**
  * Posts the output of `bodyFrom` as a comment on the issue or pull request of input `target` (a required

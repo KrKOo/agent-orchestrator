@@ -50,6 +50,8 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   `{{steps.<gate>.output}}`; later agent steps keep the chat in their context when they share the session.
   While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
   while a reply is generated. Without a timeout the run waits until answered or cancelled.
+- **Every step takes `timeoutSec`; `0` disables the timeout** — the step runs until it finishes or the run is
+  cancelled (for intervention steps this is the same as leaving the field empty). The default is 1800 (30 min).
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
   (header button) re-runs the first step that did not succeed (the last step if all did) and continues to the end;
   **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
