@@ -81,7 +81,8 @@ describe("GitHub auth mode", () => {
     expect((await app.request("/api/flows", { headers: cookieHeader(cookie) })).status).toBe(200);
     expect(await (await app.request("/api/me", { headers: cookieHeader(cookie) })).json()).toEqual({ authMode: "github", user: ALICE });
 
-    const tampered = cookie.replace(/.$/, (c) => (c === "A" ? "B" : "A"));
+    // First signature char: all 6 bits significant (the last char of a 32-byte HMAC has 2 padding bits a decoder ignores).
+    const tampered = cookie.replace(/\.(.)/, (_, c: string) => `.${c === "A" ? "B" : "A"}`);
     expect((await app.request("/api/flows", { headers: cookieHeader(tampered) })).status).toBe(401);
     // Logins removed from allowedLogins lose access even with a valid cookie.
     const bob = { id: "2002", login: "bob" };

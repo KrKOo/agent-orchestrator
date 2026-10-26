@@ -41,6 +41,10 @@ export interface RunRow {
   runnerId: string | null;
   createdBy: string | null;
   triggerKind: "manual" | "github";
+  /** Display name: set at creation, or agent-generated from the inputs (`autoName`) once assigned. */
+  name: string | null;
+  /** The run asked its runner's model for a name; `name` stays null until it reports one. */
+  autoName: boolean;
   github: RunGitHubInfo | null;
   error: string | null;
   createdAt: number;

@@ -1,6 +1,7 @@
 import {
   PR_DIFF_PATH,
   pullRequestInputOf,
+  UNTRUSTED_PREAMBLE,
   wrapUntrustedText,
   type FlowDefinition,
   type PullRequestInput,
@@ -55,6 +56,40 @@ export function pullRequestInput(pr: PullRequestInfo): PullRequestInput {
   };
 }
 
+/** Manual naming chosen at creation: a fixed name, or `autoName` to have the runner's model pick one. */
+export interface RunName {
+  /** User-provided display name; takes precedence (mutually exclusive with `autoName`). */
+  name?: string;
+  /** Ask the assigned runner's model to generate a name from the inputs. */
+  autoName?: boolean;
+}
+
+/**
+ * Composes the headless prompt the runner runs to name the run: flow name plus one line per input.
+ * GitHub titles and text inputs are untrusted data, so each is wrapped and truncated; the instruction
+ * pins the answer to a short name so models do not narrate.
+ */
+export function runNamePrompt(def: FlowDefinition, inputs: Record<string, unknown>): string {
+  const lines: string[] = [UNTRUSTED_PREAMBLE, `Flow: ${def.name}`];
+  for (const input of def.inputs) {
+    const value = inputs[input.key];
+    let text: string | null = null;
+    if (typeof value === "object" && value !== null) {
+      const v = value as { title?: unknown; url?: unknown; repo?: unknown; number?: unknown };
+      if (typeof v.title === "string" && typeof v.url === "string" && typeof v.repo === "string" && typeof v.number === "number") {
+        text = `${v.repo}#${v.number} (${v.url}): ${v.title}`;
+      }
+    } else if (typeof value === "string" && value.trim()) {
+      text = value.trim();
+    }
+    if (text !== null) lines.push(`${input.label || input.key}: ${wrapUntrustedText(text.length > 200 ? `${text.slice(0, 200)}…` : text)}`);
+  }
+  lines.push(
+    "Reply with a short human-readable name for this run only (max 6 words, no quotes, no explanation, no list).",
+  );
+  return lines.join("\n");
+}
+
 /**
  * Inserts a run of `flow` with resolved `inputs` and one pending row per step. A flow with a pull request
  * input yields an untrusted run whose `runs.github` pins that PR (checkout, check run, review, per-repo cap).
@@ -65,6 +100,7 @@ export function insertRun(
   flow: { id: string; version: number; definition: FlowDefinition },
   inputs: Record<string, unknown>,
   origin: RunOrigin,
+  name: RunName = {},
 ): string | null {
   const prDef = pullRequestInputOf(flow.definition);
   const pr = prDef ? (inputs[prDef.key] as PullRequestInput) : undefined;
@@ -95,6 +131,8 @@ export function insertRun(
             }
           : {}),
         createdAt: Date.now(),
+        name: name.name ?? null,
+        autoName: name.autoName ?? false,
       })
       .onConflictDoNothing()
       .returning({ id: runs.id })

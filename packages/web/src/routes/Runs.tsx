@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router";
 import { api, errorMessage } from "../api";
-import { formatDuration, formatTime, PrLink, StatusChip } from "../ui";
+import { formatDuration, formatTime, githubRefsOf, IssueLink, PrLink, StatusChip } from "../ui";
 
 export function Runs() {
   const [params, setParams] = useSearchParams();
@@ -33,6 +33,7 @@ export function Runs() {
             <tr>
               <th>Status</th>
               <th>Flow</th>
+              <th>Name</th>
               <th>Run</th>
               <th>Trigger</th>
               <th>Created</th>
@@ -53,6 +54,24 @@ export function Runs() {
                   <Link className="mono" to={`/runs/${r.id}`}>
                     {r.id}
                   </Link>
+                </td>
+                <td>
+                  {(() => {
+                    if (r.name) return <span>{r.name}</span>;
+                    const refs = githubRefsOf(r);
+                    if (refs.length > 0) {
+                      return (
+                        <>
+                          {refs.map((ref) => (
+                            <div key={ref.url}>
+                              <IssueLink githubRef={ref} />
+                            </div>
+                          ))}
+                        </>
+                      );
+                    }
+                    return <span className="muted">—</span>;
+                  })()}
                 </td>
                 <td>
                   <span className="tag">{r.triggerKind}</span>
