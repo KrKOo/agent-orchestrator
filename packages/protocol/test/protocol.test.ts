@@ -4,6 +4,7 @@ import {
   isActionStep,
   isAgentStep,
   renderTemplate,
+  RunEvent,
   TemplateError,
   templateRefs,
   templateVariables,
@@ -403,5 +404,14 @@ describe("templateVariables", () => {
     expect(paths).toContain("inputs.pr.diffPath");
     expect(paths).toContain("steps.review.structured");
     expectAllValid(def, 1);
+  });
+});
+
+describe("RunEvent", () => {
+  test("parses run.name and rejects an empty or oversized name", () => {
+    const base = { runId: "r1", seq: 1, ts: 1 };
+    expect(RunEvent.parse({ ...base, type: "run.name", payload: { name: "Boot fix" } }).payload).toEqual({ name: "Boot fix" });
+    expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "" } }).success).toBe(false);
+    expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "x".repeat(201) } }).success).toBe(false);
   });
 });

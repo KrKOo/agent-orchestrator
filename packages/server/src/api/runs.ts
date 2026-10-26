@@ -20,7 +20,16 @@ import { issueMessages, readJson } from "./util";
 
 const { flows, runs, runSteps, findings } = schema;
 
-const CreateRunBody = z.object({ inputs: z.record(z.string(), z.string()).optional() });
+const CreateRunBody = z
+  .object({
+    inputs: z.record(z.string(), z.string()).optional(),
+    name: z.string().trim().min(1).max(120).optional(),
+    autoName: z.boolean().optional(),
+  })
+  .refine((b) => !(b.name !== undefined && b.autoName), {
+    message: "Pass either name or autoName, not both",
+    path: ["name"],
+  });
 const PermissionBody = z.object({ optionId: z.string().min(1).nullable() });
 const RetryBody = z.object({ fromStepId: z.string().min(1).optional() });
 const ElicitationBody = z.object({ action: ElicitationAction, content: z.record(z.string(), z.unknown()).optional() });
@@ -118,7 +127,13 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       return c.json({ error: 'Flow forkPolicy is "skip": fork and first-time-contributor pull requests never run' }, 403);
     }
 
-    const id = insertRun(deps, flow, resolved.inputs, { triggerKind: "manual", createdBy: c.get("user")?.id ?? null, status });
+    const id = insertRun(
+      deps,
+      flow,
+      resolved.inputs,
+      { triggerKind: "manual", createdBy: c.get("user")?.id ?? null, status },
+      { ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}), ...(parsed.data.autoName ? { autoName: true } : {}) },
+    );
     if (id === null) throw new Error("unreachable: manual runs have no dedupe key");
     const github = deps.runs.get(id)!.github;
     if (github) {

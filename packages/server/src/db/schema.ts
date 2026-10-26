@@ -31,6 +31,10 @@ export const runs = sqliteTable(
     finishedAt: integer("finished_at"),
     /** Set while a retried run is non-terminal: the step idx it restarts from (cleared on terminal). */
     resumeFrom: integer("resume_from"),
+    /** Display name: set at creation, or agent-generated (`autoName`) once a runner reports `run.name`. */
+    name: text("name"),
+    /** The run asked its runner's model for a name; `name` stays null until the `run.name` event. */
+    autoName: integer("auto_name", { mode: "boolean" }).notNull().default(false),
     /**
      * Set while a retried run resuming a `local_path` workspace past step 1 is non-terminal: the runner
      * that ran the previous attempt (it holds the worktree); only it may take the run (cleared on terminal).

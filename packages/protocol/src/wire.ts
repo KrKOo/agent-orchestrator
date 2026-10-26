@@ -52,6 +52,12 @@ export const AssignedRun = z.object({
    * (they belong to the previous attempt) and continues its seq counter at `max(own counter + 1, seqFrom)`.
    */
   seqFrom: z.number().int().min(1).optional(),
+  /**
+   * Present when the run has no name yet and `autoName` was requested: the runner asks the harness
+   * model this prompt headlessly (`omp -p --no-session`) and reports the answer as a `run.name` event.
+   * Stripped by older runners' zod schemas; a failed naming attempt never fails the run.
+   */
+  namePrompt: z.string().min(1).optional(),
 });
 export type AssignedRun = z.infer<typeof AssignedRun>;
 

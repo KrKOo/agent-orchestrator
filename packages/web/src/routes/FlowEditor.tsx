@@ -513,8 +513,11 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
   const [values, setValues] = useState<Record<string, string>>(() =>
     Object.fromEntries(defs.map((d) => [d.key, ""])),
   );
+  const [name, setName] = useState("");
+  const [autoName, setAutoName] = useState(false);
   const start = useMutation({
-    mutationFn: () => api.startRun(flow.id, values),
+    mutationFn: () =>
+      api.startRun(flow.id, values, autoName ? { autoName: true } : name.trim() ? { name: name.trim() } : {}),
     onSuccess: (run) => {
       qc.invalidateQueries({ queryKey: ["runs"] });
       navigate(`/runs/${run.id}`);
@@ -542,6 +545,20 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
         </>
       }
     >
+      <label className="field">
+        <span>Run name</span>
+        <input
+          type="text"
+          placeholder="Optional — shown on the Runs page"
+          value={autoName ? "" : name}
+          disabled={autoName}
+          onChange={(e) => setName(e.target.value)}
+        />
+      </label>
+      <label className="field inline">
+        <input type="checkbox" checked={autoName} onChange={(e) => setAutoName(e.target.checked)} />
+        <span>Generate the name with an agent from the inputs</span>
+      </label>
       {defs.length === 0 && <p className="muted">This flow has no inputs.</p>}
       {defs.map((d) => (
         <label key={d.key} className="field">

@@ -20,6 +20,41 @@ export function PrLink({ github }: { github: RunGitHubInfo }) {
   );
 }
 
+/** One GitHub issue/PR resolved from the run's inputs, for runs the server has no `github` row for. */
+export interface GithubRef {
+  kind: "issue" | "pull_request";
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+}
+
+/**
+ * Pairs the flow definition's `github_issue`/`github_pull_request` inputs with the resolved run inputs.
+ * Purely derived client-side: the server stores GitHub inputs opaquely in `run.inputs`.
+ */
+export function githubRefsOf(run: { definition: { inputs: { key: string; type: string }[] }; inputs: Record<string, unknown> }): GithubRef[] {
+  const refs: GithubRef[] = [];
+  for (const def of run.definition.inputs) {
+    if (def.type !== "github_issue" && def.type !== "github_pull_request") continue;
+    const value = run.inputs[def.key];
+    if (typeof value !== "object" || value === null) continue;
+    const v = value as { repo?: unknown; number?: unknown; title?: unknown; url?: unknown };
+    if (typeof v.repo !== "string" || typeof v.number !== "number" || typeof v.title !== "string" || typeof v.url !== "string") continue;
+    refs.push({ kind: def.type as "issue" | "pull_request", repo: v.repo, number: v.number, title: v.title, url: v.url });
+  }
+  return refs;
+}
+
+/** `owner/name#123 — title` linked to the issue or pull request. */
+export function IssueLink({ githubRef: r }: { githubRef: GithubRef }) {
+  return (
+    <a className="pr-link" href={r.url} target="_blank" rel="noreferrer" title={r.title}>
+      {r.repo}#{r.number} — {r.title}
+    </a>
+  );
+}
+
 export function formatTime(ts: number | null | undefined): string {
   if (!ts) return "—";
   const d = new Date(ts);

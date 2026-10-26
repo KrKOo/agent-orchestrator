@@ -186,6 +186,44 @@ describe("Scheduler.kick", () => {
     }
   });
 
+  test("autoName runs carry namePrompt until a run.name event sets the name; named runs never do", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const flow = flowDef({
+      inputs: [
+        { key: "issue", label: "Issue", type: "github_issue" },
+        { key: "note", label: "Note", type: "text", required: false },
+      ],
+    });
+    const auto = addRun(deps, {
+      definition: flow,
+      autoName: true,
+      inputs: { issue: { url: "https://github.com/acme/app/issues/42", repo: "acme/app", number: 42, title: "Crash on boot", body: "" }, note: "" },
+    });
+    const named = addRun(deps, { definition: flow, name: "manual name", autoName: true });
+
+    deps.scheduler.kick();
+
+    const autoAssign = link.of("job.assign").find((m) => m.run.runId === auto)!;
+    expect(autoAssign.run.namePrompt).toContain("test flow");
+    expect(autoAssign.run.namePrompt).toContain("Crash on boot");
+    expect(autoAssign.run.namePrompt).toContain("untrusted");
+    expect(link.of("job.assign").find((m) => m.run.runId === named)!.run.namePrompt).toBeUndefined();
+
+    // Once named (e.g. on a retry after a first attempt), the prompt disappears. The run must be
+    // terminal to be retryable, and the same runner link is reused (re-inserting r1 would hit the PK).
+    deps.runs.ingest(auto, [{ runId: auto, seq: 1, ts: 1, type: "run.name", payload: { name: "Boot fix" } }]);
+    expect(deps.runs.get(auto)).toMatchObject({ name: "Boot fix" });
+    deps.runs.terminate(auto, "failed", "runner lost");
+    expect(deps.runs.retry(auto, 0)).toEqual({ ok: true });
+    deps.hub.detachRunner("r1", link);
+    deps.hub.attachRunner("r1", link);
+    deps.hub.setReplayed(link, true);
+    deps.scheduler.kick();
+    const reassign = link.of("job.assign").filter((m) => m.run.runId === auto)[1]!;
+    expect(reassign.run.namePrompt).toBeUndefined();
+  });
+
   test("leaves runs queued when only ineligible runners are online", () => {
     const deps = testDeps();
     const link = connectRunner(deps, "r1", caps({ labels: ["linux"] }));

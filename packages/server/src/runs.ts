@@ -1,5 +1,5 @@
 import { RETRYABLE_STATUSES, TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
-import { and, eq, gte, max, type ExtractTablesWithRelations } from "drizzle-orm";
+import { and, eq, gte, isNull, max, type ExtractTablesWithRelations } from "drizzle-orm";
 import type { SQLiteBunTransaction } from "drizzle-orm/bun-sqlite/session";
 import { schema, type Db } from "./db";
 import type { Hub } from "./hub";
@@ -214,6 +214,11 @@ export class RunService {
             ruleId: f.ruleId ?? null,
           })
           .run();
+        return;
+      }
+      case "run.name": {
+        // First write wins: manual names are never overwritten, duplicate events are no-ops.
+        tx.update(runs).set({ name: ev.payload.name }).where(and(eq(runs.id, ev.runId), isNull(runs.name))).run();
         return;
       }
       default:

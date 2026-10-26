@@ -90,6 +90,8 @@ export interface LogLine {
 export interface RunViewState {
   lastSeq: number;
   status?: RunStatus;
+  /** Run name, set by a `run.name` event (agent-generated naming). */
+  name?: string;
   error?: string;
   workspace?: WorkspaceInfo;
   currentStepId?: string;
@@ -237,6 +239,8 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
     }
     case "step.started":
       return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) => resetAttempt(st, "running"));
+    case "run.name":
+      return { ...s, name: ev.payload.name };
     case "step.finished":
       return withStep(s, ev.stepId, (st) => ({
         ...st,

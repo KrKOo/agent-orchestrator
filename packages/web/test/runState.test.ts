@@ -112,3 +112,13 @@ describe("applyRunEvents", () => {
     expect(restarted.steps.c).toMatchObject({ status: "running", output: undefined, structured: undefined, error: undefined });
   });
 });
+
+describe("run.name", () => {
+  test("a run.name event sets the state's name", () => {
+    seq = 0;
+    const state = applyRunEvents(initialRunViewState, [ev({ type: "run.name", payload: { name: "Boot fix" } })]);
+    expect(state.name).toBe("Boot fix");
+    const again = applyRunEvents(state, [ev({ type: "run.name", payload: { name: "Better name" } })]);
+    expect(again.name).toBe("Better name");
+  });
+});

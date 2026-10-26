@@ -105,6 +105,36 @@ describe("runs API", () => {
     expect((await call("GET", "/api/runs?flowId=other")).json).toEqual([]);
   });
 
+  test("runs accept a name or autoName at creation, never both, and expose both on the row", async () => {
+    const deps = testDeps();
+    connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const flow = (await call("POST", "/api/flows", {
+      ...flowBody,
+      inputs: [{ key: "note", label: "Note", type: "text", required: false }],
+      steps: [{ id: "impl", name: "Implement", kind: "prompt", prompt: "Do {{inputs.note}}" }],
+    })).json as FlowRow;
+    const start = (body: Record<string, unknown>) => call("POST", `/api/flows/${flow.id}/runs`, body);
+
+    const named = await start({ name: "Fix the crash", inputs: {} });
+    expect(named.status).toBe(201);
+    expect(named.json).toMatchObject({ name: "Fix the crash", autoName: false });
+
+    const auto = await start({ autoName: true, inputs: {} });
+    expect(auto.status).toBe(201);
+    expect(auto.json).toMatchObject({ name: null, autoName: true });
+
+    const both = await start({ name: "x", autoName: true, inputs: {} });
+    expect(both.status).toBe(400);
+    expect(both.json.errors[0]).toContain("name or autoName");
+
+    const tooLong = await start({ name: "x".repeat(121), inputs: {} });
+    expect(tooLong.status).toBe(400);
+
+    const plain = await start({ inputs: {} });
+    expect(plain.json).toMatchObject({ name: null, autoName: false });
+  });
+
   test("cancel: queued runs end immediately, held runs get job.cancel and a server-side fallback", async () => {
     const deps = testDeps();
     const link = connectRunner(deps, "r1", caps());

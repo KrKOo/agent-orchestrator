@@ -1174,6 +1174,9 @@ pre.output-card-body {
   white-space: nowrap;
   margin-left: 4px;
 }
+.run-name {
+  font-weight: 600;
+}
 .token-panel {
   margin-bottom: 16px;
   padding: 10px 12px;

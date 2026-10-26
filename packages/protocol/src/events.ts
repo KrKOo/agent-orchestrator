@@ -69,6 +69,11 @@ export const RunEvent = z.discriminatedUnion("type", [
   z.object({ ...base, type: z.literal("step.started"), payload: z.object({}) }),
   z.object({
     ...base,
+    type: z.literal("run.name"),
+    payload: z.object({ name: z.string().min(1).max(200) }),
+  }),
+  z.object({
+    ...base,
     type: z.literal("step.finished"),
     payload: z.object({
       status: z.enum(["succeeded", "failed", "cancelled"]),

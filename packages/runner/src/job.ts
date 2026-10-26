@@ -34,7 +34,7 @@ import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
 import { OmpJsonTranslator } from "./omp-json";
-import type { Mount, Sandbox, SandboxProvider } from "./sandbox/types";
+import type { Mount, Sandbox, SandboxProcess, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
 import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
 
@@ -150,6 +150,58 @@ function firstLine(text: string): string {
 
 /** Container dir name for a skill (`/orch/skills/<dir>`). */
 const skillDirName = (name: string) => name.replace(/[^\w.-]/g, "_");
+
+/** Time the agent-naming side quest gets before it is abandoned (the run itself proceeds unnamed). */
+const NAME_TIMEOUT_MS = 60_000;
+
+/**
+ * Asks the harness model for a run name with one headless `omp -p --no-session` call inside the run's
+ * sandbox. Emits no `acp.update`/`sandbox.log`: naming is not part of the run's transcript. Returns the
+ * first non-empty line of the reply, or null on failure/timeout — naming must never fail a run.
+ */
+async function nameRun(prompt: string, sandbox: Sandbox, adapter: { printArgv(resume?: string): string[] }, hostPath: string, signal: AbortSignal): Promise<string | null> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), NAME_TIMEOUT_MS);
+  // Cancelling the run aborts naming too, so the runner is free at once (the finally kills the process).
+  const onCancel = () => abort.abort();
+  signal.addEventListener("abort", onCancel, { once: true });
+  let proc: SandboxProcess | undefined;
+  try {
+    // `--` stops omp flag parsing so args cannot inject launch flags; the text stays one argv element.
+    proc = sandbox.exec([...adapter.printArgv(undefined), "--no-session", "--", prompt], hostPath);
+    // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
+    void proc.stdin.close();
+    const drain = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
+      const decoder = new TextDecoder();
+      let text = "";
+      for await (const chunk of stream) text += decoder.decode(chunk, { stream: true });
+      return text;
+    };
+    const translator = new OmpJsonTranslator();
+    // Updates are discarded; only the translator's final result text matters.
+    const [, , exitCode] = await rejectWhenAborted(
+      Promise.all([
+        drain(proc.stdout).then((text) => {
+          for (const update of translator.push(text)) void update;
+        }),
+        drain(proc.stderr),
+        proc.exited,
+      ]),
+      abort.signal,
+    );
+    if (abort.signal.aborted || exitCode !== 0) return null;
+    for (const update of translator.end()) void update; // flush a trailing partial NDJSON line
+    const name = firstLine(plainText(translator.result() ?? ""));
+    return name ? name.slice(0, 200) : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onCancel);
+    // No-op after a normal exit; on timeout or cancellation it stops the stray naming run.
+    proc?.kill();
+  }
+}
 
 function rejectWhenAborted<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
   const { promise, resolve, reject } = Promise.withResolvers<T>();
@@ -662,6 +714,15 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         memoryMb: def.sandbox.memoryMb,
       });
       checkCancelled();
+
+      // Agent naming: the assigned runner owns the model gateway, so it names the run before step 1.
+      // Failure or timeout only skips the name; the run proceeds (and may be named on a later retry).
+      if (run.namePrompt && sandbox && workspace) {
+        const name = await nameRun(run.namePrompt, sandbox, adapter, workspace.hostPath, signal);
+        if (name) emit({ type: "run.name", payload: { name } });
+        else console.warn(`[job ${runId}] naming skipped (no name within ${NAME_TIMEOUT_MS / 1000}s or omp -p failed)`);
+        checkCancelled();
+      }
 
       tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId), { fromEnd: resume !== undefined });
       tail.start();

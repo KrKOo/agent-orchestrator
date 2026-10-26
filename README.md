@@ -50,6 +50,13 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   `{{steps.<gate>.output}}`; later agent steps keep the chat in their context when they share the session.
   While it waits for you the run status is `awaiting_input` (it still holds its runner slot); it is `running` again
   while a reply is generated. Without a timeout the run waits until answered or cancelled.
+- **Run names** identify runs on the Runs page. Give one in the Run dialog (`name` on
+  `POST /api/flows/<id>/runs`, ≤120 chars), or check **Generate the name with an agent** (`autoName`) and the
+  runner that picks up the run asks the flow's model to name it from the flow and its inputs before step 1 —
+  one headless `omp -p --no-session` prompt, its first reply line becomes the run's name. Naming never fails a
+  run: if it times out (60s) or errors the run proceeds unnamed until a later retry names it. The Runs page and
+  run view also identify runs by their GitHub inputs — issue and PR links are derived from the resolved inputs,
+  so a queued issue run is recognizable before it even starts.
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
   (header button) re-runs the first step that did not succeed (the last step if all did) and continues to the end;
   **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
