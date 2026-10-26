@@ -178,6 +178,17 @@ export const GitCommitStep = z.object({
   kind: z.literal("git_commit"),
   messageFrom: z.string().min(1),
 });
+/**
+ * Runs a templated command as `bash -c <rendered command>` inside the sandbox at the workspace path.
+ * Template values are rendered as environment variables (`renderShellCommand`), so untrusted text in
+ * them stays data. Stdout is the step output (`{{steps.<id>.output}}`); stderr streams to the run log.
+ * A non-zero exit fails the step. Not available in flows with a pull request input.
+ */
+export const ShellStep = z.object({
+  ...stepBase,
+  kind: z.literal("shell"),
+  command: z.string().min(1),
+});
 export const GitPushStep = z.object({
   ...stepBase,
   kind: z.literal("git_push"),
@@ -219,6 +230,7 @@ export const Step = z.discriminatedUnion("kind", [
   SkillStep,
   CommandStep,
   SlashStep,
+  ShellStep,
   GitCommitStep,
   GitPushStep,
   GitHubPrStep,
@@ -230,7 +242,7 @@ export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 /** Steps that change the local workspace's repository or its GitHub remote; need a writable worktree. */
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "git_commit", "git_push", "github_pr", "intervention", "github_comment"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "shell", "git_commit", "git_push", "github_pr", "intervention", "github_comment"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
@@ -242,7 +254,7 @@ export function isActionStep(step: Step): step is ActionStep {
 
 /** Steps whose output is free text a later step can take whole (`bodyFrom` of `github_comment`). */
 export function isTextStep(step: Step): boolean {
-  return isAgentStep(step) || step.kind === "slash" || step.kind === "intervention";
+  return isAgentStep(step) || step.kind === "slash" || step.kind === "shell" || step.kind === "intervention";
 }
 
 /** The flow's `github_pull_request` input; a flow declares at most one. */
@@ -281,6 +293,8 @@ export function stepTemplates(step: Step): [string, string][] {
     case "command":
     case "slash":
       return step.args === undefined ? [] : [["args", step.args]];
+    case "shell":
+      return [["command", step.command]];
     case "intervention":
       return step.message === undefined ? [] : [["message", step.message]];
     default:
@@ -420,13 +434,16 @@ export function validateFlow(input: unknown): ValidateResult {
         errors.push(`${where}: ${step.kind} requires workspace isolation "worktree" with access "rw"`);
       }
     }
+    if (step.kind === "shell" && prFlow) {
+      errors.push(`${where}: flows with a pull request input cannot contain shell steps`);
+    }
     if (step.kind === "github_comment") {
       const target = inputs.get(step.target);
       if (!target || target.type === "text" || !target.required) {
         errors.push(`${where}.target: "${step.target}" must be a required github_issue or github_pull_request input`);
       }
       if (!textSteps.has(step.bodyFrom)) {
-        errors.push(`${where}.bodyFrom: "${step.bodyFrom}" must be an earlier prompt/skill/command/slash/intervention step`);
+        errors.push(`${where}.bodyFrom: "${step.bodyFrom}" must be an earlier prompt/skill/command/slash/shell/intervention step`);
       }
     }
     const refFields: [string, string][] =

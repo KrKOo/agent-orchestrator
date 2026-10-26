@@ -14,6 +14,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   skill: "Skill",
   command: "Command",
   slash: "Slash command",
+  shell: "Shell command",
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
@@ -26,6 +27,7 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   skill: "🧠",
   command: "⌨️",
   slash: "💬",
+  shell: "🖥️",
   git_commit: "✅",
   git_push: "⏫",
   github_pr: "🚀",
@@ -285,6 +287,22 @@ export function StepPanel({
           onChange={(args) => set({ args: args === "" ? undefined : args })}
         />
       )}
+      {step.kind === "shell" && (
+        <>
+          <TemplateField
+            label="Command"
+            rows={6}
+            value={step.command}
+            vars={vars}
+            onChange={(command) => set({ command })}
+          />
+          <p className="muted small">
+            Runs as <code>bash -c</code> in the sandbox at the workspace path. Stdout becomes{" "}
+            <code>{`{{steps.${step.id}.output}}`}</code>; stderr streams to the run log. A non-zero exit fails
+            the step. Not available in pull-request flows.
+          </p>
+        </>
+      )}
       {isAgentStep(step) && (
         <label className="check">
           <input
@@ -338,7 +356,7 @@ export function StepPanel({
           </label>
           {refSelect("Comment body from", step.bodyFrom, "bodyFrom", {
             steps: earlierSteps.filter(isTextStep),
-            noun: "prompt, skill, command, slash or intervention step",
+            noun: "prompt, skill, command, slash, shell or intervention step",
           })}
           <p className="muted small">Posts the body as a comment (mentions neutralized); the step output is the comment URL.</p>
         </>

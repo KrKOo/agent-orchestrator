@@ -59,6 +59,8 @@ function newStep(kind: StepKind, id: string, earlier: Step[], inputs: FlowDefini
       return { ...base, kind, command: "", freshSession: false };
     case "slash":
       return { ...base, kind, command: "" };
+    case "shell":
+      return { ...base, kind, command: "" };
     case "git_commit":
       return { ...base, kind, messageFrom: lastAgent };
     case "git_push":
@@ -194,6 +196,8 @@ function stepSubtitle(step: Step): string {
       return step.command ? `/${step.command}` : "(no command chosen)";
     case "slash":
       return step.command ? `/${step.command} (headless)` : "(no command chosen)";
+    case "shell":
+      return step.command.split("\n")[0] || "(empty command)";
     case "git_commit":
       return `message from ${step.messageFrom || "?"}`;
     case "git_push":
@@ -499,6 +503,7 @@ const KIND_HELP: Record<StepKind, string> = {
   skill: "Apply a skill from the runner library",
   command: "Run a command template with arguments",
   slash: "Run a built-in omp slash command (e.g. review, plan) headless",
+  shell: "Run a bash command in the sandbox; its stdout feeds later steps",
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",

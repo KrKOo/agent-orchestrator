@@ -61,7 +61,7 @@ export function Transcript({ step }: { step: StepView }) {
 }
 
 /** A finished step's error and outputs, always expanded, labelled with the template reference later steps use. */
-export function StepResult({ step, stepId, markdown }: { step: StepView; stepId: string; markdown: boolean }) {
+export function StepResult({ step, stepId, markdown, mono }: { step: StepView; stepId: string; markdown: boolean; mono?: boolean }) {
   const hasOutput = step.output !== undefined && step.output !== "";
   if (!step.error && !hasOutput && step.structured === undefined) return null;
   return (
@@ -73,7 +73,7 @@ export function StepResult({ step, stepId, markdown }: { step: StepView; stepId:
             <strong>Output</strong>
             <code className="small">{`{{steps.${stepId}.output}}`}</code>
           </div>
-          <LongText className={markdown ? "output-card-body" : "output-card-body mono"} text={step.output!} markdown={markdown} />
+          <LongText className={mono || !markdown ? "output-card-body mono" : "output-card-body"} text={step.output!} markdown={markdown} />
         </section>
       )}
       {step.structured !== undefined && (
