@@ -82,7 +82,8 @@ Its fields are `{{inputs.<key>.url|repo|number|title|body|baseSha|headSha|diffPa
 - runs untrusted, on runners with `acceptUntrusted: true`: approval `auto`, no `open` network, no git commit/push/PR steps.
 
 **`github_comment` steps** work in any flow: they post the output of an earlier prompt/skill/command/slash/intervention step
-(`bodyFrom`) as a comment on the issue or pull request of a required `github_issue`/`github_pull_request` input (`target`).
+(`bodyFrom` accepts `"<stepId>"`, `"<stepId>.output"` or `"<stepId>.structured.<field>"`) as a comment on the issue or pull
+request of a required `github_issue`/`github_pull_request` input (`target`).
 The server posts it with its own credentials (mentions neutralized); the target comes from the run's resolved inputs, never
 from the agent. The step's output is the comment URL.
 
@@ -95,6 +96,45 @@ PR input (other inputs must be optional and stay empty). Fork and first-time-con
 webhook events and manual starts alike (default `require_approval`; approve them from the run view; `skip` rejects a manual
 start). Flows with a manual trigger have no policy. With `postChecks` (default `true`), runs of PR-triggered flows — webhook
 or manual — publish a check run on the PR head with progress and finding annotations.
+
+## Structured output
+
+Prompt, skill and command steps can declare a structured-output contract: `structured: {fields: [{name, description}, …]}`
+(up to 32 fields; names match `/^[a-z][a-z0-9_]*$/`, every field required, any JSON value per field). The runner appends an
+instruction to the step's prompt telling the agent to call the `submit_output` MCP tool with a JSON object of those
+fields, and the tool's schema (what the model sees) is generated from the declaration (every declared field is required;
+extra keys are allowed and kept). Validation is self-correcting: a
+missing field comes back as a tool error naming what to add. If the agent finishes without calling `submit_output`, the step
+fails with an explicit error (retryable from the run view).
+
+Later steps consume the result as `{{steps.<id>.structured.<field>}}` in templates (string fields render raw, objects as
+JSON) and as dotted refs in `*From` fields: `git_commit.messageFrom`, `github_pr.titleFrom`/`bodyFrom` and
+`github_comment.bodyFrom` accept `"<stepId>"`, `"<stepId>.output"`, or `"<stepId>.structured.<field>"` — e.g. a PR-title flow:
+
+```yaml
+steps:
+  - id: gen
+    kind: prompt
+    name: Generate
+    prompt: "Draft the PR title and body for {{inputs.issue.title}}."
+    structured:
+      fields:
+        - { name: title, description: "One-line PR title" }
+        - { name: body, description: "Full PR description" }
+  - id: push
+    kind: git_push
+    name: Push
+  - id: pr
+    kind: github_pr
+    name: PR
+    titleFrom: gen.structured.title
+    bodyFrom: gen.structured.body
+```
+
+When a step declares fields, the editor's variable picker offers each `steps.<id>.structured.<field>` (and `*From` selects
+validate against the declared names). Steps without a declaration keep the permissive `steps.<id>.structured` access, so
+older flows and replayed run data keep working. Slash steps are text-only: they run headless (`omp -p`) without the MCP
+server.
 
 GitHub App settings:
 - **Permissions:** Checks RW, Pull requests RW, Contents R, Issues RW (comments on issues), Metadata R.

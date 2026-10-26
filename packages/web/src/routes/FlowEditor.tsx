@@ -495,7 +495,7 @@ export function FlowEditor() {
 }
 
 const KIND_HELP: Record<StepKind, string> = {
-  prompt: "Send a templated prompt to the agent",
+  prompt: "Send a templated prompt to the agent; optionally declare structured output fields (submit_output)",
   skill: "Apply a skill from the runner library",
   command: "Run a command template with arguments",
   slash: "Run a built-in omp slash command (e.g. review, plan) headless",

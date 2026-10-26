@@ -137,6 +137,24 @@ export function wrapUntrustedText(text: string): string {
   return `<untrusted_pr_text>\n${text}\n</untrusted_pr_text>`;
 }
 
+/**
+ * Structured-output contract for an agent step: the agent must call `submit_output` with a JSON object
+ * containing at least these fields (any JSON value per field; every field required; extra keys are allowed and preserved). Later steps consume it
+ * as `{{steps.<id>.structured.<field>}}` or `"<stepId>.structured.<field>"` in `*From` refs.
+ */
+export const StructuredOutput = z.object({
+  fields: z
+    .array(
+      z.object({
+        name: z.string().regex(ID_RE, "field name must match /^[a-z][a-z0-9_]*$/"),
+        description: z.string().min(1),
+      }),
+    )
+    .min(1, "list at least one field")
+    .max(32, "at most 32 fields"),
+});
+export type StructuredOutput = z.infer<typeof StructuredOutput>;
+
 const stepBase = {
   id: z.string().regex(ID_RE, "step id must match /^[a-z][a-z0-9_]*$/"),
   name: z.string().min(1),
@@ -149,6 +167,7 @@ export const PromptStep = z.object({
   kind: z.literal("prompt"),
   prompt: z.string().min(1),
   freshSession: z.boolean().default(false),
+  structured: StructuredOutput.optional(),
 });
 export const SkillStep = z.object({
   ...stepBase,
@@ -156,6 +175,7 @@ export const SkillStep = z.object({
   skill: z.string().min(1),
   args: z.string().optional(),
   freshSession: z.boolean().default(false),
+  structured: StructuredOutput.optional(),
 });
 export const CommandStep = z.object({
   ...stepBase,
@@ -163,6 +183,7 @@ export const CommandStep = z.object({
   command: z.string().min(1),
   args: z.string().optional(),
   freshSession: z.boolean().default(false),
+  structured: StructuredOutput.optional(),
 });
 /** Built-in omp slash command (`/review`, `/plan`, …) run headless via `omp -p`; output is the step output. */
 export const SlashStep = z.object({
@@ -294,7 +315,12 @@ const INPUT_FIELDS: Record<Exclude<InputDef["type"], "text">, readonly string[]>
   github_pull_request: PR_INPUT_FIELDS,
 };
 
-function checkRef(ref: string, inputs: Map<string, InputDef>, earlier: Set<string>): string | null {
+function checkRef(
+  ref: string,
+  inputs: Map<string, InputDef>,
+  steps: Map<string, Step>,
+  earlier: Set<string>,
+): string | null {
   const parts = ref.split(".");
   if (parts[0] === "inputs") {
     const input = parts[1] === undefined ? undefined : inputs.get(parts[1]);
@@ -309,7 +335,16 @@ function checkRef(ref: string, inputs: Map<string, InputDef>, earlier: Set<strin
     const id = parts[1];
     if (id === undefined || !earlier.has(id)) return `references step "${id ?? ""}" which is not an earlier step`;
     if (parts[2] === "output" && parts.length === 3) return null;
-    if (parts[2] === "structured") return null;
+    if (parts[2] === "structured") {
+      if (parts.length === 3) return null;
+      const step = steps.get(id);
+      const fields = step && isAgentStep(step) && step.structured ? step.structured.fields.map((f) => f.name) : null;
+      // Without a declared spec the check stays permissive (back-compat; replayed resume data; nested paths like
+      // `steps.<id>.structured.files.0`). With a spec, validate the first path segment and allow deeper nesting.
+      if (fields === null) return null;
+      if (fields.includes(parts[3]!)) return null;
+      return `step "${id}" exposes only structured fields ${fields.map((f) => `steps.${id}.structured.${f}`).join(", ")}`;
+    }
     return `step reference must be steps.<id>.output or steps.<id>.structured[...]`;
   }
   return `must start with inputs. or steps.`;
@@ -347,7 +382,13 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
     if (!ID_RE.test(step.id)) continue;
     add(`steps.${step.id}.output`, `Text output of "${step.name}"`);
     if (isAgentStep(step)) {
-      add(`steps.${step.id}.structured`, `JSON "${step.name}" submitted via submit_output (append .<field> for a value)`);
+      if (step.structured) {
+        for (const f of step.structured.fields) {
+          add(`steps.${step.id}.structured.${f.name}`, `${f.description} (of "${step.name}" via submit_output)`);
+        }
+      } else {
+        add(`steps.${step.id}.structured`, `JSON "${step.name}" submitted via submit_output (append .<field> for a value)`);
+      }
     }
   }
   return Array.from(vars, ([path, description]) => ({ path, description }));
@@ -402,14 +443,55 @@ export function validateFlow(input: unknown): ValidateResult {
   const seen = new Set<string>();
   const agentSteps = new Set<string>();
   const textSteps = new Set<string>();
+  const stepById = new Map<string, Step>();
+  /** `*From` refs: `id` | `id.output` | `id.structured.<field>`; `.output` is the default.
+   * `sources` limits the referenced step kind (`agentSteps` by default; `github_comment.bodyFrom` takes text steps). */
+  const checkFromRef = (field: string, ref: string, where: string, sources: Set<string> = agentSteps, noun = "prompt/skill/command") => {
+    const [id, ...rest] = ref.split(".");
+    if (!id || !sources.has(id)) {
+      errors.push(`${where}.${field}: "${ref}" must be an earlier ${noun} step`);
+      return;
+    }
+    if (rest.length === 0) return;
+    if (rest.length === 1 && rest[0] === "output") return;
+    if (rest.length === 2 && rest[0] === "structured") {
+      const source = stepById.get(id);
+      const fields = source && isAgentStep(source) && source.structured ? source.structured.fields.map((f) => f.name) : null;
+      // Without a declared spec the check stays permissive (back-compat; replayed resume data) — but only for
+      // agent steps, the only kind that can declare structured output.
+      if (fields === null) {
+        if (source && isAgentStep(source)) return;
+        errors.push(`${where}.${field}: "${ref}" references structured output, which only prompt/skill/command steps can produce`);
+        return;
+      }
+      if (fields.includes(rest[1]!)) return;
+      errors.push(`${where}.${field}: step "${id}" exposes only structured fields ${fields.map((f) => `${id}.structured.${f}`).join(", ")}`);
+      return;
+    }
+    errors.push(`${where}.${field}: "${ref}" must be an earlier step id, optionally followed by .output or .structured.<field>`);
+  };
   let pushed = false;
   flow.steps.forEach((step, idx) => {
     const where = `steps.${idx} (${step.id})`;
     if (seen.has(step.id)) errors.push(`${where}: duplicate step id "${step.id}"`);
 
+    if (isAgentStep(step) && step.structured) {
+      const names = new Set<string>();
+      for (const [i, f] of step.structured.fields.entries()) {
+        if (names.has(f.name)) errors.push(`${where}.structured.fields[${i}]: duplicate field name "${f.name}"`);
+        names.add(f.name);
+      }
+    }
+    // Zod strips unknown keys, so the raw input decides whether `structured` was declared (slash stays text-only).
+    const rawSteps = input && typeof input === "object" && "steps" in input ? input.steps : undefined;
+    const rawStep = Array.isArray(rawSteps) ? rawSteps[idx] : undefined;
+    if (!isAgentStep(step) && rawStep && typeof rawStep === "object" && "structured" in rawStep) {
+      errors.push(`${where}.structured: only prompt/skill/command steps can declare structured output`);
+    }
+
     for (const [field, tpl] of stepTemplates(step)) {
       for (const ref of templateRefs(tpl)) {
-        const problem = checkRef(ref, inputs, seen);
+        const problem = checkRef(ref, inputs, stepById, seen);
         if (problem) errors.push(`${where}.${field}: {{${ref}}} ${problem}`);
       }
     }
@@ -425,9 +507,6 @@ export function validateFlow(input: unknown): ValidateResult {
       if (!target || target.type === "text" || !target.required) {
         errors.push(`${where}.target: "${step.target}" must be a required github_issue or github_pull_request input`);
       }
-      if (!textSteps.has(step.bodyFrom)) {
-        errors.push(`${where}.bodyFrom: "${step.bodyFrom}" must be an earlier prompt/skill/command/slash/intervention step`);
-      }
     }
     const refFields: [string, string][] =
       step.kind === "git_commit"
@@ -437,14 +516,18 @@ export function validateFlow(input: unknown): ValidateResult {
               ["titleFrom", step.titleFrom],
               ["bodyFrom", step.bodyFrom],
             ]
-          : [];
+          : step.kind === "github_comment"
+            ? [["bodyFrom", step.bodyFrom]]
+            : [];
     for (const [field, ref] of refFields) {
-      if (!agentSteps.has(ref)) errors.push(`${where}.${field}: "${ref}" must be an earlier prompt/skill/command step`);
+      if (step.kind === "github_comment") checkFromRef(field, ref, where, textSteps, "prompt/skill/command/slash/intervention");
+      else checkFromRef(field, ref, where);
     }
     if (step.kind === "git_push") pushed = true;
     if (step.kind === "github_pr" && !pushed) errors.push(`${where}: github_pr requires an earlier git_push step`);
 
     seen.add(step.id);
+    stepById.set(step.id, step);
     if (isAgentStep(step)) agentSteps.add(step.id);
     if (isTextStep(step)) textSteps.add(step.id);
   });
