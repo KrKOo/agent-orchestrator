@@ -21,6 +21,7 @@ import {
   isActionStep,
   isAgentStep,
   renderTemplate,
+  type StructuredOutput,
   validateFlow,
 } from "@orch/protocol";
 import { ulid } from "ulid";
@@ -245,8 +246,8 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   let mcpRegistered = false;
   /** Step that events (logs, subagents, permissions) are attributed to. */
   let currentStepId: string | undefined;
-  /** Agent step accepting MCP output, with its structured result. */
-  let activeStep: { id: string; structured?: unknown } | null = null;
+  /** Agent step accepting MCP output, with its structured-output spec and result. */
+  let activeStep: { id: string; spec?: StructuredOutput; structured?: unknown } | null = null;
   let stepAbort: AbortController | null = null;
   /** Whether the current ACP session has been prompted; its first prompt carries the untrusted preamble.
    * A resumed run starts a fresh ACP session (ACP has no conversation resume), so this starts false. */
@@ -282,6 +283,20 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   const sink: McpRunSink = {
     submitOutput(value) {
       if (!activeStep) return "No active step";
+      const spec = activeStep.spec;
+      if (spec) {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return "submit_output must be called with a JSON object of the step's structured fields";
+        }
+        // `Object.hasOwn` (not `in`) keeps prototype names like `constructor` out. Zod's parsed
+        // object materializes missing keys and its proxy yields the inherited `constructor` class
+        // for that name, so a JSON round-trip first: it strips non-JSON values the wire never had.
+        const obj = JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
+        const missing = spec.fields.filter((f) => !Object.hasOwn(obj, f.name) || obj[f.name] === undefined);
+        if (missing.length) {
+          return `Missing structured field${missing.length > 1 ? "s" : ""}: ${missing.map((f) => `${f.name} (${f.description})`).join(", ")}. Call submit_output again with an object containing at least: ${spec.fields.map((f) => f.name).join(", ")}.`;
+        }
+      }
       activeStep.structured = value;
       return null;
     },
@@ -321,27 +336,41 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   };
 
   const agentPrompt = (step: AgentStep): string => {
-    if (step.kind === "prompt") return renderTemplate(step.prompt, ctx);
-    if (step.kind === "skill") {
-      const skill = deps.library.getSkill(step.skill);
-      const lines = [
-        `Apply the skill "${skill.name}" now. Follow its instructions exactly.`,
-        `<skill name="${skill.name}">`,
-        skill.body.trim(),
-        "</skill>",
-        `[Skill directory: /orch/skills/${skillDirName(skill.name)}]`,
-      ];
-      if (step.args) lines.push(`Arguments: ${renderTemplate(step.args, ctx)}`);
-      return lines.join("\n");
-    }
-    const command = deps.library.getCommand(step.command);
-    return command.body.replaceAll("$ARGUMENTS", renderTemplate(step.args ?? "", ctx));
+    const base =
+      step.kind === "prompt"
+        ? renderTemplate(step.prompt, ctx)
+        : step.kind === "skill"
+          ? (() => {
+              const skill = deps.library.getSkill(step.skill);
+              const lines = [
+                `Apply the skill "${skill.name}" now. Follow its instructions exactly.`,
+                `<skill name="${skill.name}">`,
+                skill.body.trim(),
+                "</skill>",
+                `[Skill directory: /orch/skills/${skillDirName(skill.name)}]`,
+              ];
+              if (step.args) lines.push(`Arguments: ${renderTemplate(step.args, ctx)}`);
+              return lines.join("\n");
+            })()
+        : (() => {
+            const command = deps.library.getCommand(step.command);
+            return command.body.replaceAll("$ARGUMENTS", renderTemplate(step.args ?? "", ctx));
+          })();
+    if (!step.structured) return base;
+    const fields = step.structured.fields;
+    return [
+      base,
+      "",
+      "Before you finish, call the submit_output tool once with a JSON object containing these fields:",
+      ...fields.map((f) => `- ${f.name}: ${f.description}`),
+      "Every field is required (use any JSON value; omit nothing). Finish your turn only after submit_output succeeds.",
+    ].join("\n");
   };
 
   /** One prompt turn in the current ACP session; updates stream under `eventStepId`, MCP output goes to `outputStepId`. */
-  const agentTurn = async (text: string, eventStepId: string, outputStepId: string, abort: AbortSignal): Promise<StepOutcome> => {
+  const agentTurn = async (text: string, eventStepId: string, outputStepId: string, abort: AbortSignal, spec?: StructuredOutput): Promise<StepOutcome> => {
     const h = harness!;
-    activeStep = { id: outputStepId };
+    activeStep = { id: outputStepId, ...(spec ? { spec } : {}) };
     let output = "";
     let afterToolCall = false;
     let grace: ReturnType<typeof setTimeout> | undefined;
@@ -368,7 +397,16 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       });
       const structured = activeStep.structured;
       if (abort.aborted) return { status: "cancelled", output };
-      if (stopReason === "end_turn") return { status: "succeeded", output, ...(structured !== undefined ? { structured } : {}) };
+      if (stopReason === "end_turn") {
+        if (spec && structured === undefined) {
+          return {
+            status: "failed",
+            output,
+            error: `Step finished without calling submit_output: it must submit a JSON object with at least these fields: ${spec.fields.map((f) => f.name).join(", ")}.`,
+          };
+        }
+        return { status: "succeeded", output, ...(structured !== undefined ? { structured } : {}) };
+      }
       if (stopReason === "cancelled") return { status: "cancelled", output };
       return { status: "failed", output, error: `Agent stopped: ${stopReason}` };
     } finally {
@@ -384,7 +422,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const text = run.trust === "untrusted" && freshContext ? `${UNTRUSTED_PREAMBLE}\n\n${agentPrompt(step)}` : agentPrompt(step);
     if (step.freshSession && sessionPrompted) await harness!.newSession();
     sessionPrompted = true;
-    const outcome = await agentTurn(text, step.id, step.id, abort);
+    const outcome = await agentTurn(text, step.id, step.id, abort, step.structured);
     sessions.set(AGENT_SESSION, { label: `Agent session (last step: ${step.name})`, output: outcome.output ?? "", timeoutSec: step.timeoutSec });
     return outcome;
   };
@@ -525,8 +563,33 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     return outcome;
   };
 
+  /** Renders a step's structured field through `renderTemplate` semantics: strings raw, objects as JSON. */
+  function renderStructuredValue(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (value !== null && typeof value === "object") return JSON.stringify(value);
+    return String(value);
+  }
+
+  /**
+   * Resolves a `*From` ref (`id` | `id.output` | `id.structured.<field>`) to its text; empty when unknown.
+   * `.structured.<field>` resolves through `renderTemplate` semantics (string raw, object JSON).
+   */
+  const resolveFromRef = (ref: string, ctx: TemplateContext): string => {
+    const [id, ...rest] = ref.split(".");
+    const step = ctx.steps[id];
+    if (!step) return "";
+    if (rest.length === 0) return step.output;
+    if (rest.length === 1 && rest[0] === "output") return step.output;
+    if (rest.length === 2 && rest[0] === "structured") {
+      const structured = step.structured === null || typeof step.structured !== "object" ? undefined : (step.structured as Record<string, unknown>);
+      const value = structured && Object.hasOwn(structured, rest[1]!) ? structured[rest[1]!] : undefined;
+      return value === undefined ? "" : renderStructuredValue(value);
+    }
+    return "";
+  };
+
   const runCommentStep = async (step: Extract<Step, { kind: "github_comment" }>, abort: AbortSignal): Promise<StepOutcome> => {
-    const body = ctx.steps[step.bodyFrom]?.output ?? "";
+    const body = resolveFromRef(step.bodyFrom, ctx);
     if (!body.trim()) throw new Error(`Comment body from step ${step.bodyFrom} is empty`);
     const params: CreateCommentParams = { runId, stepId: step.id, body };
     const comment = await rejectWhenAborted(deps.rpc<CreateCommentResult>("github.createComment", params), abort);
@@ -539,7 +602,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   ): Promise<StepOutcome> => {
     const ws = workspace!;
     if (step.kind === "git_commit") {
-      const message = plainText(ctx.steps[step.messageFrom]?.output ?? "");
+      const message = plainText(resolveFromRef(step.messageFrom, ctx));
       if (!message) throw new Error(`Commit message from step ${step.messageFrom} is empty`);
       const file = join(runDir, "commit-msg");
       await writeFile(file, `${message}\n`);
@@ -556,7 +619,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       return { status: "succeeded", output: ws.branch };
     }
     if (!pushed) throw new Error("github_pr requires an earlier git_push");
-    const title = firstLine(plainText(ctx.steps[step.titleFrom]?.output ?? ""));
+    const title = firstLine(plainText(resolveFromRef(step.titleFrom, ctx)));
     if (!title) throw new Error(`PR title from step ${step.titleFrom} is empty`);
     const params: CreatePullRequestParams = {
       runId,
@@ -564,7 +627,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       head: ws.branch,
       base: step.base ?? null,
       title,
-      body: ctx.steps[step.bodyFrom]?.output ?? "",
+      body: resolveFromRef(step.bodyFrom, ctx),
       draft: step.draft,
     };
     const pr = await rejectWhenAborted(deps.rpc<CreatePullRequestResult>("github.createPullRequest", params), abort);
@@ -665,7 +728,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
       tail = new SubagentTail(sessionsDir, (e) => emit(e, currentStepId), { fromEnd: resume !== undefined });
       tail.start();
-      const mcp = deps.mcp.registerRun(runId, sink);
+      const mcp = deps.mcp.registerRun(runId, sink, () => activeStep?.spec);
       mcpRegistered = true;
       // Slash-only flows never prompt the ACP harness; `omp -p` runs handle them inside the sandbox.
       if (def.steps.some(isAgentStep)) {

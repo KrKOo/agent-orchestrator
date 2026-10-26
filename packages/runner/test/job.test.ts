@@ -19,7 +19,7 @@ import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
 import { JobManager, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
-import type { McpOutputServer } from "../src/mcp-output";
+import { type McpOutputServer, startMcpServer } from "../src/mcp-output";
 import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/types";
 import { sinkToWritable } from "../src/sandbox/types";
 
@@ -310,6 +310,371 @@ describe("runJob", () => {
     expect(logs.map((e) => e.payload.text).join("")).toContain("message_update");
   });
 
+  describe("structured output (submit_output)", () => {
+    let mcpPort = 7810;
+    /** Real per-run MCP endpoint; `getSpec` wired like `runJob` does. */
+    const withRealMcp = async (deps: JobDeps): Promise<McpOutputServer> => {
+      deps.config = { ...config, ports: { ...config.ports, mcp: mcpPort++ } };
+      return await startMcpServer(deps.config);
+    };
+
+    test("declared fields: prompt asks for submit_output, submitted object lands in step.finished and later templates", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            // `echo` makes the fake agent stream the full prompt back, instruction block included;
+            // the submit regex still captures only the trailing JSON object.
+            prompt: `echo submit {"title":"My PR","score":7}`,
+            structured: {
+              fields: [
+                { name: "title", description: "PR title" },
+                { name: "score", description: "Score" },
+              ],
+            },
+          },
+          { kind: "prompt", id: "use", name: "Use", prompt: "echo title={{steps.gen.structured.title}} score={{steps.gen.structured.score}}" },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        const [gen, use] = ofType(events, "step.finished");
+        expect(gen!.payload.structured).toEqual({ title: "My PR", score: 7 });
+        // The fake agent echoes the full prompt: the submit_output instruction block was appended.
+        const genText = ofType(events, "acp.update")
+          .filter((e) => e.stepId === "gen")
+          .map((e) => e.payload.update)
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) => {
+            const c: unknown = u.content;
+            return typeof c === "object" && c !== null && "text" in c && typeof c.text === "string" ? c.text : "";
+          })
+          .join("");
+        expect(genText).toContain("call the submit_output tool once with a JSON object containing these fields:");
+        expect(genText).toContain("- title: PR title");
+        expect(genText).toContain("- score: Score");
+        expect(use!.payload.output).toContain("title=My PR score=7");
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("missing field: the tool error is streamed to the agent, which retries with the fixed object", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            prompt: `submit retry {"title":"Fixed","body":"Body"}`,
+            structured: {
+              fields: [
+                { name: "title", description: "PR title" },
+                { name: "body", description: "PR body" },
+              ],
+            },
+          },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        const finished = ofType(events, "step.finished")[0]!;
+        expect(finished.payload.structured).toEqual({ title: "Fixed", body: "Body" });
+        // The agent saw the tool error naming the missing field, then the ok from the retry.
+        const chunks = ofType(events, "acp.update").filter((e) => e.stepId === "gen").map((e) => e.payload.update);
+        const texts = chunks
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) => {
+            const c: unknown = u.content;
+            return typeof c === "object" && c !== null && "text" in c && typeof c.text === "string" ? c.text : "";
+          });
+        const all = texts.join("");
+        // With a spec the MCP schema also rejects the call before the sink; the retry then succeeds.
+        expect(all).toContain("error: MCP error -32602: Input validation error: Invalid arguments for tool submit_output: Invalid input: expected nonoptional, received undefined at output.body");
+        expect(all).toContain("ok: ok");
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("never submitting: the step fails with an explicit submit_output error", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          { kind: "prompt", id: "gen", name: "Gen", prompt: "hi", structured: { fields: [{ name: "title", description: "PR title" }] } },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({
+          t: "job.finished",
+          runId: run.runId,
+          status: "failed",
+          error: "Step finished without calling submit_output: it must submit a JSON object with at least these fields: title.",
+        });
+        const finished = ofType(events, "step.finished")[0]!;
+        expect(finished.payload.status).toBe("failed");
+        expect(finished.payload.error).toBe(
+          "Step finished without calling submit_output: it must submit a JSON object with at least these fields: title.",
+        );
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("github_pr titleFrom/bodyFrom accept <step>.structured.<field> refs", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const rpcCalls: { method: string; params: unknown }[] = [];
+      deps.rpc = async <T>(method: string, params: unknown) => {
+        rpcCalls.push({ method, params });
+        return (method === "github.createPullRequest" ? { url: "https://github.com/acme/widget/pull/5" } : { token: "write-token" }) as T;
+      };
+      // The push already happened in attempt 1 (resume past it; a real push would hit github.com).
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "git_push", id: "push", name: "Push" },
+              { kind: "prompt", id: "gen", name: "Gen", prompt: `submit {"title":"Structured title","body":"Structured\\nbody"}` },
+              { kind: "github_pr", id: "pr", name: "PR", titleFrom: "gen.structured.title", bodyFrom: "gen.structured.body" },
+            ],
+          },
+          "gen",
+          ["push"],
+        ),
+      );
+      // Attempt 1's push was skipped here; derive `pushed` the same way the runner does.
+      run.resume!.prior = [
+        { stepId: "done", output: "prior-output" },
+        { stepId: "push", output: "pushed" },
+      ];
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        const call = rpcCalls.find((c) => c.method === "github.createPullRequest");
+        expect(call).toMatchObject({
+          method: "github.createPullRequest",
+          params: { title: "Structured title", body: "Structured\nbody" },
+        });
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("field names are matched with Object.hasOwn, not the prototype chain", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            // First submit {} (inherits "constructor" from Object.prototype); the runner-side check
+            // must reject it via Object.hasOwn, the agent retries with an own property.
+            prompt: `submit-empty {} submit {"constructor":"C"}`,
+            structured: { fields: [{ name: "constructor", description: "ctor" }] },
+          },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        const chunks = ofType(events, "acp.update")
+          .filter((e) => e.stepId === "gen")
+          .map((e) => e.payload.update)
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) => {
+            const c: unknown = u.content;
+            return typeof c === "object" && c !== null && "text" in c && typeof c.text === "string" ? c.text : "";
+          })
+          .join("");
+        expect(chunks).toContain("error: Missing structured field: constructor (ctor)");
+        const finished = ofType(events, "step.finished")[0]!;
+        expect(finished.payload.structured).toEqual({ constructor: "C" });
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("resume replays structured into later templates", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "prompt", id: "use", name: "Use", prompt: "echo n={{steps.done.structured.n}}" },
+            ],
+          },
+          "use",
+        ),
+      );
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["use"]);
+      expect(ofType(events, "step.finished")[0]!.payload.output).toContain("n=1");
+    });
+
+    test("tools/list during a spec'd step carries the field schema (per-request getSpec)", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          { kind: "prompt", id: "plain", name: "Plain", prompt: `echo probe` },
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            // `probe` makes the fake agent call tools/list before submitting (see fake-agent.ts).
+            prompt: `probe submit {"title":"T"}`,
+            structured: { fields: [{ name: "title", description: "PR title" }] },
+          },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        // The fake agent streamed the tools/list result as a chunk while the step was active.
+        const genText = ofType(events, "acp.update")
+          .filter((e) => e.stepId === "gen")
+          .map((e) => e.payload.update)
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) => {
+            const c: unknown = u.content;
+            return typeof c === "object" && c !== null && "text" in c && typeof c.text === "string" ? c.text : "";
+          })
+          .join("");
+        const probe = genText.split("\nprobe: ")[1] ?? "";
+        // The schema was built from the spec: field name, required, and the structured description.
+        expect(probe).toContain('"title"');
+        expect(probe).toContain('"required":["title"]');
+        expect(probe).toContain("submit_output");
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("submit_output rejects non-object payloads; the agent retries and extras are kept", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const run = assigned({
+        steps: [
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            // First two calls send an array and null (both rejected); the third submits the real object
+            // with an extra key, which is accepted and preserved.
+            prompt: `submit-array [1,2] submit-null null submit {"title":"T","extra":1}`,
+            structured: { fields: [{ name: "title", description: "PR title" }] },
+          },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        const chunks = ofType(events, "acp.update")
+          .filter((e) => e.stepId === "gen")
+          .map((e) => e.payload.update)
+          .filter((u) => u.sessionUpdate === "agent_message_chunk")
+          .map((u) => {
+            const c: unknown = u.content;
+            return typeof c === "object" && c !== null && "text" in c && typeof c.text === "string" ? c.text : "";
+          })
+          .join("");
+        // Non-objects are rejected by the tool schema before the sink even sees them.
+        expect(chunks).toContain("error: MCP error -32602: Input validation error: Invalid arguments for tool submit_output: Invalid input: expected object, received array at output");
+        expect(chunks).toContain("error: MCP error -32602: Input validation error: Invalid arguments for tool submit_output: Invalid input: expected object, received null at output");
+        // The extra key survives into the step result.
+        const finished = ofType(events, "step.finished")[0]!;
+        expect(finished.payload.structured).toEqual({ title: "T", extra: 1 });
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("github_comment bodyFrom accepts <step>.structured.<field> refs", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.mcp = await withRealMcp(deps);
+      const rpcCalls: { method: string; params: unknown }[] = [];
+      deps.rpc = async <T>(method: string, params: unknown) => {
+        rpcCalls.push({ method, params });
+        return { url: "https://github.com/acme/widget/issues/3#issuecomment-9" } as T;
+      };
+      const run = assigned({
+        inputs: [{ key: "issue", label: "Issue", type: "github_issue", required: true }],
+        steps: [
+          {
+            kind: "prompt",
+            id: "gen",
+            name: "Gen",
+            prompt: `submit {"body":"Structured\\ncomment"}`,
+            structured: { fields: [{ name: "body", description: "Comment body" }] },
+          },
+          { kind: "github_comment", id: "post", name: "Post", target: "issue", bodyFrom: "gen.structured.body" },
+        ],
+      });
+      run.inputs.issue = { url: "https://github.com/acme/widget/issues/3", repo: "acme/widget", number: 3, title: "Bug", body: "Broken" };
+      try {
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        expect(rpcCalls.filter((c) => c.method === "github.createComment")).toEqual([
+          { method: "github.createComment", params: { runId: run.runId, stepId: "post", body: "Structured\ncomment" } },
+        ]);
+      } finally {
+        await deps.mcp.stop();
+      }
+    });
+
+    test("resume with structured: null resolves stepTemplates and *From refs without crashing", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(
+        resumed(
+          {
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "git_commit", id: "commit", name: "Commit", messageFrom: "done.structured.nope" },
+            ],
+          },
+          "commit",
+        ),
+      );
+      run.resume!.prior = [{ stepId: "done", output: "prior-output", structured: null }];
+      await runJob(run, deps, new AbortController().signal);
+
+      // A structured ref to a field the resume data lacks resolves to "" and fails the commit with
+      // the explicit empty-message error instead of crashing.
+      expect(sent.at(-1)).toEqual({
+        t: "job.finished",
+        runId: run.runId,
+        status: "failed",
+        error: "Commit message from step done.structured.nope is empty",
+      });
+      expect(ofType(events, "step.finished").at(-1)!.payload.status).toBe("failed");
+    });
+  });
+
   test("slash step tool activity streams as tool_call cards", async () => {
     const { deps, events } = harnessDeps(new FakeSandboxProvider());
     const run = assigned({ steps: [{ kind: "slash", id: "tools", name: "Tools", command: "plan", args: "use the tool" }] });
@@ -377,6 +742,26 @@ describe("runJob", () => {
     expect(sh(worktree, "git", "log", "-1", "--format=%s|%an")).toBe("Hello, world|Orch Test");
     expect(sh(worktree, "git", "show", "--name-only", "--format=", "HEAD")).toBe("hello.txt");
     expect(existsSync(join(repo, "hello.txt"))).toBe(false);
+  });
+
+  test("command step with structured output: no submit fails the step with the explicit error", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [
+        { kind: "prompt", id: "impl", name: "Implement", prompt: "write hello.txt" },
+        // The commit-msg command body renders $ARGUMENTS; the spec appends the submit instruction
+        // like for prompt steps. The fake agent never calls submit_output, so the step must fail
+        // with the explicit no-submit error naming the declared field.
+        { kind: "command", id: "msg", name: "Message", command: "commit-msg", structured: { fields: [{ name: "message", description: "Commit message" }] }, args: "one word" },
+        { kind: "git_commit", id: "commit", name: "Commit", messageFrom: "msg.structured.message" },
+      ],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished", status: "failed" });
+    expect(ofType(events, "step.finished").at(-1)!.payload.error).toContain(
+      "Step finished without calling submit_output: it must submit a JSON object with at least these fields: message.",
+    );
   });
 
   test("approval ask: permission request round-trips through PendingRequests", async () => {
@@ -573,31 +958,31 @@ describe("runJob", () => {
     expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Path outside allowedRoots" }]);
   });
 
-  describe("resumed runs", () => {
-    /** A run assigned for attempt 2: step `done` succeeded in attempt 1, `fromStepId` failed. */
-    const resumed = (
-      flow: Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps">,
-      fromStepId: string,
-      /** Extra succeeded prior steps besides `done` (e.g. a skipped `git_push`). */
-      priorIds: string[] = [],
-    ): AssignedRun => {
-      const run = assigned(flow);
-      const idx = run.definition.steps.findIndex((s) => s.id === fromStepId);
-      run.resume = {
-        fromStepIdx: idx,
-        prior: [{ stepId: "done", output: "prior-output", structured: { n: 1 } }, ...priorIds.map((stepId) => ({ stepId, output: stepId }))]
-          .filter((p) => run.definition.steps.some((s) => s.id === p.stepId) && p.stepId !== fromStepId),
-      };
-      run.seqFrom = 9;
-      return run;
+  /** A run assigned for attempt 2: step `done` succeeded in attempt 1, `fromStepId` failed. */
+  const resumed = (
+    flow: Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps">,
+    fromStepId: string,
+    /** Extra succeeded prior steps besides `done` (e.g. a skipped `git_push`). */
+    priorIds: string[] = [],
+  ): AssignedRun => {
+    const run = assigned(flow);
+    const idx = run.definition.steps.findIndex((s) => s.id === fromStepId);
+    run.resume = {
+      fromStepIdx: idx,
+      prior: [{ stepId: "done", output: "prior-output", structured: { n: 1 } }, ...priorIds.map((stepId) => ({ stepId, output: stepId }))]
+        .filter((p) => run.definition.steps.some((s) => s.id === p.stepId) && p.stepId !== fromStepId),
     };
-    /** Creates the worktree attempt 1 would have left, which a mid-run (`fromStepIdx > 0`) resume requires. */
-    const withWorktree = (run: AssignedRun): AssignedRun => {
-      const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
-      sh(repo, "git", "worktree", "add", "-q", "-b", branch, join(config.dataDir, "worktrees", run.runId), "HEAD");
-      return run;
-    };
+    run.seqFrom = 9;
+    return run;
+  };
+  /** Creates the worktree attempt 1 would have left, which a mid-run (`fromStepIdx > 0`) resume requires. */
+  const withWorktree = (run: AssignedRun): AssignedRun => {
+    const branch = `orch/${run.runId.slice(0, 10).toLowerCase()}`;
+    sh(repo, "git", "worktree", "add", "-q", "-b", branch, join(config.dataDir, "worktrees", run.runId), "HEAD");
+    return run;
+  };
 
+  describe("resumed runs", () => {
     test("renders prior step outputs in templates and starts at the cursor", async () => {
       const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
       const run = withWorktree(

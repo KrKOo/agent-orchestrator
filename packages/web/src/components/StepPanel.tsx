@@ -118,26 +118,38 @@ export function StepPanel({
   const githubInputs = def.inputs.filter((i) => i.type !== "text");
   const set = (patch: Partial<Step>) => onChange({ ...step, ...patch } as Step);
 
-  /** Select of an earlier step whose output feeds `patchKey`; agent steps unless `sources` says otherwise. */
+  /** Select of an earlier step whose output feeds `patchKey`; agent steps unless `sources` says otherwise.
+   * Agent steps with a structured spec also offer `<id>.structured.<field>` entries. */
   const refSelect = (
     label: string,
     value: string,
     patchKey: "messageFrom" | "titleFrom" | "bodyFrom",
     sources: { steps: Step[]; noun: string } = { steps: earlierAgentSteps, noun: "agent step" },
-  ) => (
-    <label className="field">
-      <span>{label}</span>
-      <select value={value} onChange={(e) => set({ [patchKey]: e.target.value } as Partial<Step>)}>
-        <option value="">— choose an earlier {sources.noun} —</option>
-        {value && !sources.steps.some((s) => s.id === value) && <option value={value}>{value} (invalid)</option>}
-        {sources.steps.map((s) => (
-          <option key={s.id} value={s.id}>
-            {s.name} ({s.id})
-          </option>
-        ))}
-      </select>
-    </label>
-  );
+  ) => {
+    const options: { value: string; label: string }[] = [];
+    for (const s of sources.steps) {
+      options.push({ value: s.id, label: `${s.name} (${s.id})` });
+      if (isAgentStep(s) && s.structured) {
+        for (const f of s.structured.fields) {
+          options.push({ value: `${s.id}.structured.${f.name}`, label: `${s.name} (${s.id}.structured.${f.name})` });
+        }
+      }
+    }
+    return (
+      <label className="field">
+        <span>{label}</span>
+        <select value={value} onChange={(e) => set({ [patchKey]: e.target.value } as Partial<Step>)}>
+          <option value="">— choose an earlier {sources.noun} —</option>
+          {value && !options.some((o) => o.value === value) && <option value={value}>{value} (invalid)</option>}
+          {options.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  };
 
   const catalogSelect = (kind: "skill" | "command", value: string) => {
     const items = kind === "skill" ? (catalog?.skills ?? []) : (catalog?.commands ?? []);
@@ -283,14 +295,63 @@ export function StepPanel({
         />
       )}
       {isAgentStep(step) && (
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={step.freshSession}
-            onChange={(e) => set({ freshSession: e.target.checked })}
-          />
-          Start a fresh agent session for this step
-        </label>
+        <>
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={step.freshSession}
+              onChange={(e) => set({ freshSession: e.target.checked })}
+            />
+            Start a fresh agent session for this step
+          </label>
+          <div className="field">
+            <span>Structured output (optional)</span>
+            <small className="muted">
+              The agent must call <code>submit_output</code> with a JSON object containing at least these fields before finishing; later steps read{" "}
+              <code>{`{{steps.${step.id || "<id>"}.structured.<field>}}`}</code>.
+            </small>
+            {(step.structured?.fields ?? []).map((f, i) => (
+              <div className="grid2" key={i}>
+                <input
+                  className="mono"
+                  placeholder="field_name"
+                  value={f.name}
+                  onChange={(e) => {
+                    const fields = [...(step.structured?.fields ?? [])];
+                    fields[i] = { ...f, name: e.target.value };
+                    set({ structured: { fields } } as Partial<Step>);
+                  }}
+                />
+                <input
+                  placeholder="Description for the model"
+                  value={f.description}
+                  onChange={(e) => {
+                    const fields = [...(step.structured?.fields ?? [])];
+                    fields[i] = { ...f, description: e.target.value };
+                    set({ structured: { fields } } as Partial<Step>);
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn small danger"
+                  onClick={() => {
+                    const fields = (step.structured?.fields ?? []).filter((_, j) => j !== i);
+                    set({ structured: fields.length ? { fields } : undefined } as Partial<Step>);
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              className="btn small"
+              onClick={() => set({ structured: { fields: [...(step.structured?.fields ?? []), { name: "", description: "" }] } } as Partial<Step>)}
+            >
+              + Add field
+            </button>
+          </div>
+        </>
       )}
 
       {step.kind === "git_commit" && refSelect("Commit message from", step.messageFrom, "messageFrom")}

@@ -152,6 +152,142 @@ describe("validateFlow", () => {
     expect(bad.errors.filter((e) => e.includes("command")).length).toBe(3);
   });
 
+  test("accepts structured field declarations and rejects duplicates, bad names and empty descriptions", () => {
+    const ok = validateFlow({
+      ...baseFlow,
+      steps: [{ id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "title", description: "PR title" }] } }],
+    });
+    if (!ok.ok) throw new Error(ok.errors.join("\n"));
+    expect(ok.flow.steps[0]).toMatchObject({ structured: { fields: [{ name: "title", description: "PR title" }] } });
+
+    const bad = validateFlow({
+      ...baseFlow,
+      steps: [
+        {
+          id: "gen",
+          name: "Gen",
+          kind: "prompt",
+          prompt: "hi",
+          structured: {
+            fields: [
+              { name: "title", description: "a" },
+              { name: "title", description: "b" },
+            ],
+          },
+        },
+      ],
+    });
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.errors.join()).toContain('structured.fields[1]: duplicate field name "title"');
+
+    const malformed = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "Bad Name", description: "c" }] } },
+        { id: "u", name: "U", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "ok", description: "" }] } },
+      ],
+    });
+    expect(malformed.ok).toBe(false);
+    if (malformed.ok) return;
+    const all = malformed.errors.join("\n");
+    expect(all).toContain("structured.fields.0.name: field name must match");
+    expect(all).toContain("structured.fields.0.description");
+
+    // Slash steps stay text-only.
+    const slash = validateFlow({
+      ...baseFlow,
+      steps: [{ id: "s", name: "S", kind: "slash", command: "review", structured: { fields: [{ name: "x", description: "x" }] } }],
+    });
+    expect(slash.ok).toBe(false);
+    if (!slash.ok) expect(slash.errors.join()).toContain("structured");
+  });
+
+  test("*From refs accept id, id.output and id.structured.<field>, rejecting unknown fields and bad grammar", () => {
+    const steps = (messageFrom: string) => [
+      { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "title", description: "t" }] } },
+      { id: "commit", name: "C", kind: "git_commit", messageFrom },
+    ];
+    for (const ref of ["gen", "gen.output", "gen.structured.title"]) {
+      const res = validateFlow({ ...baseFlow, steps: steps(ref) });
+      if (!res.ok) throw new Error(`${ref}: ${res.errors.join("\n")}`);
+    }
+    const bad = validateFlow({ ...baseFlow, steps: steps("gen.structured.nope") });
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.errors.join()).toContain('exposes only structured fields gen.structured.title');
+
+    const noSpec = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "plain", name: "P", kind: "prompt", prompt: "hi" },
+        { id: "commit", name: "C", kind: "git_commit", messageFrom: "plain.structured.title" },
+      ],
+    });
+    // No spec: permissive (back-compat; replayed resume data may carry structured values).
+    if (!noSpec.ok) throw new Error(noSpec.errors.join("\n"));
+
+    const grammar = validateFlow({ ...baseFlow, steps: steps("gen.output.deep") });
+    expect(grammar.ok).toBe(false);
+    if (!grammar.ok) expect(grammar.errors.join()).toContain(".output or .structured.<field>");
+
+    // Non-agent refs are still rejected with the base message.
+    const action = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "title", description: "t" }] } },
+        { id: "push", name: "Push", kind: "git_push" },
+        { id: "pr", name: "PR", kind: "github_pr", titleFrom: "push", bodyFrom: "gen" },
+      ],
+    });
+    expect(action.ok).toBe(false);
+    if (!action.ok) expect(action.errors.join()).toContain('titleFrom: "push" must be an earlier prompt/skill/command step');
+  });
+
+  test("templates resolve steps.<id>.structured.<field> only for declared fields", () => {
+    const bad = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "title", description: "t" }] } },
+        { id: "use", name: "Use", kind: "prompt", prompt: "{{steps.gen.structured.nope}}" },
+      ],
+    });
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.errors.join()).toContain('step "gen" exposes only structured fields steps.gen.structured.title');
+
+    const good = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "title", description: "t" }] } },
+        { id: "use", name: "Use", kind: "prompt", prompt: "{{steps.gen.structured.title}}" },
+      ],
+    });
+    if (!good.ok) throw new Error(good.errors.join("\n"));
+  });
+
+  test("structured template refs allow deeper nested paths (field values are arbitrary JSON)", () => {
+    const nested = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi" },
+        { id: "use", name: "Use", kind: "prompt", prompt: "{{steps.gen.structured.files.0}}" },
+      ],
+    });
+    // No spec: permissive at any depth (back-compat; the renderer walks nested values).
+    if (!nested.ok) throw new Error(nested.errors.join("\n"));
+
+    const specNested = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Gen", kind: "prompt", prompt: "hi", structured: { fields: [{ name: "files", description: "t" }] } },
+        { id: "use", name: "Use", kind: "prompt", prompt: "{{steps.gen.structured.files.0}}" },
+      ],
+    });
+    // With a spec the first path segment is validated; deeper segments stay permissive.
+    if (!specNested.ok) throw new Error(specNested.errors.join("\n"));
+  });
+
   test("accepts extra harness model roles and rejects default/smol and malformed role keys", () => {
     const ok = validateFlow({
       ...baseFlow,
@@ -349,6 +485,53 @@ describe("github_comment steps", () => {
     expect(chained.ok).toBe(false);
     if (!chained.ok) expect(chained.errors.join()).toContain('bodyFrom: "post" must be an earlier');
   });
+
+  test("bodyFrom accepts id, id.output and id.structured.<field> of an earlier text step", () => {
+    const flowWith = (bodyFrom: string, impl: Record<string, unknown>) =>
+      validateFlow({
+        ...prFlow,
+        steps: [
+          { id: "impl", name: "Impl", kind: "prompt", prompt: "hi", ...impl },
+          { id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom },
+        ],
+      });
+    for (const ref of ["impl", "impl.output", "impl.structured.body"]) {
+      const res = flowWith(ref, { structured: { fields: [{ name: "body", description: "b" }] } });
+      if (!res.ok) throw new Error(`${ref}: ${res.errors.join("\n")}`);
+    }
+    // Unknown field.
+    const unknownField = flowWith("impl.structured.nope", { structured: { fields: [{ name: "body", description: "b" }] } });
+    expect(unknownField.ok).toBe(false);
+    if (!unknownField.ok) expect(unknownField.errors.join()).toContain("exposes only structured fields impl.structured.body");
+    // Wrong grammar.
+    const badGrammar = flowWith("impl.output.deep", {});
+    expect(badGrammar.ok).toBe(false);
+    if (!badGrammar.ok) expect(badGrammar.errors.join()).toContain(".output or .structured.<field>");
+    // No spec: permissive (back-compat; replayed resume data).
+    const noSpec = flowWith("impl.structured.body", {});
+    if (!noSpec.ok) throw new Error(noSpec.errors.join("\n"));
+    // A slash step without structured output is a valid plain-id source.
+    const slash = validateFlow({
+      ...prFlow,
+      steps: [
+        { id: "review", name: "Review", kind: "slash", command: "review" },
+        { id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom: "review" },
+      ],
+    });
+    if (!slash.ok) throw new Error(slash.errors.join("\n"));
+  });
+
+  test("structured refs on non-agent sources are rejected for github_comment bodyFrom", () => {
+    const res = validateFlow({
+      ...prFlow,
+      steps: [
+        { id: "review", name: "Review", kind: "slash", command: "review" },
+        { id: "post", name: "Post", kind: "github_comment", target: "pr", bodyFrom: "review.structured.body" },
+      ],
+    });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.errors.join()).toContain("references structured output, which only prompt/skill/command steps can produce");
+  });
 });
 
 describe("templateVariables", () => {
@@ -403,5 +586,45 @@ describe("templateVariables", () => {
     expect(paths).toContain("inputs.pr.diffPath");
     expect(paths).toContain("steps.review.structured");
     expectAllValid(def, 1);
+  });
+
+  test("declared structured fields replace the bare structured entry and carry the description", () => {
+    const def = parse({
+      ...baseFlow,
+      steps: [
+        {
+          id: "gen",
+          name: "Generate",
+          kind: "prompt",
+          prompt: "go",
+          structured: {
+            fields: [
+              { name: "title", description: "PR title" },
+              { name: "body", description: "PR body" },
+            ],
+          },
+        },
+        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
+      ],
+    });
+    const vars = templateVariables(def, 1);
+    expect(vars).toEqual(
+      expect.arrayContaining([
+        { path: "steps.gen.output", description: 'Text output of "Generate"' },
+        { path: "steps.gen.structured.title", description: 'PR title (of "Generate" via submit_output)' },
+        { path: "steps.gen.structured.body", description: 'PR body (of "Generate" via submit_output)' },
+      ]),
+    );
+    expect(vars.some((v) => v.path === "steps.gen.structured")).toBe(false);
+    // The bare entry remains for steps without a spec.
+    const plain = parse({
+      ...baseFlow,
+      steps: [
+        { id: "gen", name: "Generate", kind: "prompt", prompt: "go" },
+        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
+      ],
+    });
+    expect(templateVariables(plain, 1).map((v) => v.path)).toContain("steps.gen.structured");
+    for (let i = 0; i < def.steps.length; i++) expectAllValid(def, i);
   });
 });
