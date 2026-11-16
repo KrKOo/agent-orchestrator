@@ -1,6 +1,8 @@
 import {
   PR_DIFF_PATH,
   pullRequestInputOf,
+  UNTRUSTED_PREAMBLE,
+  unwrapUntrustedText,
   wrapUntrustedText,
   type FlowDefinition,
   type PullRequestInput,
@@ -55,6 +57,51 @@ export function pullRequestInput(pr: PullRequestInfo): PullRequestInput {
   };
 }
 
+/** Manual naming chosen at creation: a fixed name, or `autoName` to have the runner's model pick one. */
+export interface RunName {
+  /** User-provided display name; takes precedence (mutually exclusive with `autoName`). */
+  name?: string;
+  /** Ask the assigned runner's model to generate a name from the inputs. */
+  autoName?: boolean;
+}
+
+/** Max characters of one untrusted input value quoted in the naming prompt. */
+const NAME_PROMPT_VALUE_MAX = 200;
+
+/**
+ * Composes the headless prompt the runner runs to name the run: flow name plus one line per input.
+ * GitHub titles and text inputs are untrusted data, so each is wrapped exactly once, clipped before
+ * wrapping so a cut never drops a closing tag; the instruction pins the answer to a short name so
+ * models do not narrate.
+ */
+export function runNamePrompt(def: FlowDefinition, inputs: Record<string, unknown>): string {
+  const lines: string[] = [UNTRUSTED_PREAMBLE, `Flow: ${def.name}`];
+  for (const input of def.inputs) {
+    const value = inputs[input.key];
+    // `ref` (repo#number and GitHub's URL) is server-resolved; only `text` is untrusted.
+    let ref = "";
+    let text: string;
+    if (input.type === "github_issue" || input.type === "github_pull_request") {
+      if (typeof value !== "object" || value === null) continue;
+      const v = value as { title?: unknown; url?: unknown; repo?: unknown; number?: unknown };
+      if (typeof v.title !== "string" || typeof v.url !== "string" || typeof v.repo !== "string" || typeof v.number !== "number") continue;
+      ref = `${v.repo}#${v.number} (${v.url}) `;
+      // PR titles are stored wrapped (`pullRequestInput`); unwrap so every title is clipped and wrapped once.
+      text = unwrapUntrustedText(v.title);
+    } else if (typeof value === "string" && value.trim()) {
+      text = value.trim();
+    } else {
+      continue;
+    }
+    const clipped = text.length > NAME_PROMPT_VALUE_MAX ? `${text.slice(0, NAME_PROMPT_VALUE_MAX)}…` : text;
+    lines.push(`${input.label || input.key}: ${ref}${wrapUntrustedText(clipped)}`);
+  }
+  lines.push(
+    "Reply with a short human-readable name for this run only (max 6 words, no quotes, no explanation, no list).",
+  );
+  return lines.join("\n");
+}
+
 /**
  * Inserts a run of `flow` with resolved `inputs` and one pending row per step. A flow with a pull request
  * input yields an untrusted run whose `runs.github` pins that PR (checkout, check run, review, per-repo cap).
@@ -65,6 +112,7 @@ export function insertRun(
   flow: { id: string; version: number; definition: FlowDefinition },
   inputs: Record<string, unknown>,
   origin: RunOrigin,
+  name: RunName = {},
 ): string | null {
   const prDef = pullRequestInputOf(flow.definition);
   const pr = prDef ? (inputs[prDef.key] as PullRequestInput) : undefined;
@@ -95,6 +143,8 @@ export function insertRun(
             }
           : {}),
         createdAt: Date.now(),
+        name: name.name ?? null,
+        autoName: name.autoName ?? false,
       })
       .onConflictDoNothing()
       .returning({ id: runs.id })

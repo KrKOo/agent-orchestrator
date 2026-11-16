@@ -137,6 +137,12 @@ export function wrapUntrustedText(text: string): string {
   return `<untrusted_pr_text>\n${text}\n</untrusted_pr_text>`;
 }
 
+/** Inverse of `wrapUntrustedText` for display; text that is not wrapped is returned unchanged. */
+export function unwrapUntrustedText(text: string): string {
+  const m = /^<untrusted_pr_text>\n([\s\S]*)\n<\/untrusted_pr_text>$/.exec(text);
+  return m ? m[1]! : text;
+}
+
 /**
  * Structured-output contract for an agent step: the agent must call `submit_output` with a JSON object
  * containing at least these fields (any JSON value per field; every field required; extra keys are allowed and preserved). Later steps consume it

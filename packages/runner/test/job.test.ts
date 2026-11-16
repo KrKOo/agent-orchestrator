@@ -47,12 +47,17 @@ function sh(cwd: string, ...argv: string[]): string {
 class FakeSandboxProvider implements SandboxProvider {
   readonly id = "docker" as const;
   specs: CreateSandbox[] = [];
+  /** Every argv passed to `exec`, in order (asserts e.g. the naming call's `--no-session`). */
+  argvs: string[][] = [];
   destroyed = 0;
+  /** Called after each `exec` spawns its process (e.g. to cancel mid-call). */
+  onExec?: (argv: string[]) => void;
 
   async create(spec: CreateSandbox): Promise<Sandbox> {
     this.specs.push(spec);
     return {
       exec: (argv, cwd) => {
+        this.argvs.push(argv);
         // `bash -c <script>` (shell steps): run real bash on the host — the sandbox is faked anyway.
         if (argv[0] === "bash" && argv[1] === "-c") {
           const proc = Bun.spawn(["bash", "-c", argv[2] ?? ""], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
@@ -69,6 +74,7 @@ class FakeSandboxProvider implements SandboxProvider {
           const resume = argv.indexOf("--resume");
           const args = [argv[argv.indexOf("--") + 1] ?? "", resume >= 0 ? argv[resume + 1]! : ""];
           const proc = Bun.spawn(["bun", FAKE_PRINT, ...args], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          this.onExec?.(argv);
           return {
             stdin: sinkToWritable(proc.stdin),
             stdout: proc.stdout,
@@ -121,14 +127,14 @@ function harnessDeps(sandboxes: SandboxProvider) {
   return { deps, events, sent };
 }
 
-function assigned(flow: Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps">, trust: AssignedRun["trust"] = "owner"): AssignedRun {
+function assigned(flow: Partial<FlowDefinitionInput> & Pick<FlowDefinitionInput, "steps">, trust: AssignedRun["trust"] = "owner", over: Partial<AssignedRun> = {}): AssignedRun {
   const definition = FlowDefinition.parse({
     name: "test",
     workspace: { kind: "local_path", path: repo },
     harness: { id: "omp", model: "anthropic/claude-sonnet-4-5" },
     ...flow,
   });
-  return { runId: ulid(), trust, definition, inputs: {} };
+  return { runId: ulid(), trust, definition, inputs: {}, ...over };
 }
 
 const ofType = <T extends RunEventDraft["type"]>(events: RunEventDraft[], type: T) =>
@@ -199,6 +205,83 @@ describe("plainText (commit message / PR title source)", () => {
 });
 
 describe("runJob", () => {
+  test("namePrompt emits run.name with the first reply line before step 1", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events } = harnessDeps(sandboxes);
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] }, "owner", {
+      namePrompt: "Suggest a short name for this run",
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    const nameEvents = ofType(events, "run.name");
+    expect(nameEvents).toHaveLength(1);
+    // fake-print echoes `print:<prompt>`; the first line is the name.
+    expect(nameEvents[0]!.payload.name).toBe("print:Suggest a short name for this run");
+    const firstStep = events.findIndex((e) => e.type === "step.started");
+    expect(events.findIndex((e) => e.type === "run.name")).toBeLessThan(firstStep);
+    // Naming stays out of the transcript: nothing but run.status/run.name precedes step 1.
+    expect(events.slice(0, firstStep).filter((e) => e.type === "acp.update" || e.type === "sandbox.log")).toHaveLength(0);
+    // The naming invocation is session-less, tool-less, and bounded inside the container.
+    const nameArgv = sandboxes.argvs[0]!;
+    expect(nameArgv.slice(0, 4)).toEqual(["timeout", "-s", "KILL", "60"]);
+    expect(nameArgv).toContain("--no-session");
+    expect(nameArgv).toContain("--no-tools");
+  });
+
+  test("an over-long name is clamped to RUN_NAME_MAX without splitting a surrogate pair", async () => {
+    const { deps, events } = harnessDeps(new FakeSandboxProvider());
+    // `print:` (6) + 113 = 119 units; the 2-unit emoji would cross 120, so it and the rest are dropped.
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] }, "owner", {
+      namePrompt: `${"a".repeat(113)}😀${"b".repeat(50)}`,
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(ofType(events, "run.name")[0]!.payload.name).toBe(`print:${"a".repeat(113)}`);
+  });
+
+  test("a naming call past its budget is abandoned and killed; the run proceeds unnamed", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    // Real (short) budget: the timer races a real child process, which fake timers cannot drive.
+    deps.nameTimeoutMs = 200;
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] }, "owner", {
+      namePrompt: "be slow",
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(ofType(events, "run.name")).toHaveLength(0);
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+  });
+
+  test("cancelling during naming cancels the run before step 1 and destroys the sandbox", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const abort = new AbortController();
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] }, "owner", {
+      namePrompt: "be slow",
+    });
+    // Cancel once the (hanging) naming process is running.
+    sandboxes.onExec = () => abort.abort();
+    await runJob(run, deps, abort.signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "cancelled" });
+    expect(ofType(events, "step.started")).toHaveLength(0);
+    expect(ofType(events, "run.name")).toHaveLength(0);
+    expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("a failing naming process never fails the run: no run.name, steps continue", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] }, "owner", {
+      namePrompt: "make this fail",
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(ofType(events, "run.name")).toHaveLength(0);
+    expect(sent[1]).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    expect(ofType(events, "step.finished")).toHaveLength(1);
+  });
+
   test("prompt step: output is the concatenated chunks", async () => {
     const sandboxes = new FakeSandboxProvider();
     const { deps, events, sent } = harnessDeps(sandboxes);

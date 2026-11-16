@@ -8,6 +8,8 @@ export type RunStatus = z.infer<typeof RunStatus>;
 export const TERMINAL_STATUSES: readonly RunStatus[] = ["succeeded", "failed", "cancelled"];
 /** Terminal statuses a run can be retried from (same run, from a step cursor). */
 export const RETRYABLE_STATUSES: readonly RunStatus[] = ["failed", "cancelled"];
+/** Max run name length (UTF-16 code units, as zod counts), for user-given and agent-generated names alike. */
+export const RUN_NAME_MAX = 120;
 
 export const StepStatus = z.enum(["pending", "running", "succeeded", "failed", "cancelled"]);
 export type StepStatus = z.infer<typeof StepStatus>;
@@ -67,6 +69,11 @@ export const RunEvent = z.discriminatedUnion("type", [
     }),
   }),
   z.object({ ...base, type: z.literal("step.started"), payload: z.object({}) }),
+  z.object({
+    ...base,
+    type: z.literal("run.name"),
+    payload: z.object({ name: z.string().min(1).max(RUN_NAME_MAX) }),
+  }),
   z.object({
     ...base,
     type: z.literal("step.finished"),

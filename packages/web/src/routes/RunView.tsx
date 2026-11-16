@@ -9,7 +9,7 @@ import { PermissionDialog } from "../components/PermissionDialog";
 import { KIND_ICON, KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
 import { applyRunEvents, initialRunViewState, type LogLine, type StepView } from "../runState";
-import { Collapsible, CopyButton, formatDuration, formatTime, PrLink, StatusChip } from "../ui";
+import { Collapsible, CopyButton, formatDuration, formatTime, githubRefsOf, IssueLink, PrLink, StatusChip } from "../ui";
 import { useRunEventStream } from "../ws";
 
 const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, subagents: [] };
@@ -105,6 +105,23 @@ function RunViewInner({ runId }: { runId: string }) {
           <h2>
             <Link to={`/flows/${run.flowId}`}>{run.flowName}</Link>
           </h2>
+          {(() => {
+            // The REST row is authoritative (manual names, first-write-wins); live events only fill a gap.
+            const name = run.name ?? state.name;
+            if (name) return <span className="run-name">{name}</span>;
+            const refs = githubRefsOf(run);
+            if (refs.length > 0) {
+              return (
+                <span className="row gap wrap">
+                  {refs.map((ref) => (
+                    <IssueLink key={ref.url} githubRef={ref} />
+                  ))}
+                </span>
+              );
+            }
+            return null;
+          })()}
+          {run.autoName && !(run.name ?? state.name) && !runTerminal && <span className="muted small">generating name…</span>}
           <span className="mono small muted">{run.id}</span>
           <span className={`dot ${connected ? "dot-on" : "dot-off"}`} title={connected ? "live" : "disconnected"} />
           <span className="grow" />
@@ -148,6 +165,13 @@ function RunViewInner({ runId }: { runId: string }) {
               Pull request <PrLink github={run.github} />
             </span>
           )}
+          {githubRefsOf(run)
+            .filter((ref) => !(run.github && ref.kind === "pull_request" && ref.repo === run.github.repo && ref.number === run.github.number))
+            .map((ref) => (
+              <span key={ref.url}>
+                {ref.kind === "issue" ? "Issue" : "Pull request"} <IssueLink githubRef={ref} />
+              </span>
+            ))}
           <span>Duration {formatDuration(run.startedAt, run.finishedAt)}</span>
           {run.runnerId && (
             <span>

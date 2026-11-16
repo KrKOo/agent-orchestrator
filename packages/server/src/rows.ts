@@ -26,6 +26,8 @@ export function runRow(r: typeof schema.runs.$inferSelect): RunRow {
     runnerId: r.runnerId,
     createdBy: r.createdBy,
     triggerKind: r.triggerKind,
+    name: r.name,
+    autoName: r.autoName,
     github: r.github,
     error: r.error,
     createdAt: r.createdAt,

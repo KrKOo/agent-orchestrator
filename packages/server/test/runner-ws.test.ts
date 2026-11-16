@@ -103,6 +103,25 @@ describe("RunnerSession", () => {
     expect(fs[0]).toMatchObject({ runId, stepId: "impl", file: "src/a.ts", line: 3, severity: "warning", endLine: null });
   });
 
+  test("run.name sets the run's name; a second event never overwrites (first write wins)", async () => {
+    const { deps, session } = setup();
+    const runId = addRun(deps, { status: "assigned", runnerId: "r1" });
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [
+          ev(runId, 1, "run.name", { name: "Boot fix" }, undefined, 10),
+          ev(runId, 2, "run.name", { name: "Second guess" }, undefined, 11),
+        ],
+      }),
+    );
+    expect(deps.runs.get(runId)).toMatchObject({ name: "Boot fix" });
+    // Replays of the first event stay no-ops too.
+    await session.handle(JSON.stringify({ t: "job.events", runId, events: [ev(runId, 1, "run.name", { name: "Boot fix" }, undefined, 10)] }));
+    expect(deps.runs.get(runId)).toMatchObject({ name: "Boot fix" });
+  });
+
   test("terminal run.status sets finished_at/error; later non-terminal status cannot resurrect the run", async () => {
     const { deps, session } = setup();
     const runId = addRun(deps, { status: "running", runnerId: "r1" });

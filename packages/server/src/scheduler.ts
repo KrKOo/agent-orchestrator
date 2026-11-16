@@ -1,6 +1,7 @@
 import type { FlowDefinition, RunnerCapabilities } from "@orch/protocol";
 import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { posix } from "node:path";
+import { runNamePrompt } from "./createRun";
 import { schema } from "./db";
 import { DEFAULT_MAX_CONCURRENT_PER_REPO } from "./config";
 import type { RunService } from "./runs";
@@ -210,6 +211,9 @@ export class Scheduler {
           ...(gh ? { github: { repo: gh.repo, number: gh.number, headSha: gh.headSha, baseSha: gh.baseSha } } : {}),
           ...(prior !== undefined ? { resume: { fromStepIdx: run.resumeFrom!, prior } } : {}),
           ...(prior !== undefined ? { seqFrom: this.runService.maxSeq(run.id) + 1 } : {}),
+          // Agent naming happens on the runner (it owns the model gateway) before step 1; retried
+          // runs re-include it only while the name is still missing — first `run.name` wins.
+          ...(run.autoName && run.name === null ? { namePrompt: runNamePrompt(run.definition, run.inputs) } : {}),
         },
       });
       if (!sent) {

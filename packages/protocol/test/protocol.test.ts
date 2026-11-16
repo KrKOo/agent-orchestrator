@@ -5,6 +5,7 @@ import {
   isAgentStep,
   renderShellCommand,
   renderTemplate,
+  RunEvent,
   TemplateError,
   templateRefs,
   templateVariables,
@@ -726,5 +727,15 @@ describe("templateVariables", () => {
     });
     expect(templateVariables(plain, 1).map((v) => v.path)).toContain("steps.gen.structured");
     for (let i = 0; i < def.steps.length; i++) expectAllValid(def, i);
+  });
+});
+
+describe("RunEvent", () => {
+  test("parses run.name and rejects an empty or oversized name", () => {
+    const base = { runId: "r1", seq: 1, ts: 1 };
+    expect(RunEvent.parse({ ...base, type: "run.name", payload: { name: "Boot fix" } }).payload).toEqual({ name: "Boot fix" });
+    expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "" } }).success).toBe(false);
+    expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "x".repeat(120) } }).success).toBe(true);
+    expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "x".repeat(121) } }).success).toBe(false);
   });
 });
