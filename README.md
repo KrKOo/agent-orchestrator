@@ -62,8 +62,9 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
 - **Run names** identify runs on the Runs page. Give one in the Run dialog (`name` on
   `POST /api/flows/<id>/runs`, ≤120 chars), or check **Generate the name with an agent** (`autoName`) and the
   runner that picks up the run asks the flow's model to name it from the flow and its inputs before step 1 —
-  one headless `omp -p --no-session` prompt, its first reply line becomes the run's name. Naming never fails a
-  run: if it times out (60s) or errors the run proceeds unnamed until a later retry names it. The Runs page and
+  one headless `omp -p --no-session --no-tools` prompt, its first reply line (clamped to 120 chars) becomes the
+  run's name; the first name reported wins. Naming never fails a run: if it times out (60s, enforced inside the
+  sandbox) or errors the run proceeds unnamed until a later retry names it. The Runs page and
   run view also identify runs by their GitHub inputs — issue and PR links are derived from the resolved inputs,
   so a queued issue run is recognizable before it even starts.
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**

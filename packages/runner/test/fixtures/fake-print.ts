@@ -14,6 +14,10 @@ await (async () => {
 
 const emit = (obj: unknown) => console.log(JSON.stringify(obj));
 emit({ type: "session", version: 3, id: resume ?? "fake" });
+if (text.includes("slow")) {
+  // Hangs well past any test timeout; callers must abandon and kill it.
+  await Bun.sleep(30_000);
+}
 if (text.includes("fail")) {
   process.stderr.write("boom\n");
   process.exit(3);

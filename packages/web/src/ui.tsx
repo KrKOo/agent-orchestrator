@@ -1,5 +1,5 @@
 // Small shared presentational helpers.
-import type { RunGitHubInfo } from "@orch/protocol";
+import { type RunGitHubInfo, unwrapUntrustedText } from "@orch/protocol";
 import { type ReactNode, useEffect, useState } from "react";
 
 export function StatusChip({ status }: { status: string }) {
@@ -41,7 +41,14 @@ export function githubRefsOf(run: { definition: { inputs: { key: string; type: s
     if (typeof value !== "object" || value === null) continue;
     const v = value as { repo?: unknown; number?: unknown; title?: unknown; url?: unknown };
     if (typeof v.repo !== "string" || typeof v.number !== "number" || typeof v.title !== "string" || typeof v.url !== "string") continue;
-    refs.push({ kind: def.type as "issue" | "pull_request", repo: v.repo, number: v.number, title: v.title, url: v.url });
+    refs.push({
+      kind: def.type === "github_issue" ? "issue" : "pull_request",
+      repo: v.repo,
+      number: v.number,
+      // PR titles are stored wrapped as untrusted agent input; show the bare title.
+      title: unwrapUntrustedText(v.title),
+      url: v.url,
+    });
   }
   return refs;
 }

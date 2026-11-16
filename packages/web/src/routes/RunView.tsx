@@ -106,7 +106,8 @@ function RunViewInner({ runId }: { runId: string }) {
             <Link to={`/flows/${run.flowId}`}>{run.flowName}</Link>
           </h2>
           {(() => {
-            const name = state.name ?? run.name;
+            // The REST row is authoritative (manual names, first-write-wins); live events only fill a gap.
+            const name = run.name ?? state.name;
             if (name) return <span className="run-name">{name}</span>;
             const refs = githubRefsOf(run);
             if (refs.length > 0) {
@@ -120,7 +121,7 @@ function RunViewInner({ runId }: { runId: string }) {
             }
             return null;
           })()}
-          {run.autoName && !(state.name ?? run.name) && !runTerminal && <span className="muted small">generating name…</span>}
+          {run.autoName && !(run.name ?? state.name) && !runTerminal && <span className="muted small">generating name…</span>}
           <span className="mono small muted">{run.id}</span>
           <span className={`dot ${connected ? "dot-on" : "dot-off"}`} title={connected ? "live" : "disconnected"} />
           <span className="grow" />

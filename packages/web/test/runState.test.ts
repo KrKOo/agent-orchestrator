@@ -114,11 +114,11 @@ describe("applyRunEvents", () => {
 });
 
 describe("run.name", () => {
-  test("a run.name event sets the state's name", () => {
+  test("the first run.name event wins, matching the server's first-write-wins", () => {
     seq = 0;
     const state = applyRunEvents(initialRunViewState, [ev({ type: "run.name", payload: { name: "Boot fix" } })]);
     expect(state.name).toBe("Boot fix");
     const again = applyRunEvents(state, [ev({ type: "run.name", payload: { name: "Better name" } })]);
-    expect(again.name).toBe("Better name");
+    expect(again.name).toBe("Boot fix");
   });
 });

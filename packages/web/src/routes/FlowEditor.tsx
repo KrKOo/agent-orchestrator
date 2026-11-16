@@ -4,6 +4,7 @@ import {
   isAgentStep,
   isTextStep,
   pullRequestInputOf,
+  RUN_NAME_MAX,
   type Step,
   STEP_KINDS,
   type StepKind,
@@ -555,6 +556,7 @@ function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {
         <input
           type="text"
           placeholder="Optional — shown on the Runs page"
+          maxLength={RUN_NAME_MAX}
           value={autoName ? "" : name}
           disabled={autoName}
           onChange={(e) => setName(e.target.value)}

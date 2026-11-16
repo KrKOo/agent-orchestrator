@@ -206,8 +206,9 @@ describe("Scheduler.kick", () => {
 
     const autoAssign = link.of("job.assign").find((m) => m.run.runId === auto)!;
     expect(autoAssign.run.namePrompt).toContain("test flow");
-    expect(autoAssign.run.namePrompt).toContain("Crash on boot");
-    expect(autoAssign.run.namePrompt).toContain("untrusted");
+    expect(autoAssign.run.namePrompt).toContain(
+      "Issue: acme/app#42 (https://github.com/acme/app/issues/42) <untrusted_pr_text>\nCrash on boot\n</untrusted_pr_text>",
+    );
     expect(link.of("job.assign").find((m) => m.run.runId === named)!.run.namePrompt).toBeUndefined();
 
     // Once named (e.g. on a retry after a first attempt), the prompt disappears. The run must be

@@ -51,11 +51,6 @@ export function Runs() {
                   <Link to={`/flows/${r.flowId}`}>{r.flowName}</Link> <span className="muted">v{r.flowVersion}</span>
                 </td>
                 <td>
-                  <Link className="mono" to={`/runs/${r.id}`}>
-                    {r.id}
-                  </Link>
-                </td>
-                <td>
                   {(() => {
                     if (r.name) return <span>{r.name}</span>;
                     const refs = githubRefsOf(r);
@@ -72,6 +67,11 @@ export function Runs() {
                     }
                     return <span className="muted">—</span>;
                   })()}
+                </td>
+                <td>
+                  <Link className="mono" to={`/runs/${r.id}`}>
+                    {r.id}
+                  </Link>
                 </td>
                 <td>
                   <span className="tag">{r.triggerKind}</span>

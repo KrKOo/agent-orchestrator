@@ -18,6 +18,7 @@ import {
   renderShellCommand,
   type Step,
   type TemplateContext,
+  RUN_NAME_MAX,
   UNTRUSTED_PREAMBLE,
   isActionStep,
   isAgentStep,
@@ -57,6 +58,8 @@ export interface JobDeps {
   rpc<T>(method: RunnerRpcMethod, params: unknown): Promise<T>;
   /** Git origin for PR checkouts; defaults to `GITHUB_GIT_URL` (tests use a local `file://` dir). */
   githubGitUrl?: string;
+  /** Budget for the agent-naming call; defaults to `NAME_TIMEOUT_MS` (tests shorten it). */
+  nameTimeoutMs?: number;
 }
 
 /** Time a user has to answer a permission or elicitation request. */
@@ -161,21 +164,42 @@ const skillDirName = (name: string) => name.replace(/[^\w.-]/g, "_");
 /** Time the agent-naming side quest gets before it is abandoned (the run itself proceeds unnamed). */
 const NAME_TIMEOUT_MS = 60_000;
 
+/** Longest prefix of `text` within `RUN_NAME_MAX` UTF-16 units that never splits a surrogate pair. */
+function clampRunName(text: string): string {
+  let out = "";
+  for (const ch of text) {
+    if (out.length + ch.length > RUN_NAME_MAX) break;
+    out += ch;
+  }
+  return out.trim();
+}
+
 /**
- * Asks the harness model for a run name with one headless `omp -p --no-session` call inside the run's
- * sandbox. Emits no `acp.update`/`sandbox.log`: naming is not part of the run's transcript. Returns the
- * first non-empty line of the reply, or null on failure/timeout — naming must never fail a run.
+ * Asks the harness model for a run name with one headless `omp -p --no-session --no-tools` call inside
+ * the run's sandbox. Emits no `acp.update`/`sandbox.log`: naming is not part of the run's transcript.
+ * Returns the first non-empty line of the reply, or null on failure/timeout — naming must never fail a run.
  */
-async function nameRun(prompt: string, sandbox: Sandbox, adapter: { printArgv(resume?: string): string[] }, hostPath: string, signal: AbortSignal): Promise<string | null> {
+async function nameRun(
+  prompt: string,
+  sandbox: Sandbox,
+  adapter: { printArgv(resume?: string): string[] },
+  hostPath: string,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<string | null> {
   const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), NAME_TIMEOUT_MS);
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
   // Cancelling the run aborts naming too, so the runner is free at once (the finally kills the process).
   const onCancel = () => abort.abort();
   signal.addEventListener("abort", onCancel, { once: true });
   let proc: SandboxProcess | undefined;
   try {
+    // Killing the host-side `docker exec` client does not signal the process in the container, and
+    // the run keeps using that container after a timeout, so `timeout -s KILL` bounds it in-container.
+    // `--no-tools`: naming only needs text; the agent must not touch the worktree or network.
     // `--` stops omp flag parsing so args cannot inject launch flags; the text stays one argv element.
-    proc = sandbox.exec([...adapter.printArgv(undefined), "--no-session", "--", prompt], hostPath);
+    const argv = [...adapter.printArgv(undefined), "--no-session", "--no-tools", "--", prompt];
+    proc = sandbox.exec(["timeout", "-s", "KILL", String(Math.ceil(timeoutMs / 1000)), ...argv], hostPath);
     // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
     void proc.stdin.close();
     const drain = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
@@ -198,8 +222,8 @@ async function nameRun(prompt: string, sandbox: Sandbox, adapter: { printArgv(re
     );
     if (abort.signal.aborted || exitCode !== 0) return null;
     for (const update of translator.end()) void update; // flush a trailing partial NDJSON line
-    const name = firstLine(plainText(translator.result() ?? ""));
-    return name ? name.slice(0, 200) : null;
+    const name = clampRunName(firstLine(plainText(translator.result() ?? "")));
+    return name || null;
   } catch {
     return null;
   } finally {
@@ -834,9 +858,10 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       // Agent naming: the assigned runner owns the model gateway, so it names the run before step 1.
       // Failure or timeout only skips the name; the run proceeds (and may be named on a later retry).
       if (run.namePrompt && sandbox && workspace) {
-        const name = await nameRun(run.namePrompt, sandbox, adapter, workspace.hostPath, signal);
+        const nameTimeoutMs = deps.nameTimeoutMs ?? NAME_TIMEOUT_MS;
+        const name = await nameRun(run.namePrompt, sandbox, adapter, workspace.hostPath, signal, nameTimeoutMs);
         if (name) emit({ type: "run.name", payload: { name } });
-        else console.warn(`[job ${runId}] naming skipped (no name within ${NAME_TIMEOUT_MS / 1000}s or omp -p failed)`);
+        else console.warn(`[job ${runId}] naming skipped (no name within ${nameTimeoutMs / 1000}s or omp -p failed)`);
         checkCancelled();
       }
 

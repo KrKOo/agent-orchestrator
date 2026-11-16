@@ -5,6 +5,7 @@ import {
   type InputDef,
   type PullRequestInput,
   type RunDetail,
+  RUN_NAME_MAX,
 } from "@orch/protocol";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -23,7 +24,7 @@ const { flows, runs, runSteps, findings } = schema;
 const CreateRunBody = z
   .object({
     inputs: z.record(z.string(), z.string()).optional(),
-    name: z.string().trim().min(1).max(120).optional(),
+    name: z.string().trim().min(1).max(RUN_NAME_MAX).optional(),
     autoName: z.boolean().optional(),
   })
   .refine((b) => !(b.name !== undefined && b.autoName), {

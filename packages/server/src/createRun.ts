@@ -2,6 +2,7 @@ import {
   PR_DIFF_PATH,
   pullRequestInputOf,
   UNTRUSTED_PREAMBLE,
+  unwrapUntrustedText,
   wrapUntrustedText,
   type FlowDefinition,
   type PullRequestInput,
@@ -64,25 +65,36 @@ export interface RunName {
   autoName?: boolean;
 }
 
+/** Max characters of one untrusted input value quoted in the naming prompt. */
+const NAME_PROMPT_VALUE_MAX = 200;
+
 /**
  * Composes the headless prompt the runner runs to name the run: flow name plus one line per input.
- * GitHub titles and text inputs are untrusted data, so each is wrapped and truncated; the instruction
- * pins the answer to a short name so models do not narrate.
+ * GitHub titles and text inputs are untrusted data, so each is wrapped exactly once, clipped before
+ * wrapping so a cut never drops a closing tag; the instruction pins the answer to a short name so
+ * models do not narrate.
  */
 export function runNamePrompt(def: FlowDefinition, inputs: Record<string, unknown>): string {
   const lines: string[] = [UNTRUSTED_PREAMBLE, `Flow: ${def.name}`];
   for (const input of def.inputs) {
     const value = inputs[input.key];
-    let text: string | null = null;
-    if (typeof value === "object" && value !== null) {
+    // `ref` (repo#number and GitHub's URL) is server-resolved; only `text` is untrusted.
+    let ref = "";
+    let text: string;
+    if (input.type === "github_issue" || input.type === "github_pull_request") {
+      if (typeof value !== "object" || value === null) continue;
       const v = value as { title?: unknown; url?: unknown; repo?: unknown; number?: unknown };
-      if (typeof v.title === "string" && typeof v.url === "string" && typeof v.repo === "string" && typeof v.number === "number") {
-        text = `${v.repo}#${v.number} (${v.url}): ${v.title}`;
-      }
+      if (typeof v.title !== "string" || typeof v.url !== "string" || typeof v.repo !== "string" || typeof v.number !== "number") continue;
+      ref = `${v.repo}#${v.number} (${v.url}) `;
+      // PR titles are stored wrapped (`pullRequestInput`); unwrap so every title is clipped and wrapped once.
+      text = unwrapUntrustedText(v.title);
     } else if (typeof value === "string" && value.trim()) {
       text = value.trim();
+    } else {
+      continue;
     }
-    if (text !== null) lines.push(`${input.label || input.key}: ${wrapUntrustedText(text.length > 200 ? `${text.slice(0, 200)}…` : text)}`);
+    const clipped = text.length > NAME_PROMPT_VALUE_MAX ? `${text.slice(0, NAME_PROMPT_VALUE_MAX)}…` : text;
+    lines.push(`${input.label || input.key}: ${ref}${wrapUntrustedText(clipped)}`);
   }
   lines.push(
     "Reply with a short human-readable name for this run only (max 6 words, no quotes, no explanation, no list).",
