@@ -424,6 +424,14 @@ textarea:focus {
   margin: 0;
   border-radius: 0;
 }
+.warn-box {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+  border-radius: 4px;
+  font-size: 12px;
+}
 
 /* collapsible */
 .collapsible-summary {

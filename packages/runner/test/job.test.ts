@@ -20,6 +20,7 @@ import type { Gateway } from "../src/gateway";
 import { JobManager, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
 import { type McpOutputServer, startMcpServer } from "../src/mcp-output";
+import { TRUNCATED_MARK } from "../src/outbox";
 import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/types";
 import { sinkToWritable } from "../src/sandbox/types";
 
@@ -52,6 +53,17 @@ class FakeSandboxProvider implements SandboxProvider {
     this.specs.push(spec);
     return {
       exec: (argv, cwd) => {
+        // `bash -c <script>` (shell steps): run real bash on the host — the sandbox is faked anyway.
+        if (argv[0] === "bash" && argv[1] === "-c") {
+          const proc = Bun.spawn(["bash", "-c", argv[2] ?? ""], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          return {
+            stdin: sinkToWritable(proc.stdin),
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+            exited: proc.exited,
+            kill: () => proc.kill(),
+          };
+        }
         // `omp -p ...` (slash steps): run the fake print-mode responder instead of the ACP agent.
         if (argv.includes("-p")) {
           const resume = argv.indexOf("--resume");
@@ -764,6 +776,121 @@ describe("runJob", () => {
     );
   });
 
+  test("shell step: stdout is the output, stderr lands in the sandbox log", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "shell", id: "run", name: "Run", command: "echo hello; echo oops >&2" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const finished = ofType(events, "step.finished")[0]!;
+    expect(finished.stepId).toBe("run");
+    expect(finished.payload).toEqual({ status: "succeeded", output: "hello\n" });
+    const logs = ofType(events, "sandbox.log").filter((e) => e.stepId === "run");
+    expect(logs.map((e) => `${e.payload.stream}:${e.payload.text}`).join("")).toContain("stdout:hello\n");
+    expect(logs.map((e) => `${e.payload.stream}:${e.payload.text}`).join("")).toContain("stderr:oops\n");
+  });
+
+  test("shell step: a failing command fails the step with exit code and stderr", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "shell", id: "broken", name: "Broken", command: "echo working >&2; exit 3" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({
+      t: "job.finished",
+      runId: run.runId,
+      status: "failed",
+      error: expect.stringContaining("exited with code 3"),
+    });
+    const finished = ofType(events, "step.finished")[0]!;
+    expect(finished.payload.status).toBe("failed");
+    expect(finished.payload.error).toContain("exited with code 3");
+    expect(finished.payload.error).toContain("working");
+    // The run stops before later steps.
+    expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["broken"]);
+  });
+
+  test("shell step output feeds a later step's template", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      inputs: [{ key: "topic", label: "Topic", type: "text", required: true }],
+      steps: [
+        { kind: "shell", id: "run", name: "Run", command: "echo value-of-{{inputs.topic}}" },
+        { kind: "slash", id: "use", name: "Use", command: "review", args: "got {{steps.run.output}}" },
+      ],
+    });
+    run.inputs.topic = "tea";
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const finished = Object.fromEntries(ofType(events, "step.finished").map((e) => [e.stepId, e.payload]));
+    expect(finished.run).toEqual({ status: "succeeded", output: "value-of-tea\n" });
+    // The slash step's fake-print responder echoes the prompt with the rendered template.
+    expect(finished.use).toMatchObject({ status: "succeeded", output: "print:/review got value-of-tea\n" });
+  });
+
+  test("shell step: untrusted text in a template value stays data (env-var rendering)", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      inputs: [{ key: "topic", label: "Topic", type: "text", required: true }],
+      steps: [{ kind: "shell", id: "run", name: "Run", command: "echo {{inputs.topic}}" }],
+    });
+    run.inputs.topic = "$(touch pwned; touch pwned2; echo injected)";
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const finished = ofType(events, "step.finished")[0]!;
+    // The raw text is echoed verbatim: bash never parsed it as a command substitution.
+    expect(finished.payload).toEqual({ status: "succeeded", output: `${run.inputs.topic}\n` });
+    expect(existsSync(join(config.dataDir, "worktrees", run.runId, "pwned"))).toBe(false);
+    expect(existsSync(join(config.dataDir, "worktrees", run.runId, "pwned2"))).toBe(false);
+  });
+
+  test("shell step: stdout beyond the cap is stored as a truncation-marked prefix", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "shell", id: "big", name: "Big", command: "yes x | head -c 3000000" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const finished = ofType(events, "step.finished")[0]!;
+    expect(finished.payload.status).toBe("succeeded");
+    expect(finished.payload.output).toHaveLength(1_000_000 + TRUNCATED_MARK.length);
+    expect((finished.payload.output as string).endsWith(TRUNCATED_MARK)).toBe(true);
+  });
+
+  test("shell step: a failing command with empty stderr omits the colon", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const run = assigned({
+      steps: [{ kind: "shell", id: "quiet", name: "Quiet", command: "exit 4" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "failed", error: "Command exited with code 4" });
+  });
+
+  test("shell-only flow runs without the ACP harness and with the command run in the worktree", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const run = assigned({
+      steps: [{ kind: "shell", id: "ls", name: "List", command: "test -f a.txt && echo found && pwd" }],
+    });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    // No agent steps: no harness, no acp.update traffic.
+    expect(ofType(events, "acp.update")).toHaveLength(0);
+    // The sandbox exec ran real bash in the workspace (worktree path contains a.txt).
+    const logs = ofType(events, "sandbox.log").map((e) => e.payload.text).join("");
+    expect(logs).toContain("found");
+    expect(logs).toContain(join(config.dataDir, "worktrees", run.runId));
+    expect(sandboxes.destroyed).toBe(1);
+  });
+
   test("approval ask: permission request round-trips through PendingRequests", async () => {
     const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
     const pending = new PendingRequests();
@@ -1351,6 +1478,18 @@ describe("runJob: untrusted pull request runs", () => {
     // The checkout is deleted after the run.
     expect(existsSync(checkout)).toBe(false);
     expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("shell steps run in the PR checkout", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    deps.config = { ...config, acceptUntrusted: true };
+    deps.githubGitUrl = `file://${ghRoot}`;
+    deps.rpc = async <T>() => ({ token: "read-token" }) as T;
+    const run = prRun([{ kind: "shell", id: "show", name: "Show", command: "cat app.py" }]);
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    expect(ofType(events, "step.finished")[0]!.payload).toMatchObject({ status: "succeeded", output: "print('hi')\neval(input())\n" });
   });
 
   test("github_comment posts the comment body via RPC", async () => {

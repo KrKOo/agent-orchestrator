@@ -15,6 +15,7 @@ import {
   type RunEventDraft,
   type RunnerMessage,
   REPO_RE,
+  renderShellCommand,
   type Step,
   type TemplateContext,
   UNTRUSTED_PREAMBLE,
@@ -35,6 +36,7 @@ import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
 import { OmpJsonTranslator } from "./omp-json";
+import { TRUNCATED_MARK } from "./outbox";
 import type { Mount, Sandbox, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
 import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
@@ -61,6 +63,8 @@ export interface JobDeps {
 const ANSWER_TIMEOUT_MS = 30 * 60_000;
 /** Grace period between asking the agent to stop and tearing the sandbox down. */
 const CANCEL_GRACE_MS = 10_000;
+/** Cap for the stored (and template-referenced) stdout of a `shell` step. */
+const SHELL_OUTPUT_LIMIT = 1_000_000;
 
 /** `{type, payload}` of every run event, correlated (distributes over the event union). */
 type EventBody = RunEventDraft extends infer E ? (E extends { type: infer T; payload: infer P } ? { type: T; payload: P } : never) : never;
@@ -182,6 +186,9 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
   if (run.trust === "untrusted") {
     if (!deps.config.acceptUntrusted) return "Runner does not accept untrusted runs";
     if (def.workspace.kind === "local_path") return "Untrusted runs cannot mount local paths";
+    // Defense in depth: `validateFlow` already rejects action steps in PR flows, and an untrusted
+    // run needs a `github_pull_request` input, but the runner must not depend on that staying true.
+    // Shell steps are allowed: they run in the same sandbox the agent already executes code in.
     if (def.steps.some(isActionStep)) return "Untrusted runs cannot run action steps";
     if (def.approval === "ask") return "Untrusted runs cannot use approval: ask";
     if (def.sandbox.network.mode === "open") return "Untrusted runs cannot use open network";
@@ -555,6 +562,48 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     }
   };
 
+  /**
+   * Runs a templated shell command as `bash -c <rendered>` inside the sandbox at the workspace path.
+   * Stdout is the step output (`{{steps.<id>.output}}`); both streams land in the run log (rendered
+   * under the step), stderr's tail is also kept for the failure error. A non-zero exit fails the step.
+   * Template values are rendered into the script as environment variables (see `renderShellCommand`)
+   * and the stored output is capped at {@link SHELL_OUTPUT_LIMIT} chars so a chatty command cannot
+   * balloon the run's `ctx`, events and server payloads.
+   */
+  const runShellStep = async (step: Extract<Step, { kind: "shell" }>, abort: AbortSignal): Promise<StepOutcome> => {
+    const script = renderShellCommand(step.command, ctx);
+    const proc = sandbox!.exec(["bash", "-c", script], workspace!.hostPath);
+    // Nothing is written to stdin; closing it so commands reading stdin see EOF instead of hanging.
+    void proc.stdin.close();
+    const drain = async (stream: ReadableStream<Uint8Array>, stream2: "stdout" | "stderr"): Promise<string> => {
+      const decoder = new TextDecoder();
+      let text = "";
+      for await (const chunk of stream) {
+        const part = decoder.decode(chunk, { stream: true });
+        text += part;
+        emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, step.id);
+      }
+      return text;
+    };
+    try {
+      const [stdout, stderr, exitCode] = await rejectWhenAborted(
+        Promise.all([drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"), proc.exited]),
+        abort,
+      );
+      // Log and store at most this much stdout; the sandbox log keeps streaming regardless.
+      const kept = stdout.length > SHELL_OUTPUT_LIMIT ? `${stdout.slice(0, SHELL_OUTPUT_LIMIT)}${TRUNCATED_MARK}` : stdout;
+      if (abort.aborted) return { status: "cancelled", output: kept };
+      if (exitCode !== 0) {
+        const tail = stderr.trim().slice(-500);
+        return { status: "failed", output: kept, error: `Command exited with code ${exitCode}${tail ? `: ${tail}` : ""}` };
+      }
+      return { status: "succeeded", output: kept };
+    } finally {
+      // No-op after a normal exit; on abort (cancel, step or revision timeout) it stops the run.
+      proc.kill();
+    }
+  };
+
   const runSlashStep = async (step: Extract<Step, { kind: "slash" }>, abort: AbortSignal): Promise<StepOutcome> => {
     const prompt = step.args && step.args.trim() ? `/${step.command} ${renderTemplate(step.args, ctx).trim()}` : `/${step.command}`;
     const { sessionId, ...outcome } = await slashRun(prompt, step.id, abort);
@@ -598,7 +647,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   };
 
   const runActionStep = async (
-    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "intervention" } | { kind: "github_comment" }>,
+    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" }>,
     abort: AbortSignal,
   ): Promise<StepOutcome> => {
     const ws = workspace!;
@@ -659,11 +708,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         ? await runAgentStep(step, abort.signal)
         : step.kind === "slash"
           ? await runSlashStep(step, abort.signal)
-          : step.kind === "intervention"
-            ? await runInterventionStep(step, previous, abort.signal)
-            : step.kind === "github_comment"
-              ? await runCommentStep(step, abort.signal)
-              : await runActionStep(step, abort.signal);
+          : step.kind === "shell"
+            ? await runShellStep(step, abort.signal)
+            : step.kind === "intervention"
+              ? await runInterventionStep(step, previous, abort.signal)
+              : step.kind === "github_comment"
+                ? await runCommentStep(step, abort.signal)
+                : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };

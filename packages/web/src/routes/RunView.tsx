@@ -288,7 +288,12 @@ function RunViewInner({ runId }: { runId: string }) {
             {startSession && <InterventionStart session={startSession} />}
             <Transcript step={step} />
             {selectedDef && (
-              <StepResult step={step} stepId={selectedDef.id} markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"} />
+              <StepResult
+                step={step}
+                stepId={selectedDef.id}
+                markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"}
+                mono={selectedDef.kind === "shell"}
+              />
             )}
             {runLevel && runLevel.items.length > 0 && (
               <Collapsible summary="Run-level updates" className="diagnostics">

@@ -3,6 +3,7 @@ import {
   type FlowDefinition,
   isAgentStep,
   isTextStep,
+  pullRequestInputOf,
   type Step,
   type TemplateVariable,
   templateVariables,
@@ -14,6 +15,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   skill: "Skill",
   command: "Command",
   slash: "Slash command",
+  shell: "Shell command",
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
@@ -26,6 +28,7 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   skill: "🧠",
   command: "⌨️",
   slash: "💬",
+  shell: "🖥️",
   git_commit: "✅",
   git_push: "⏫",
   github_pr: "🚀",
@@ -297,6 +300,30 @@ export function StepPanel({
           onChange={(args) => set({ args: args === "" ? undefined : args })}
         />
       )}
+      {step.kind === "shell" && (
+        <>
+          <TemplateField
+            label="Command"
+            rows={6}
+            value={step.command}
+            vars={vars}
+            onChange={(command) => set({ command })}
+          />
+          <p className="muted small">
+            Runs as <code>bash -c</code> in the sandbox at the workspace path. Stdout becomes{" "}
+            <code>{`{{steps.${step.id}.output}}`}</code>; stderr streams to the run log. A non-zero exit fails
+            the step.
+          </p>
+          {pullRequestInputOf(def) && (
+            <p className="warn-box">
+              ⚠️ This flow runs on untrusted pull requests. The command runs in the PR author's checkout, so
+              anything it executes there (build scripts, tests, package installs, repo binaries) is code they
+              control, with the sandbox's network and gateway access. Template values reach bash as data, but
+              never <code>eval</code> them or pass them to tools that interpret them as code.
+            </p>
+          )}
+        </>
+      )}
       {isAgentStep(step) && (
         <>
           <label className="check">
@@ -399,7 +426,7 @@ export function StepPanel({
           </label>
           {refSelect("Comment body from", step.bodyFrom, "bodyFrom", {
             steps: earlierSteps.filter(isTextStep),
-            noun: "prompt, skill, command, slash or intervention step",
+            noun: "prompt, skill, command, slash, shell or intervention step",
           })}
           <p className="muted small">Posts the body as a comment (mentions neutralized); the step output is the comment URL.</p>
         </>
