@@ -1,4 +1,4 @@
-#!/bin/sh
+–#!/bin/sh
 set -e
 mkdir -p "$HOME/.omp/agent"
 if [ -f /orch/config/models.yml ]; then

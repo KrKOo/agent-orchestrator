@@ -3,6 +3,7 @@ import {
   type FlowDefinition,
   isAgentStep,
   isTextStep,
+  pullRequestInputOf,
   type Step,
   type TemplateVariable,
   templateVariables,
@@ -311,8 +312,16 @@ export function StepPanel({
           <p className="muted small">
             Runs as <code>bash -c</code> in the sandbox at the workspace path. Stdout becomes{" "}
             <code>{`{{steps.${step.id}.output}}`}</code>; stderr streams to the run log. A non-zero exit fails
-            the step. Not available in pull-request flows.
+            the step.
           </p>
+          {pullRequestInputOf(def) && (
+            <p className="warn-box">
+              ⚠️ This flow runs on untrusted pull requests. The command runs in the PR author's checkout, so
+              anything it executes there (build scripts, tests, package installs, repo binaries) is code they
+              control, with the sandbox's network and gateway access. Template values reach bash as data, but
+              never <code>eval</code> them or pass them to tools that interpret them as code.
+            </p>
+          )}
         </>
       )}
       {isAgentStep(step) && (

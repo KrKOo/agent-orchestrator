@@ -47,8 +47,9 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   reach the script as environment variables (`{{steps.<id>.output}}` is rewritten to `${ORCH_REF_n}` and the
   value is exported quoted), so untrusted text in them stays data and can never become shell code. Stdout is
   the step output (kept beyond 1 MB only as a truncation-marked prefix); stderr streams to the run log; a
-  non-zero exit fails the step. Flows with a pull request input cannot contain shell steps: PR
-  title/body are template-renderable, and the runner additionally rejects shell steps in untrusted runs.
+  non-zero exit fails the step. Shell steps are allowed in pull request flows, but there they run in the PR
+  author's checkout: anything the command executes from it (build scripts, tests, package installs) is
+  untrusted code with the sandbox's network and gateway access. The flow editor warns about this.
 - **Intervention steps** pause the run and open a chat under the step in the run view. Pick one of the run's
   sessions — the shared agent (ACP) session of prompt/skill/command steps, or the `omp -p` session of an
   earlier slash step (resumed with `--resume`) — and send any text, slash commands included; replies stream
@@ -85,7 +86,8 @@ Its fields are `{{inputs.<key>.url|repo|number|title|body|baseSha|headSha|diffPa
 
 - uses the `github_checkout` workspace (set automatically in the editor): the runner checks out the PR head on the host,
   mounts it read-only and writes the diff to `/orch/context/pr.diff`;
-- runs untrusted, on runners with `acceptUntrusted: true`: approval `auto`, no `open` network, no git commit/push/PR steps.
+- runs untrusted, on runners with `acceptUntrusted: true`: approval `auto`, no `open` network, no git commit/push/PR steps;
+  shell steps are allowed but run against the untrusted checkout (see Shell steps above).
 
 **`github_comment` steps** work in any flow: they post the output of an earlier prompt/skill/command/slash/shell/intervention step
 (`bodyFrom` accepts `"<stepId>"`, `"<stepId>.output"` or `"<stepId>.structured.<field>"`) as a comment on the issue or pull

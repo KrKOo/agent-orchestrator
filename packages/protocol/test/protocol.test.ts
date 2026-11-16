@@ -502,14 +502,13 @@ describe("validateFlow for flows with a pull request input", () => {
     }
   });
 
-  test("rejects shell steps in flows with a pull request input", () => {
+  test("accepts shell steps in flows with a pull request input", () => {
     const res = validateFlow({
       ...prFlow,
       steps: [...prFlow.steps, { id: "run", name: "Run", kind: "shell", command: "cat {{inputs.pr.diffPath}}" }],
     });
-    expect(res.ok).toBe(false);
-    if (res.ok) return;
-    expect(res.errors.join()).toContain("flows with a pull request input cannot contain shell steps");
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps.at(-1)).toMatchObject({ kind: "shell" });
   });
 
   test("github_checkout and the PR trigger need the PR input", () => {

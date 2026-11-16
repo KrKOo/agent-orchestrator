@@ -186,11 +186,10 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
   if (run.trust === "untrusted") {
     if (!deps.config.acceptUntrusted) return "Runner does not accept untrusted runs";
     if (def.workspace.kind === "local_path") return "Untrusted runs cannot mount local paths";
-    // Defense in depth, mirroring the action-step check: `validateFlow` already rejects action and
-    // shell steps in PR flows, and an untrusted run needs a `github_pull_request` input, but the
-    // runner must not depend on that staying true.
+    // Defense in depth: `validateFlow` already rejects action steps in PR flows, and an untrusted
+    // run needs a `github_pull_request` input, but the runner must not depend on that staying true.
+    // Shell steps are allowed: they run in the same sandbox the agent already executes code in.
     if (def.steps.some(isActionStep)) return "Untrusted runs cannot run action steps";
-    if (def.steps.some((s) => s.kind === "shell")) return "Untrusted runs cannot run shell steps";
     if (def.approval === "ask") return "Untrusted runs cannot use approval: ask";
     if (def.sandbox.network.mode === "open") return "Untrusted runs cannot use open network";
     if (!run.github) return "Untrusted runs require a pull request";

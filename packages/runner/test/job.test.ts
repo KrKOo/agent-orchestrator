@@ -1116,34 +1116,6 @@ describe("runJob", () => {
     expect(sandboxes.specs).toHaveLength(0);
   });
 
-  test("untrusted runs with a shell step are rejected before any sandbox exists", async () => {
-    const sandboxes = new FakeSandboxProvider();
-    const { deps, events, sent } = harnessDeps(sandboxes);
-    deps.config = { ...config, acceptUntrusted: true };
-    const run = assigned(
-      {
-        workspace: { kind: "github_checkout" },
-        inputs: [{ key: "pr", label: "Pull request", type: "github_pull_request", required: true }],
-        steps: [{ kind: "shell", id: "run", name: "Run", command: "cat /orch/context/pr.diff" }],
-      },
-      "untrusted",
-    );
-    run.github = { repo: "acme/widget", number: 7, headSha, baseSha };
-    await runJob(run, deps, new AbortController().signal);
-
-    // `validateFlow` rejects shell steps in PR flows first (the runner-side untrusted check is
-    // defense in depth behind it); either way no sandbox is created and the reason is quoted.
-    expect(sent).toEqual([
-      {
-        t: "job.rejected",
-        runId: run.runId,
-        reason: "Invalid flow: steps.0 (run): flows with a pull request input cannot contain shell steps",
-      },
-    ]);
-    expect(events).toEqual([]);
-    expect(sandboxes.specs).toHaveLength(0);
-  });
-
   test("workspace outside allowedRoots is rejected", async () => {
     const { deps, sent } = harnessDeps(new FakeSandboxProvider());
     const run = assigned({ workspace: { kind: "local_path", path: tmpdir() }, steps: [{ kind: "prompt", id: "p", name: "P", prompt: "x" }] });
@@ -1506,6 +1478,18 @@ describe("runJob: untrusted pull request runs", () => {
     // The checkout is deleted after the run.
     expect(existsSync(checkout)).toBe(false);
     expect(sandboxes.destroyed).toBe(1);
+  });
+
+  test("shell steps run in the PR checkout", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    deps.config = { ...config, acceptUntrusted: true };
+    deps.githubGitUrl = `file://${ghRoot}`;
+    deps.rpc = async <T>() => ({ token: "read-token" }) as T;
+    const run = prRun([{ kind: "shell", id: "show", name: "Show", command: "cat app.py" }]);
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    expect(ofType(events, "step.finished")[0]!.payload).toMatchObject({ status: "succeeded", output: "print('hi')\neval(input())\n" });
   });
 
   test("github_comment posts the comment body via RPC", async () => {

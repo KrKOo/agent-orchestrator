@@ -203,7 +203,7 @@ export const GitCommitStep = z.object({
  * Runs a templated command as `bash -c <rendered command>` inside the sandbox at the workspace path.
  * Template values are rendered as environment variables (`renderShellCommand`), so untrusted text in
  * them stays data. Stdout is the step output (`{{steps.<id>.output}}`); stderr streams to the run log.
- * A non-zero exit fails the step. Not available in flows with a pull request input.
+ * A non-zero exit fails the step. In pull request flows it runs against the untrusted PR checkout.
  */
 export const ShellStep = z.object({
   ...stepBase,
@@ -515,9 +515,6 @@ export function validateFlow(input: unknown): ValidateResult {
       else if (flow.workspace.kind !== "local_path" || flow.workspace.isolation !== "worktree" || flow.workspace.access !== "rw") {
         errors.push(`${where}: ${step.kind} requires workspace isolation "worktree" with access "rw"`);
       }
-    }
-    if (step.kind === "shell" && prFlow) {
-      errors.push(`${where}: flows with a pull request input cannot contain shell steps`);
     }
     if (step.kind === "github_comment") {
       const target = inputs.get(step.target);
