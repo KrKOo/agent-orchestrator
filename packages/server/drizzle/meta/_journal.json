@@ -50,6 +50,13 @@
       "when": 1794847167581,
       "tag": "0006_run_name",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794942136380,
+      "tag": "0007_compact_run_events",
+      "breakpoints": true
     }
   ]
 }

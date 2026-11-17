@@ -320,7 +320,7 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
 
 export function applyRunEvents(state: RunViewState, events: RunEvent[]): RunViewState {
   // Logs are independent of other state, so a batch (e.g. a replayed backlog with thousands of
-  // raw NDJSON lines) appends them in one copy instead of re-copying the array per line.
+  // shell output chunks) appends them in one copy instead of re-copying the array per line.
   const logs: LogLine[] = [];
   let next = state;
   for (const ev of events) {

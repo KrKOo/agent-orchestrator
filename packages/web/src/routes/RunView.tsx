@@ -365,7 +365,7 @@ function RunViewInner({ runId }: { runId: string }) {
   );
 }
 
-/** Log chunks as one `<pre>`; long logs (a slash step streams all of omp's NDJSON) show their tail first. */
+/** Log chunks as one `<pre>`; long logs (a chatty shell step) show their tail first. */
 function SandboxLog({ logs }: { logs: LogLine[] }) {
   const [all, setAll] = useState(false);
   // Newest chunks within the budget, and always at least the last one.

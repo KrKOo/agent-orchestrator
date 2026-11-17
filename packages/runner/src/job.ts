@@ -13,6 +13,7 @@ import {
   type GitHubTokenResult,
   InterventionAction,
   type RunEventDraft,
+  type SessionUpdate,
   type RunnerMessage,
   REPO_RE,
   renderShellCommand,
@@ -40,6 +41,7 @@ import { OmpJsonTranslator } from "./omp-json";
 import { TRUNCATED_MARK } from "./outbox";
 import type { Mount, Sandbox, SandboxProcess, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
+import { ToolUpdateCompactor } from "./tool-updates";
 import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
 
 export interface JobDeps {
@@ -305,6 +307,12 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   const emit = (body: EventBody, stepId?: string) =>
     // `body` is one correlated {type, payload} member; adding envelope fields keeps it a RunEventDraft.
     deps.emit({ ...body, runId, ts: Date.now(), ...(stepId !== undefined ? { stepId } : {}) } as RunEventDraft);
+  const toolUpdates = new ToolUpdateCompactor();
+  /** Emits an ACP session update unless compaction finds it redundant (see {@link ToolUpdateCompactor}). */
+  const emitUpdate = (update: SessionUpdate, stepId: string) => {
+    const kept = toolUpdates.compact(update, stepId);
+    if (kept) emit({ type: "acp.update", payload: { update: kept } }, stepId);
+  };
 
   const reason = await rejectReason(run, deps);
   if (reason) {
@@ -478,7 +486,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         } else if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
           afterToolCall = true;
         }
-        emit({ type: "acp.update", payload: { update } }, eventStepId);
+        emitUpdate(update, eventStepId);
       });
       const structured = activeStep.structured;
       if (abort.aborted) return { status: "cancelled", output };
@@ -605,7 +613,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
     void proc.stdin.close();
     const translator = new OmpJsonTranslator();
-    // stdout is NDJSON for the translator, never output itself; only stderr is kept (for errors).
+    // stdout is NDJSON for the translator, never output itself. It is not logged either: what the UI
+    // renders of it arrives as acp.updates, and the raw stream was most of a slash run's stored events.
+    // Only stderr is logged and kept (for errors).
     const drain = async (stream: ReadableStream<Uint8Array>, stream2: "stdout" | "stderr"): Promise<string> => {
       const decoder = new TextDecoder();
       let text = "";
@@ -613,11 +623,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         const part = decoder.decode(chunk, { stream: true });
         if (stream2 === "stdout") {
           // Translate before emitting so text deltas and tool cards stream like agent steps do.
-          for (const update of translator.push(part)) emit({ type: "acp.update", payload: { update } }, eventStepId);
+          for (const update of translator.push(part)) emitUpdate(update, eventStepId);
         } else {
           text += part;
+          emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, eventStepId);
         }
-        emit({ type: "sandbox.log", payload: { stream: stream2, text: part } }, eventStepId);
       }
       return text;
     };
@@ -626,7 +636,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         Promise.all([drain(proc.stdout, "stdout"), drain(proc.stderr, "stderr"), proc.exited]),
         abort,
       );
-      for (const update of translator.end()) emit({ type: "acp.update", payload: { update } }, eventStepId);
+      for (const update of translator.end()) emitUpdate(update, eventStepId);
       const output = translator.result();
       const sessionId = translator.sessionId();
       if (abort.aborted) return { status: "cancelled", output };

@@ -400,9 +400,9 @@ describe("runJob", () => {
       return c.text;
     };
     expect(updates.map((e) => chunkText(e.payload.update)).join("")).toBe("print:/review focus on tea\n");
-    // Raw NDJSON still lands in the sandbox log.
+    // The raw NDJSON is not logged: its rendering is already in the acp.updates.
     const logs = ofType(events, "sandbox.log").filter((e) => e.stepId === "review");
-    expect(logs.map((e) => e.payload.text).join("")).toContain("message_update");
+    expect(logs.filter((e) => e.payload.stream === "stdout")).toHaveLength(0);
   });
 
   describe("structured output (submit_output)", () => {
