@@ -25,6 +25,7 @@ export type TranscriptItem =
   | { kind: "user"; text: string }
   | { kind: "tool"; toolCallId: string }
   | { kind: "plan"; entries: PlanEntryView[] }
+  | { kind: "iteration"; n: number }
   | { kind: "other"; update: { sessionUpdate: string; [k: string]: unknown } };
 
 export interface SubagentMessageView {
@@ -77,6 +78,8 @@ export interface InterventionView {
   session?: string;
   /** Why the last chat turn failed. */
   error?: string;
+  /** Set on `ask` loop gates that can still repeat: repeat from `toStepId`, starting iteration `iteration` of `maxIterations`. */
+  repeat?: { toStepId: string; iteration: number; maxIterations: number };
   resolved: boolean;
 }
 
@@ -102,6 +105,8 @@ export interface RunViewState {
   permissions: PermissionView[];
   elicitations: ElicitationView[];
   interventions: InterventionView[];
+  /** Per-loop current/max iteration, kept by `loop.repeat` and cleared when a retry rewinds past the loop. */
+  loops: Record<string, { iteration: number; maxIterations: number }>;
   logs: LogLine[];
 }
 
@@ -113,6 +118,7 @@ export const initialRunViewState: RunViewState = {
   permissions: [],
   elicitations: [],
   interventions: [],
+  loops: {},
   logs: [],
 };
 
@@ -222,6 +228,21 @@ function resetFrom(state: RunViewState, fromStepId: string): RunViewState {
   return { ...state, steps };
 }
 
+/**
+ * Drops the loop counters of loops at or after the retry cursor. We don't know the definition here,
+ * so we can't tell a loop from the body it contains — clearing every counter recorded after the
+ * cursor start errs toward restarting them, which matches the runner (counters restart on retry).
+ */
+function resetLoopsFrom(state: RunViewState, fromStepId: string): RunViewState["loops"] {
+  const idx = state.stepOrder.indexOf(fromStepId);
+  const loops: RunViewState["loops"] = {};
+  for (const [id, c] of Object.entries(state.loops)) {
+    const stepIdx = state.stepOrder.indexOf(id);
+    if (stepIdx >= 0 && idx >= 0 && stepIdx < idx) loops[id] = c;
+  }
+  return loops;
+}
+
 export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
   if (ev.seq <= state.lastSeq) return state;
   const s: RunViewState = { ...state, lastSeq: ev.seq };
@@ -230,15 +251,23 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
       // A retried run re-enters a non-terminal status: the previous attempt's error no longer applies.
       const error = TERMINAL_STATUSES.includes(ev.payload.status) ? (ev.payload.error ?? s.error) : undefined;
       const from = ev.payload.resumeFromStepId;
+      // Retry rewinds loop steps too (the runner restarts their counters), so drop the stale badges.
+      const loops = from === undefined ? s.loops : resetLoopsFrom(s, from);
       return {
         ...(from === undefined ? s : resetFrom(s, from)),
+        loops,
         status: ev.payload.status,
         error,
         workspace: ev.payload.workspace ?? s.workspace,
       };
     }
     case "step.started":
-      return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) => resetAttempt(st, "running"));
+      return withStep({ ...s, currentStepId: ev.stepId }, ev.stepId, (st) =>
+        // Iteration ≥2: the step re-runs inside a loop body; the divider marks each pass in its transcript.
+        ev.payload.iteration === undefined
+          ? resetAttempt(st, "running")
+          : { ...resetAttempt(st, "running"), items: [...st.items, { kind: "iteration", n: ev.payload.iteration }] },
+      );
     case "run.name":
       return { ...s, name: s.name ?? ev.payload.name };
     case "step.finished":
@@ -249,6 +278,21 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
         structured: ev.payload.structured,
         error: ev.payload.error,
       }));
+    case "loop.repeat": {
+      // The body steps repeat: back to pending for their next pass, transcripts kept (one per step).
+      // The loop step itself keeps its finished state; RunView shows its `iteration/max` badge.
+      // Loops nested in the body restart their count (as the runner does), so their badges go too.
+      const loopStepId = ev.stepId ?? "";
+      const steps = { ...s.steps };
+      const loops = { ...s.loops };
+      for (const id of ev.payload.stepIds) {
+        const st = steps[id];
+        if (st) steps[id] = resetAttempt(st, "pending");
+        delete loops[id];
+      }
+      loops[loopStepId] = { iteration: ev.payload.iteration, maxIterations: ev.payload.maxIterations };
+      return { ...s, steps, loops };
+    }
     case "acp.update":
       return withStep(s, ev.stepId, (st) => applyUpdate(st, ev.payload.update));
     case "acp.permission_request":

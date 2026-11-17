@@ -30,6 +30,12 @@ export function Transcript({ step }: { step: StepView }) {
             const call = step.toolCalls[item.toolCallId];
             return call ? <ToolCallCard key={i} call={call} /> : null;
           }
+          case "iteration":
+            return (
+              <div key={i} className="iteration-divider">
+                <span className="iteration-label">Iteration {item.n}</span>
+              </div>
+            );
           case "plan":
             return (
               <div key={i} className="plan">
@@ -60,8 +66,11 @@ export function Transcript({ step }: { step: StepView }) {
   );
 }
 
-/** A finished step's error and outputs, always expanded, labelled with the template reference later steps use. */
-export function StepResult({ step, stepId, markdown, mono }: { step: StepView; stepId: string; markdown: boolean; mono?: boolean }) {
+/**
+ * A finished step's error and outputs, always expanded, labelled with the template reference later steps use.
+ * `stepId` is omitted for steps later steps cannot reference (loop steps), which then show no reference.
+ */
+export function StepResult({ step, stepId, markdown, mono }: { step: StepView; stepId?: string; markdown: boolean; mono?: boolean }) {
   const hasOutput = step.output !== undefined && step.output !== "";
   if (!step.error && !hasOutput && step.structured === undefined) return null;
   return (
@@ -71,7 +80,7 @@ export function StepResult({ step, stepId, markdown, mono }: { step: StepView; s
         <section className="output-card">
           <div className="output-card-head">
             <strong>Output</strong>
-            <code className="small">{`{{steps.${stepId}.output}}`}</code>
+            {stepId !== undefined && <code className="small">{`{{steps.${stepId}.output}}`}</code>}
           </div>
           <LongText className={mono || !markdown ? "output-card-body mono" : "output-card-body"} text={step.output!} markdown={markdown} />
         </section>
@@ -80,7 +89,7 @@ export function StepResult({ step, stepId, markdown, mono }: { step: StepView; s
         <section className="output-card">
           <div className="output-card-head">
             <strong>Structured output</strong>
-            <code className="small">{`{{steps.${stepId}.structured}}`}</code>
+            {stepId !== undefined && <code className="small">{`{{steps.${stepId}.structured}}`}</code>}
           </div>
           <pre className="output-card-body">{JSON.stringify(step.structured, null, 2)}</pre>
         </section>

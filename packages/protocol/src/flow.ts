@@ -251,6 +251,38 @@ export const GitHubCommentStep = z.object({
   target: z.string().min(1),
   bodyFrom: z.string().min(1),
 });
+/**
+ * When a `loop` step stops repeating its body. `max`: run the body exactly `maxIterations` times.
+ * `value`: stop as soon as `ref` (`<stepId>.output` or `<stepId>.structured.<field>` of a step directly
+ * in the body) matches `is` per `isTruthyValue`; checked right after that step succeeds, so it can
+ * break out mid-body. `ask`: pause on an intervention gate that offers "repeat" next to "continue".
+ */
+export const LoopStop = z.discriminatedUnion("when", [
+  z.object({ when: z.literal("max") }),
+  z.object({ when: z.literal("value"), ref: z.string().min(1), is: z.enum(["truthy", "falsy"]) }),
+  z.object({ when: z.literal("ask"), message: z.string().optional() }),
+]);
+export type LoopStop = z.infer<typeof LoopStop>;
+/** Hard cap for `maxIterations` of one loop (nested loops multiply). */
+export const LOOP_MAX_ITERATIONS = 20;
+/**
+ * "Repeat from…": ends a loop body that starts at the earlier step `to` and runs up to this step. On reaching
+ * it the run jumps back to `to` until the stop condition holds or `maxIterations` passes ran; then a `value`
+ * loop's `onExhausted` decides whether the run continues or the step fails (`max` loops just end, and an
+ * `ask` loop's last pass still asks, without offering repeat). Bodies of different loops nest or are
+ * disjoint. `timeoutSec` caps each wait of an `ask` gate, like an intervention's. A loop step has no
+ * template value: later steps cannot reference it.
+ */
+export const LoopStep = z.object({
+  ...stepBase,
+  kind: z.literal("loop"),
+  to: z.string().min(1),
+  maxIterations: z.number().int().min(1).max(LOOP_MAX_ITERATIONS),
+  stop: LoopStop.default({ when: "max" }),
+  onExhausted: z.enum(["continue", "fail"]).default("continue"),
+  timeoutSec: z.number().int().min(0).optional(),
+});
+export type LoopStep = z.infer<typeof LoopStep>;
 
 export const Step = z.discriminatedUnion("kind", [
   PromptStep,
@@ -263,13 +295,14 @@ export const Step = z.discriminatedUnion("kind", [
   GitHubPrStep,
   InterventionStep,
   GitHubCommentStep,
+  LoopStep,
 ]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 /** Steps that change the local workspace's repository or its GitHub remote; need a writable worktree. */
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "shell", "git_commit", "git_push", "github_pr", "intervention", "github_comment"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "shell", "git_commit", "git_push", "github_pr", "intervention", "github_comment", "loop"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
@@ -282,6 +315,53 @@ export function isActionStep(step: Step): step is ActionStep {
 /** Steps whose output is free text a later step can take whole (`bodyFrom` of `github_comment`). */
 export function isTextStep(step: Step): boolean {
   return isAgentStep(step) || step.kind === "slash" || step.kind === "shell" || step.kind === "intervention";
+}
+
+/**
+ * Loop bodies by position: loop step index → index of its `to` step. Loops whose `to` is not an earlier
+ * non-loop step are left out (`validateFlow` reports them), so drafts with broken loops still map.
+ * A body spans `[start, loopIdx]`; the steps it repeats are `[start, loopIdx)`.
+ */
+export function loopRanges(def: Pick<FlowDefinition, "steps">): Map<number, number> {
+  const ranges = new Map<number, number>();
+  def.steps.forEach((step, idx) => {
+    if (step.kind !== "loop") return;
+    const start = def.steps.findIndex((s, i) => i < idx && s.id === step.to);
+    if (start !== -1 && def.steps[start]!.kind !== "loop") ranges.set(idx, start);
+  });
+  return ranges;
+}
+
+/**
+ * Ids of later steps that a template of `def.steps[stepIndex]` may reference as `steps.<id>.output`
+ * because both sit in the same loop body (or the reference target is in an enclosing one): the value
+ * comes from the previous iteration and is empty on the first.
+ */
+function loopBackIds(def: Pick<FlowDefinition, "steps">, ranges: Map<number, number>, stepIndex: number): Set<string> {
+  const ids = new Set<string>();
+  for (const [end, start] of ranges) {
+    if (start > stepIndex || stepIndex >= end) continue;
+    for (let j = stepIndex + 1; j < end; j++) {
+      const step = def.steps[j]!;
+      if (step.kind !== "loop") ids.add(step.id);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Truthiness for loop `value` stops. Falsy: `false`, `null`, `undefined`, `0`, empty or whitespace-only
+ * strings, `"false"`/`"no"`/`"0"` (trimmed, any case), `[]` and `{}`. Everything else is truthy.
+ */
+export function isTruthyValue(value: unknown): boolean {
+  if (value === undefined || value === null || value === false || value === 0) return false;
+  if (typeof value === "string") {
+    const text = value.trim().toLowerCase();
+    return text !== "" && text !== "false" && text !== "no" && text !== "0";
+  }
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }
 
 /** The flow's `github_pull_request` input; a flow declares at most one. */
@@ -324,6 +404,8 @@ export function stepTemplates(step: Step): [string, string][] {
       return [["command", step.command]];
     case "intervention":
       return step.message === undefined ? [] : [["message", step.message]];
+    case "loop":
+      return step.stop.when === "ask" && step.stop.message !== undefined ? [["stop.message", step.stop.message]] : [];
     default:
       return [];
   }
@@ -335,11 +417,13 @@ const INPUT_FIELDS: Record<Exclude<InputDef["type"], "text">, readonly string[]>
   github_pull_request: PR_INPUT_FIELDS,
 };
 
+/** `loopBack`: later steps of an enclosing loop body, referenceable as `.output` only (previous iteration). */
 function checkRef(
   ref: string,
   inputs: Map<string, InputDef>,
   steps: Map<string, Step>,
   earlier: Set<string>,
+  loopBack: Set<string>,
 ): string | null {
   const parts = ref.split(".");
   if (parts[0] === "inputs") {
@@ -353,7 +437,14 @@ function checkRef(
   }
   if (parts[0] === "steps") {
     const id = parts[1];
+    if (id !== undefined && !earlier.has(id) && loopBack.has(id)) {
+      return parts[2] === "output" && parts.length === 3
+        ? null
+        : `references later step "${id}" of this loop; only steps.${id}.output (previous iteration) is available`;
+    }
     if (id === undefined || !earlier.has(id)) return `references step "${id ?? ""}" which is not an earlier step`;
+    // A loop step only reports how it ended; the runner keeps no template value for it.
+    if (steps.get(id)?.kind === "loop") return `references loop step "${id}", which has no output to use`;
     if (parts[2] === "output" && parts.length === 3) return null;
     if (parts[2] === "structured") {
       if (parts.length === 3) return null;
@@ -378,7 +469,8 @@ export interface TemplateVariable {
 
 /**
  * Variables a template of `def.steps[stepIndex]` can reference, following `validateFlow`'s reference rules.
- * `structured` is listed only for agent steps since action steps never submit it.
+ * `structured` is listed only for agent steps since action steps never submit it. Inside a loop body,
+ * later body steps' `.output` is listed too (previous iteration).
  */
 export function templateVariables(def: FlowDefinition, stepIndex: number): TemplateVariable[] {
   const vars = new Map<string, string>();
@@ -399,7 +491,7 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
     }
   }
   for (const step of def.steps.slice(0, stepIndex)) {
-    if (!ID_RE.test(step.id)) continue;
+    if (!ID_RE.test(step.id) || step.kind === "loop") continue;
     add(`steps.${step.id}.output`, `Text output of "${step.name}"`);
     if (isAgentStep(step)) {
       if (step.structured) {
@@ -410,6 +502,11 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
         add(`steps.${step.id}.structured`, `JSON "${step.name}" submitted via submit_output (append .<field> for a value)`);
       }
     }
+  }
+  const ranges = loopRanges(def);
+  for (const id of loopBackIds(def, ranges, stepIndex)) {
+    const step = def.steps.find((s) => s.id === id)!;
+    if (ID_RE.test(id)) add(`steps.${id}.output`, `Text output of "${step.name}" (previous iteration; empty on the first)`);
   }
   return Array.from(vars, ([path, description]) => ({ path, description }));
 }
@@ -491,6 +588,7 @@ export function validateFlow(input: unknown): ValidateResult {
     errors.push(`${where}.${field}: "${ref}" must be an earlier step id, optionally followed by .output or .structured.<field>`);
   };
   let pushed = false;
+  const ranges = loopRanges(flow);
   flow.steps.forEach((step, idx) => {
     const where = `steps.${idx} (${step.id})`;
     if (seen.has(step.id)) errors.push(`${where}: duplicate step id "${step.id}"`);
@@ -511,7 +609,7 @@ export function validateFlow(input: unknown): ValidateResult {
 
     for (const [field, tpl] of stepTemplates(step)) {
       for (const ref of templateRefs(tpl)) {
-        const problem = checkRef(ref, inputs, stepById, seen);
+        const problem = checkRef(ref, inputs, stepById, seen, loopBackIds(flow, ranges, idx));
         if (problem) errors.push(`${where}.${field}: {{${ref}}} ${problem}`);
       }
     }
@@ -546,6 +644,24 @@ export function validateFlow(input: unknown): ValidateResult {
     }
     if (step.kind === "git_push") pushed = true;
     if (step.kind === "github_pr" && !pushed) errors.push(`${where}: github_pr requires an earlier git_push step`);
+    if (step.kind === "github_pr" && [...ranges].some(([e, s]) => s <= idx && idx < e)) {
+      errors.push(`${where}: github_pr cannot run inside a loop (it would open one pull request per iteration)`);
+    }
+    if (step.kind === "loop") {
+      const start = ranges.get(idx);
+      if (start === undefined) {
+        errors.push(`${where}.to: "${step.to}" must be an earlier step that is not a loop`);
+      } else {
+        for (const [end, s] of ranges) {
+          // Earlier loop `[s, end]` crossing this one `[start, idx]`: it starts before this body and ends inside it.
+          if (end < idx && s < start && start <= end) {
+            errors.push(`${where}.to: this loop's body crosses loop "${flow.steps[end]!.id}"; loops must be nested or disjoint`);
+          }
+        }
+        const problem = step.stop.when === "value" ? checkStopRef(flow, ranges, step.stop.ref, start, idx) : null;
+        if (problem) errors.push(`${where}.stop.ref: ${problem}`);
+      }
+    }
 
     seen.add(step.id);
     stepById.set(step.id, step);
@@ -556,6 +672,30 @@ export function validateFlow(input: unknown): ValidateResult {
   return errors.length ? { ok: false, errors } : { ok: true, flow };
 }
 
+/** Validates a `value` stop's ref: `<stepId>.output` of a text step or `<stepId>.structured.<field>` of an agent step, directly in body `[start, end)`. */
+function checkStopRef(flow: FlowDefinition, ranges: Map<number, number>, ref: string, start: number, end: number): string | null {
+  const [id, ...rest] = ref.split(".");
+  const at = flow.steps.findIndex((s, i) => i >= start && i < end && s.id === id);
+  if (at === -1) return `"${ref}" must reference a step inside this loop's body`;
+  // The stop is checked when the referenced step finishes; inside an inner loop that is mid-way through it.
+  if ([...ranges].some(([e, s]) => e < end && s >= start && s <= at && at < e)) {
+    return `step "${id}" is inside a nested loop; reference a step directly in this loop's body`;
+  }
+  const source = flow.steps[at]!;
+  if (rest.length === 1 && rest[0] === "output") {
+    return isTextStep(source) ? null : `step "${id}" has no text output; use a prompt/skill/command/slash/shell/intervention step`;
+  }
+  if (rest.length === 2 && rest[0] === "structured") {
+    if (!isAgentStep(source)) return `"${ref}" references structured output, which only prompt/skill/command steps can produce`;
+    const fields = source.structured?.fields.map((f) => f.name);
+    return !fields || fields.includes(rest[1]!) ? null : `step "${id}" exposes only structured fields ${fields.map((f) => `${id}.structured.${f}`).join(", ")}`;
+  }
+  return `"${ref}" must be <stepId>.output or <stepId>.structured.<field>`;
+}
+
 export type InterventionAction = z.infer<typeof InterventionAction>;
-/** `message` sends text to one of the run's sessions (the gate asks again afterwards); `continue` resumes the flow. */
-export const InterventionAction = z.enum(["message", "continue", "cancel"]);
+/**
+ * `message` sends text to one of the run's sessions (the gate asks again afterwards); `continue` resumes the flow;
+ * `repeat` jumps back to the start of the loop body, only on gates whose request offers it (`ask` loops).
+ */
+export const InterventionAction = z.enum(["message", "continue", "repeat", "cancel"]);

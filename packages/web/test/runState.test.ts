@@ -122,3 +122,97 @@ describe("run.name", () => {
     expect(again.name).toBe("Boot fix");
   });
 });
+
+describe("loops", () => {
+  const chunkOf = (stepId: string, sessionUpdate: string, text: string) =>
+    ev({ type: "acp.update", stepId, payload: { update: { sessionUpdate, content: { type: "text", text } } } });
+  const bodyDone = (stepId: string, status: "succeeded" | "skipped" | "failed" = "succeeded") =>
+    ev({ type: "step.finished", stepId, payload: { status, output: `${stepId} out` } });
+  const firstPass = (loopStepId: string, body: string[]): RunEvent[] => [
+    ...body.flatMap((id) => [
+      ev({ type: "step.started", stepId: id, payload: {} }),
+      chunkOf(id, "agent_message_chunk", `${id} out`),
+      bodyDone(id),
+    ]),
+    ev({ type: "step.started", stepId: loopStepId, payload: {} }),
+    ev({ type: "step.finished", stepId: loopStepId, payload: { status: "succeeded", output: `Repeating from fix (iteration 2 of 3)` } }),
+    ev({
+      type: "loop.repeat",
+      stepId: loopStepId,
+      payload: { toStepId: body[0]!, iteration: 2, maxIterations: 3, stepIds: body },
+    }),
+  ];
+
+  test("loop.repeat resets the listed steps to pending, keeps their transcripts and records the counter", () => {
+    seq = 0;
+    const afterFirst = applyRunEvents(initialRunViewState, firstPass("loop1", ["fix", "test"]));
+    expect(afterFirst.loops.loop1).toEqual({ iteration: 2, maxIterations: 3 });
+    expect(afterFirst.steps.fix).toMatchObject({ status: "pending", output: undefined });
+    expect(afterFirst.steps.test).toMatchObject({ status: "pending", output: undefined });
+    // Transcripts survive the reset: the next pass appends to them.
+    expect(afterFirst.steps.fix!.items).toHaveLength(1);
+    expect(afterFirst.steps.fix!.items[0]).toEqual({ kind: "assistant", text: "fix out" });
+
+    // Second pass: dividers mark the new iteration; the loop counter updates.
+    const second = applyRunEvents(afterFirst, [
+      ev({ type: "step.started", stepId: "fix", payload: { iteration: 2 } }),
+      chunkOf("fix", "agent_message_chunk", "pass two"),
+      ev({ type: "step.started", stepId: "test", payload: { iteration: 2 } }),
+    ]);
+    expect(second.loops.loop1).toEqual({ iteration: 2, maxIterations: 3 });
+    expect(second.steps.fix!.items).toEqual([
+      { kind: "assistant", text: "fix out" },
+      { kind: "iteration", n: 2 },
+      { kind: "assistant", text: "pass two" },
+    ]);
+    expect(second.steps.test!.items).toEqual([{ kind: "assistant", text: "test out" }, { kind: "iteration", n: 2 }]);
+  });
+
+  test("re-applying loop events (seq <= lastSeq) changes nothing", () => {
+    seq = 0;
+    const events = firstPass("loop1", ["fix", "test"]);
+    const s = applyRunEvents(initialRunViewState, events);
+    expect(applyRunEvents(s, events)).toBe(s);
+    expect(s.loops.loop1).toEqual({ iteration: 2, maxIterations: 3 });
+    expect(s.steps.fix!.items).toEqual([{ kind: "assistant", text: "fix out" }]);
+  });
+
+  test("a retry (queued with resumeFromStepId) clears loop counters at or after the cursor", () => {
+    seq = 0;
+    const afterFirst = applyRunEvents(initialRunViewState, [
+      ...firstPass("outer", ["fix", "test", "gate"]),
+      // An inner loop inside the outer body repeated too.
+      ev({
+        type: "loop.repeat",
+        stepId: "inner",
+        payload: { toStepId: "fix", iteration: 2, maxIterations: 5, stepIds: ["fix"] },
+      }),
+    ]);
+    expect(afterFirst.loops).toEqual({ outer: { iteration: 2, maxIterations: 3 }, inner: { iteration: 2, maxIterations: 5 } });
+    // Retry from the outer body: both counters restart (the runner restarts them as well).
+    const retried = applyRunEvents(afterFirst, [ev({ type: "run.status", payload: { status: "queued", resumeFromStepId: "fix" } })]);
+    expect(retried.loops).toEqual({});
+    expect(retried.steps.fix).toMatchObject({ status: "pending" });
+  });
+
+  test("an outer loop.repeat drops the counters of loops nested in its body", () => {
+    seq = 0;
+    const innerRepeat = ev({ type: "loop.repeat", stepId: "inner", payload: { toStepId: "fix", iteration: 3, maxIterations: 3, stepIds: ["fix"] } });
+    const s = applyRunEvents(initialRunViewState, [innerRepeat, ...firstPass("outer", ["plan", "fix", "inner"])]);
+    // The runner restarts the inner loop at pass 1, so a kept `3/3` badge would be stale.
+    expect(s.loops).toEqual({ outer: { iteration: 2, maxIterations: 3 } });
+  });
+
+  test("a skipped finish records status skipped and counts as done for retry cursors", () => {
+    seq = 0;
+    const s = applyRunEvents(initialRunViewState, [
+      ev({ type: "step.started", stepId: "a", payload: {} }),
+      bodyDone("a"),
+      // A `value` stop fired on `a`: the rest of the iteration is bypassed without ever starting.
+      bodyDone("b", "skipped"),
+      bodyDone("c", "skipped"),
+    ]);
+    expect(s.steps.b).toMatchObject({ status: "skipped", output: "b out" });
+    expect(s.steps.c!.status).toBe("skipped");
+  });
+});

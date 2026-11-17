@@ -1,6 +1,6 @@
 # Agent Orchestrator
 
-Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → shell command → git commit → push → PR, or pull request review → GitHub review) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
+Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → shell command → git commit → push → PR, or pull request review → GitHub review — with loops such as review → fix until approved) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
 
 - `packages/protocol` — flow schema + validation, templates, run events, runner wire protocol, REST types.
 - `packages/server` — Hono API, SQLite (drizzle), scheduler, runner/browser WebSockets, GitHub (PAT or App: login, webhooks, Checks, reviews).
@@ -68,7 +68,7 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   run view also identify runs by their GitHub inputs — issue and PR links are derived from the resolved inputs,
   so a queued issue run is recognizable before it even starts.
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
-  (header button) re-runs the first step that did not succeed (the last step if all did) and continues to the end;
+  (header button) re-runs the first step that did not succeed or get skipped by a loop (the last step if all did) and continues to the end;
   **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
   from bad upstream output without rerunning what worked. Retrying from a later step of a local-path flow runs on
   the runner that ran the previous attempt and adopts its worktree as left; if that runner stays offline, the run
@@ -112,6 +112,54 @@ PR input (other inputs must be optional and stay empty). Fork and first-time-con
 webhook events and manual starts alike (default `require_approval`; approve them from the run view; `skip` rejects a manual
 start). Flows with a manual trigger have no policy. With `postChecks` (default `true`), runs of PR-triggered flows — webhook
 or manual — publish a check run on the PR head with progress and finding annotations.
+
+## Loops
+
+A flow is a flat list of steps; a **`loop` step** ("Repeat from…") ends a loop body that starts at an earlier step `to`.
+When the run reaches it, it jumps back to `to` until its stop condition holds or `maxIterations` (1–20, required) passes ran:
+
+```yaml
+steps:
+  - { id: plan, kind: prompt, name: Plan, prompt: "Plan {{inputs.task}}" }
+  - { id: implement, kind: prompt, name: Implement, prompt: "Implement the plan" }
+  - id: review
+    kind: prompt
+    name: Review
+    prompt: "Review the change. Previous fixes: {{steps.fix.output}}"
+    structured:
+      fields:
+        - { name: approved, description: "true when the change needs no more fixes" }
+        - { name: issues, description: "What still needs fixing" }
+  - { id: fix, kind: prompt, name: Fix, prompt: "Fix: {{steps.review.structured.issues}}" }
+  - id: again
+    kind: loop
+    name: Review/fix
+    to: review
+    maxIterations: 3
+    stop: { when: value, ref: review.structured.approved, is: truthy }
+  - { id: gate, kind: intervention, name: Check }
+```
+
+- **`stop.when`**: `max` (default) runs the body exactly `maxIterations` times. `value` stops as soon as `ref`
+  (`<stepId>.output` or `<stepId>.structured.<field>` of a step directly in the body, not only inside a nested loop) is
+  `truthy`/`falsy` (`is`); it is checked right after that step succeeds, so it breaks out mid-body — the rest of the body
+  is marked `skipped` and keeps its previous values for later templates. `ask` pauses at the loop step like an
+  intervention (optional `message`, `timeoutSec` caps each wait): chat with the run's sessions, then **Repeat from …**
+  or **Continue run**.
+- **Falsy** values: `false`, `null`, missing, `0`, empty or whitespace-only text, `"false"`/`"no"`/`"0"` (trimmed, any
+  case), `[]` and `{}`. Everything else is truthy.
+- **`onExhausted`** (`value` loops): when the last allowed pass ends without meeting the stop condition, `continue`
+  (default) moves on to the next step and `fail` fails the run. `max` and `ask` loops ignore it: an `ask` loop's stop
+  condition is the person's **Continue run**, so its last allowed pass still asks, just without offering repeat.
+- A loop step has no output of its own: templates cannot reference `{{steps.<loopId>…}}`.
+- **Forward refs**: a body step may use `{{steps.<later>.output}}` of a later step in the same (or an enclosing) body —
+  the previous pass's output, empty on the first pass (like `{{steps.fix.output}}` in the review prompt above).
+- Bodies of different loops nest or are disjoint (crossing loops are rejected), and `github_pr` cannot run inside a loop
+  (it would open one PR per pass). Loops are allowed in pull request flows: they are bounded by `maxIterations` and step
+  timeouts.
+- The run view shows `n/max` badges on the body and an *Iteration n* divider in re-run steps' transcripts (both follow
+  the innermost loop that has repeated, so a body step re-run by an outer pass is marked too). **Retrying** a run from
+  inside a loop restarts that loop's counter at 1 (each attempt stays bounded).
 
 ## Structured output
 

@@ -129,6 +129,29 @@ describe("Scheduler.kick", () => {
     expect(deps.runs.get(run)).toMatchObject({ status: "assigned", resumeFrom: 1 });
   });
 
+  test("resume.prior includes skipped steps: a body bypassed by a loop stop counts as done", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const def = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "first" },
+        { id: "b", name: "B", kind: "prompt", prompt: "second" },
+      ],
+    });
+    const run = addRun(deps, { definition: def, status: "failed" });
+    deps.db
+      .update(schema.runSteps)
+      .set({ status: "skipped", output: "stopped early" })
+      .where(and(eq(schema.runSteps.runId, run), eq(schema.runSteps.stepId, "a")))
+      .run();
+    deps.runs.retry(run, 1);
+
+    deps.scheduler.kick();
+
+    const assigned = link.of("job.assign")[0]!.run;
+    expect(assigned.resume).toEqual({ fromStepIdx: 1, prior: [{ stepId: "a", output: "stopped early" }] });
+  });
+
   test("a local_path retry past step 1 is pinned to the previous runner; from step 1 it is not", () => {
     const deps = testDeps();
     const other = connectRunner(deps, "r0", caps()); // sorts first, so it wins any unpinned tie

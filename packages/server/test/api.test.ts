@@ -253,6 +253,12 @@ describe("runs API", () => {
     expect((await call("POST", `/api/runs/${late}/retry`, {})).status).toBe(200);
     expect(deps.runs.get(late)).toMatchObject({ status: "queued", resumeFrom: 1 });
 
+    // A skipped body step (loop stop ended the iteration) counts as done for the cursor.
+    const skipped = addRun(deps, { definition: def, status: "failed" });
+    deps.db.update(schema.runSteps).set({ status: "skipped", output: "" }).where(eq(schema.runSteps.runId, skipped)).run();
+    expect((await call("POST", `/api/runs/${skipped}/retry`, {})).status).toBe(200);
+    expect(deps.runs.get(skipped)).toMatchObject({ status: "queued", resumeFrom: 1 });
+
     // Cancelled mid-run: the interrupted step reruns, earlier outputs stay.
     const cancelled = addRun(deps, { definition: def, status: "cancelled" });
     deps.db
@@ -321,6 +327,42 @@ describe("runs API", () => {
     });
     // offline runner → 409
     expect((await call("POST", `/api/runs/${offline}/interventions/req5`, { stepId: "gate", action: "continue" })).status).toBe(409);
+
+    // An ask-loop gate accepts the same answers, plus `repeat` which is forwarded to the runner link.
+    const loopDef = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "go" },
+        { id: "again", name: "Repeat", kind: "loop", to: "a", maxIterations: 3, stop: { when: "ask" } },
+      ],
+    });
+    const looping = addRun(deps, { status: "running", runnerId: "r1", definition: loopDef });
+
+    const repeat = await call("POST", `/api/runs/${looping}/interventions/req6`, { stepId: "again", action: "repeat" });
+    expect(repeat.json).toEqual({ ok: true });
+    expect(link.of("intervention.respond").at(-1)).toEqual({
+      t: "intervention.respond",
+      runId: looping,
+      requestId: "req6",
+      action: "repeat",
+    });
+
+    // `repeat` on a plain intervention step is rejected with 400 and not relayed.
+    const plain = await call("POST", `/api/runs/${running}/interventions/req7`, { stepId: "gate", action: "repeat" });
+    expect(plain.status).toBe(400);
+    // Still only the earlier message + cancel + ask-loop repeat answers; the rejected one was not relayed.
+    expect(link.of("intervention.respond")).toHaveLength(3);
+
+    // A non-ask loop step is not an intervention gate.
+    const maxLoop = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "go" },
+        { id: "spin", name: "Spin", kind: "loop", to: "a", maxIterations: 3 },
+      ],
+    });
+    const maxing = addRun(deps, { status: "running", runnerId: "r1", definition: maxLoop });
+    expect(
+      (await call("POST", `/api/runs/${maxing}/interventions/req8`, { stepId: "spin", action: "continue" })).status,
+    ).toBe(400);
   });
 });
 

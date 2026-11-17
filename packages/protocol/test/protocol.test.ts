@@ -3,6 +3,8 @@ import {
   type FlowDefinition,
   isActionStep,
   isAgentStep,
+  isTruthyValue,
+  loopRanges,
   renderShellCommand,
   renderTemplate,
   RunEvent,
@@ -730,6 +732,146 @@ describe("templateVariables", () => {
   });
 });
 
+describe("loop steps", () => {
+  const review = {
+    id: "review",
+    name: "Review",
+    kind: "prompt",
+    prompt: "review",
+    structured: { fields: [{ name: "approved", description: "true when ready" }] },
+  };
+  const fix = { id: "fix", name: "Fix", kind: "prompt", prompt: "fix" };
+  const loop = (extra: Record<string, unknown> = {}) => ({ id: "again", name: "Review/fix", kind: "loop", to: "review", maxIterations: 3, ...extra });
+  const errorsOf = (steps: unknown[]) => {
+    const res = validateFlow({ ...baseFlow, steps });
+    return res.ok ? [] : res.errors;
+  };
+
+  test("accepts the review/fix example and applies defaults", () => {
+    const res = validateFlow({
+      ...baseFlow,
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        review,
+        fix,
+        loop({ stop: { when: "value", ref: "review.structured.approved", is: "truthy" } }),
+        { id: "gate", name: "Gate", kind: "intervention" },
+      ],
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps[3]).toMatchObject({ kind: "loop", onExhausted: "continue" });
+    expect(loopRanges(res.flow)).toEqual(new Map([[3, 1]]));
+    const plain = validateFlow({ ...baseFlow, steps: [review, fix, loop()] });
+    if (!plain.ok) throw new Error(plain.errors.join("\n"));
+    expect(plain.flow.steps[2]).toMatchObject({ stop: { when: "max" } });
+  });
+
+  test("to must name an earlier step that is not a loop", () => {
+    expect(errorsOf([review, loop({ to: "fix" }), fix]).some((e) => e.includes("steps.1 (again).to"))).toBe(true);
+    expect(errorsOf([review, loop({ to: "again" })]).some((e) => e.includes(".to"))).toBe(true);
+    const toLoop = errorsOf([review, loop(), { id: "outer", name: "Outer", kind: "loop", to: "again", maxIterations: 2 }]);
+    expect(toLoop).toEqual([`steps.2 (outer).to: "again" must be an earlier step that is not a loop`]);
+    expect(errorsOf([review, loop({ maxIterations: 21 })]).length).toBeGreaterThan(0);
+    expect(errorsOf([review, loop({ maxIterations: 0 })]).length).toBeGreaterThan(0);
+  });
+
+  test("nested loops are accepted, crossing loops rejected", () => {
+    const a = { id: "a", name: "A", kind: "prompt", prompt: "a" };
+    const b = { id: "b", name: "B", kind: "prompt", prompt: "b" };
+    const c = { id: "c", name: "C", kind: "prompt", prompt: "c" };
+    const inner = { id: "inner", name: "Inner", kind: "loop", to: "b", maxIterations: 2 };
+    expect(errorsOf([a, b, inner, c, { id: "outer", name: "Outer", kind: "loop", to: "a", maxIterations: 2 }])).toEqual([]);
+    // Same start is nesting too.
+    expect(errorsOf([a, b, { ...inner, to: "a" }, c, { id: "outer", name: "Outer", kind: "loop", to: "a", maxIterations: 2 }])).toEqual([]);
+    const crossing = errorsOf([a, b, { ...inner, to: "a" }, c, { id: "outer", name: "Outer", kind: "loop", to: "b", maxIterations: 2 }]);
+    expect(crossing).toEqual([`steps.4 (outer).to: this loop's body crosses loop "inner"; loops must be nested or disjoint`]);
+  });
+
+  test("value stop refs must sit directly in the body and match the step's outputs", () => {
+    const stop = (ref: string) => loop({ stop: { when: "value", ref, is: "truthy" } });
+    expect(errorsOf([review, fix, stop("fix.output")])).toEqual([]);
+    expect(errorsOf([review, fix, stop("review.structured.approved")])).toEqual([]);
+    expect(errorsOf([{ id: "plan", name: "Plan", kind: "prompt", prompt: "p" }, review, fix, stop("plan.output")])[0]).toContain(
+      'stop.ref: "plan.output" must reference a step inside this loop\'s body',
+    );
+    expect(errorsOf([review, fix, stop("review.structured.nope")])[0]).toContain("exposes only structured fields review.structured.approved");
+    expect(errorsOf([review, fix, stop("fix.structured.x")])).toEqual([]);
+    expect(errorsOf([review, fix, stop("review")])[0]).toContain("must be <stepId>.output or <stepId>.structured.<field>");
+    const shell = { id: "check", name: "Check", kind: "shell", command: "true" };
+    expect(errorsOf([review, shell, stop("check.structured.x")])[0]).toContain("only prompt/skill/command steps");
+    const push = { id: "push", name: "Push", kind: "git_push" };
+    expect(errorsOf([review, push, stop("push.output")])[0]).toContain('step "push" has no text output');
+    // `fix` is only in the inner loop's body, not directly in the outer one.
+    const inner = { id: "inner", name: "Inner", kind: "loop", to: "fix", maxIterations: 2 };
+    const nested = errorsOf([review, fix, inner, { id: "outer", name: "Outer", kind: "loop", to: "review", maxIterations: 2, stop: { when: "value", ref: "fix.output", is: "truthy" } }]);
+    expect(nested[0]).toContain('step "fix" is inside a nested loop');
+  });
+
+  test("github_pr cannot sit in a loop body", () => {
+    const steps = [
+      { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+      { id: "push", name: "Push", kind: "git_push" },
+      { id: "pr", name: "PR", kind: "github_pr", titleFrom: "impl", bodyFrom: "impl" },
+      { id: "again", name: "Again", kind: "loop", to: "impl", maxIterations: 2 },
+    ];
+    expect(errorsOf(steps)).toEqual(["steps.2 (pr): github_pr cannot run inside a loop (it would open one pull request per iteration)"]);
+    expect(errorsOf([...steps.slice(0, 2), steps[3], steps[2]])).toEqual([]);
+  });
+
+  test("body steps may reference later body steps' .output only", () => {
+    const fixRef = { ...fix, prompt: "fix {{steps.review.output}}" };
+    const reviewRef = (prompt: string) => ({ ...review, prompt });
+    expect(errorsOf([reviewRef("last fix: {{steps.fix.output}}"), fixRef, loop()])).toEqual([]);
+    expect(errorsOf([reviewRef("{{steps.fix.structured}}"), fixRef, loop()])[0]).toContain(
+      'references later step "fix" of this loop; only steps.fix.output (previous iteration) is available',
+    );
+    const after = { id: "after", name: "After", kind: "prompt", prompt: "a" };
+    expect(errorsOf([reviewRef("{{steps.after.output}}"), fixRef, loop(), after])[0]).toContain("which is not an earlier step");
+    // Enclosing body: a step in the inner loop may reference a later step of the outer body.
+    const steps = [
+      { id: "plan", name: "Plan", kind: "prompt", prompt: "{{steps.fix.output}}" },
+      reviewRef("{{steps.fix.output}}"),
+      { id: "inner", name: "Inner", kind: "loop", to: "review", maxIterations: 2 },
+      fixRef,
+      { id: "outer", name: "Outer", kind: "loop", to: "plan", maxIterations: 2 },
+    ];
+    expect(errorsOf(steps)).toEqual([]);
+    // Outside every loop, forward refs stay invalid.
+    expect(errorsOf([{ ...review, prompt: "{{steps.fix.output}}" }, fix]).length).toBe(1);
+  });
+
+  test("templateVariables lists loop-back refs, and every listed variable validates", () => {
+    const res = validateFlow({ ...baseFlow, steps: [review, fix, loop({ stop: { when: "ask", message: "Again? {{steps.fix.output}}" } })] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const vars = templateVariables(res.flow, 0);
+    expect(vars).toContainEqual({ path: "steps.fix.output", description: 'Text output of "Fix" (previous iteration; empty on the first)' });
+    expect(vars.some((v) => v.path === "steps.fix.structured" || v.path === "steps.again.output")).toBe(false);
+    const prompt = vars.map((v) => `{{${v.path}}}`).join(" ");
+    expect(validateFlow({ ...res.flow, steps: [{ ...review, prompt }, fix, res.flow.steps[2]] }).ok).toBe(true);
+  });
+
+  test("steps after a loop cannot reference the loop step, and templateVariables does not list it", () => {
+    const after = (prompt: string) => ({ id: "after", name: "After", kind: "prompt", prompt });
+    expect(errorsOf([review, fix, loop(), after("{{steps.again.output}}")])).toEqual([
+      `steps.3 (after).prompt: {{steps.again.output}} references loop step "again", which has no output to use`,
+    ]);
+    const res = validateFlow({ ...baseFlow, steps: [review, fix, loop(), after("x")] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const paths = templateVariables(res.flow, 3).map((v) => v.path);
+    expect(paths).toContain("steps.fix.output");
+    expect(paths.some((p) => p.startsWith("steps.again"))).toBe(false);
+  });
+
+  test("ask loop messages are validated templates", () => {
+    expect(errorsOf([review, fix, loop({ stop: { when: "ask", message: "{{steps.later.output}}" } })])[0]).toContain("steps.2 (again).stop.message");
+  });
+
+  test("isTruthyValue", () => {
+    for (const v of [false, null, undefined, 0, "", "  ", "false", " FALSE ", "No", "0", [], {}]) expect(isTruthyValue(v)).toBe(false);
+    for (const v of [true, 1, -1, "yes", "true", "approved", "00", [0], { a: 1 }]) expect(isTruthyValue(v)).toBe(true);
+  });
+});
+
 describe("RunEvent", () => {
   test("parses run.name and rejects an empty or oversized name", () => {
     const base = { runId: "r1", seq: 1, ts: 1 };
@@ -737,5 +879,14 @@ describe("RunEvent", () => {
     expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "" } }).success).toBe(false);
     expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "x".repeat(120) } }).success).toBe(true);
     expect(RunEvent.safeParse({ ...base, type: "run.name", payload: { name: "x".repeat(121) } }).success).toBe(false);
+  });
+
+  test("parses loop.repeat, skipped finishes and iteration starts", () => {
+    const base = { runId: "r1", seq: 1, ts: 1, stepId: "again" };
+    const repeat = { ...base, type: "loop.repeat", payload: { toStepId: "review", iteration: 2, maxIterations: 3, stepIds: ["review", "fix"] } };
+    expect(RunEvent.parse(repeat)).toEqual(repeat as never);
+    expect(RunEvent.safeParse({ ...base, type: "step.finished", payload: { status: "skipped" } }).success).toBe(true);
+    expect(RunEvent.safeParse({ ...base, type: "step.started", payload: { iteration: 2 } }).success).toBe(true);
+    expect(RunEvent.safeParse({ ...base, type: "step.started", payload: { iteration: 1 } }).success).toBe(false);
   });
 });

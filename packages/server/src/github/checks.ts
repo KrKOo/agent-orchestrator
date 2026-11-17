@@ -12,7 +12,7 @@ const { runs, runSteps, findings } = schema;
 /** GitHub accepts at most 50 annotations per check-run update. */
 export const ANNOTATIONS_PER_PATCH = 50;
 export const AWAITING_APPROVAL_SUMMARY = "Awaiting approval in orchestrator";
-const FINISHED_STEP = new Set(["succeeded", "failed", "cancelled"]);
+const FINISHED_STEP = new Set(["succeeded", "skipped", "failed", "cancelled"]);
 
 export function checkNameOf(def: FlowDefinition): string {
   return def.trigger.kind === "github_pull_request" ? (def.trigger.checkName ?? def.name) : def.name;

@@ -1,5 +1,5 @@
 import { RETRYABLE_STATUSES, TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
-import { and, eq, gte, isNull, max, type ExtractTablesWithRelations } from "drizzle-orm";
+import { and, eq, gte, isNull, lt, max, type ExtractTablesWithRelations } from "drizzle-orm";
 import type { SQLiteBunTransaction } from "drizzle-orm/bun-sqlite/session";
 import { schema, type Db } from "./db";
 import type { Hub } from "./hub";
@@ -106,7 +106,8 @@ export class RunService {
       .from(runSteps)
       .where(eq(runSteps.runId, runId))
       .all();
-    if (prior.some((s) => s.idx < fromStepIdx && s.status !== "succeeded")) return { ok: false, error: "unfinished_steps" };
+    if (prior.some((s) => s.idx < fromStepIdx && s.status !== "succeeded" && s.status !== "skipped"))
+      return { ok: false, error: "unfinished_steps" };
     const ev: RunEvent = {
       runId,
       seq: this.maxSeq(runId) + 1,
@@ -180,23 +181,52 @@ export class RunService {
           .run();
         return;
       }
-      case "step.started":
-      case "step.finished": {
+      case "step.started": {
         if (ev.stepId === undefined) return;
-        const fields =
-          ev.type === "step.started"
-            ? { status: "running" as const, startedAt: ev.ts }
-            : {
-                status: ev.payload.status,
-                output: ev.payload.output ?? null,
-                structured: ev.payload.structured ?? null,
-                finishedAt: ev.ts,
-              };
         const run = tx.select({ definition: runs.definition }).from(runs).where(eq(runs.id, ev.runId)).get();
         const idx = run ? run.definition.steps.findIndex((s) => s.id === ev.stepId) : -1;
+        const fields = { status: "running" as const, startedAt: ev.ts };
+        tx.insert(runSteps)
+          .values({ runId: ev.runId, stepId: ev.stepId, idx, ...fields, output: null, structured: null, finishedAt: null })
+          .onConflictDoUpdate({
+            target: [runSteps.runId, runSteps.stepId],
+            // A re-run inside a loop starts over: clear the previous attempt's output, not just the status.
+            set: { ...fields, output: null, structured: null, finishedAt: null },
+          })
+          .run();
+        return;
+      }
+      case "step.finished": {
+        if (ev.stepId === undefined) return;
+        const run = tx.select({ definition: runs.definition }).from(runs).where(eq(runs.id, ev.runId)).get();
+        const idx = run ? run.definition.steps.findIndex((s) => s.id === ev.stepId) : -1;
+        const fields = {
+          status: ev.payload.status,
+          output: ev.payload.output ?? null,
+          structured: ev.payload.structured ?? null,
+          finishedAt: ev.ts,
+        };
         tx.insert(runSteps)
           .values({ runId: ev.runId, stepId: ev.stepId, idx, ...fields })
           .onConflictDoUpdate({ target: [runSteps.runId, runSteps.stepId], set: fields })
+          .run();
+        return;
+      }
+      case "loop.repeat": {
+        // The loop jumps back to `to`: body rows from `to` up to (not including) the loop step go
+        // pending again for the new iteration. Ids resolve against the run's own run_steps rows;
+        // ignore when either endpoint is missing (unknown step id or no rows for this run yet).
+        const rows = tx
+          .select({ stepId: runSteps.stepId, idx: runSteps.idx })
+          .from(runSteps)
+          .where(eq(runSteps.runId, ev.runId))
+          .all();
+        const toIdx = rows.find((r) => r.stepId === ev.payload.toStepId)?.idx;
+        const loopIdx = ev.stepId === undefined ? undefined : rows.find((r) => r.stepId === ev.stepId)?.idx;
+        if (toIdx === undefined || loopIdx === undefined) return;
+        tx.update(runSteps)
+          .set({ status: "pending", output: null, structured: null, startedAt: null, finishedAt: null })
+          .where(and(eq(runSteps.runId, ev.runId), gte(runSteps.idx, toIdx), lt(runSteps.idx, loopIdx)))
           .run();
         return;
       }

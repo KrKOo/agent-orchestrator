@@ -203,17 +203,18 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       fromStepIdx = run.definition.steps.findIndex((s) => s.id === parsed.data.fromStepId);
       if (fromStepIdx < 0) return c.json({ error: `Unknown step "${parsed.data.fromStepId}"` }, 400);
     } else {
-      // Default: the first step (definition order) that did not succeed; the last step when all did.
-      const succeeded = new Set(
+      // Default: the first step (definition order) that is neither succeeded nor skipped (`skipped`
+      // bodies were bypassed by a loop stop and count as done); the last step when all are done.
+      const done = new Set(
         db
           .select({ stepId: runSteps.stepId, status: runSteps.status })
           .from(runSteps)
           .where(eq(runSteps.runId, id))
           .all()
-          .filter((s) => s.status === "succeeded")
+          .filter((s) => s.status === "succeeded" || s.status === "skipped")
           .map((s) => s.stepId),
       );
-      fromStepIdx = run.definition.steps.findIndex((s) => !succeeded.has(s.id));
+      fromStepIdx = run.definition.steps.findIndex((s) => !done.has(s.id));
       if (fromStepIdx < 0) fromStepIdx = run.definition.steps.length - 1;
     }
     const outcome = deps.runs.retry(id, fromStepIdx);
@@ -294,7 +295,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     return c.json({ ok: true });
   });
 
-  /** Answers an intervention gate: send a chat message to a session, continue the run, or cancel. */
+  /** Answers an intervention gate: chat with a session, continue, repeat (ask loop), or cancel. */
   app.post("/:id/interventions/:requestId", async (c) => {
     const { id, requestId } = c.req.param();
     const body = await readJson(c);
@@ -305,7 +306,11 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     if ("error" in h) return c.json({ error: h.error }, h.status);
     const run = deps.runs.get(id)!;
     const step = run.definition.steps.find((s) => s.id === parsed.data.stepId);
-    if (step?.kind !== "intervention") return c.json({ error: `Step "${parsed.data.stepId}" is not an intervention step` }, 400);
+    const isAskLoop = step?.kind === "loop" && step.stop.when === "ask";
+    if (step?.kind !== "intervention" && !isAskLoop)
+      return c.json({ error: `Step "${parsed.data.stepId}" is not an intervention step` }, 400);
+    if (parsed.data.action === "repeat" && !isAskLoop)
+      return c.json({ error: `Step "${parsed.data.stepId}" cannot be repeated` }, 400);
     const { action, session, text } = parsed.data;
     hub.sendToRunner(h.runnerId, {
       t: "intervention.respond",
