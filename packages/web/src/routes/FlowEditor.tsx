@@ -512,7 +512,6 @@ export function FlowEditor() {
               edges={edges}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
-              colorMode="system"
               nodesDraggable={false}
               nodesConnectable={false}
               edgesFocusable={false}

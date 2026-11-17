@@ -1,8 +1,9 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, normalize, sep } from "node:path";
-import type { MeResponse } from "@orch/protocol";
+import { THEME_COOKIE, type MeResponse, type ThemesResponse } from "@orch/protocol";
 import { Webhooks } from "@octokit/webhooks";
 import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
 import { flowRoutes } from "./api/flows";
 import { runnerRoutes } from "./api/runners";
 import { runRoutes } from "./api/runs";
@@ -18,16 +19,19 @@ import { handleWebhook } from "./github/webhook";
 import { Hub } from "./hub";
 import { RunService } from "./runs";
 import { Scheduler } from "./scheduler";
+import { ThemeStore } from "./themes";
 import { registerBrowserWs } from "./ws/browser";
 import { registerRunnerWs } from "./ws/runner";
 
 export const DEFAULT_WEB_DIST = join(import.meta.dir, "../../web/dist");
+export const DEFAULT_THEMES_DIR = join(import.meta.dir, "../../web/themes");
 
 export interface DepsOptions {
   db?: Db;
   credentials?: GitHubCredentials;
   github?: GitHubApi;
   webDist?: string;
+  builtinThemesDir?: string;
 }
 
 /**
@@ -51,6 +55,7 @@ export function createDeps(config: ServerConfig, opts: DepsOptions = {}): AppDep
     github: opts.github ?? (gh ? new GitHubApi(fetch, gh.apiBaseUrl, gh.webBaseUrl) : new GitHubApi()),
     webhooks: gh?.kind === "app" ? new Webhooks({ secret: gh.webhookSecret }) : null,
     webDist: opts.webDist ?? DEFAULT_WEB_DIST,
+    themes: new ThemeStore(opts.builtinThemesDir ?? DEFAULT_THEMES_DIR, config.ui.themesDir),
   };
   const checks = new CheckReporter(deps);
   checks.attach();
@@ -76,6 +81,31 @@ function serveWeb(webDist: string, path: string): Response {
   return new Response(Bun.file(index), { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+/**
+ * The page's render-blocking `/theme.css`: the `orch_theme` cookie's theme if it exists, else `ui.theme`, else
+ * empty (built-in styles). Cached per cookie and always revalidated, so a newly picked or edited theme applies.
+ */
+function serveTheme(deps: AppDeps, cookie: string | undefined): Response {
+  const { theme } = deps.config.ui;
+  let file = cookie === undefined ? null : deps.themes.resolve(cookie);
+  if (file === null && theme !== null) {
+    file = deps.themes.resolve(theme);
+    if (file === null) console.warn(`[themes] ui.theme "${theme}" not found; serving the built-in default`);
+  }
+  let css = "";
+  if (file !== null) {
+    try {
+      css = readFileSync(file, "utf8");
+    } catch (err) {
+      // Removed between resolve and read.
+      console.warn(`[themes] reading ${file} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return new Response(css, {
+    headers: { "Content-Type": "text/css; charset=utf-8", "Cache-Control": "no-cache", Vary: "Cookie" },
+  });
+}
+
 export function createApp(deps: AppDeps): Hono {
   const app = new Hono();
 
@@ -94,6 +124,15 @@ export function createApp(deps: AppDeps): Hono {
     return c.json(me);
   });
   app.use("/api/*", requireSession(deps));
+  app.get("/api/themes", (c) => {
+    const { theme } = deps.config.ui;
+    const res: ThemesResponse = {
+      themes: deps.themes.list(),
+      // A configured theme whose file is gone is served as the built-in default; say so.
+      defaultTheme: theme !== null && deps.themes.resolve(theme) !== null ? theme : null,
+    };
+    return c.json(res);
+  });
 
   const runs = runRoutes(deps);
   const runners = runnerRoutes(deps);
@@ -120,6 +159,8 @@ export function createApp(deps: AppDeps): Hono {
     });
   }
 
+  // Public like the rest of the web bundle: index.html loads it before any session exists.
+  app.get("/theme.css", (c) => serveTheme(deps, getCookie(c, THEME_COOKIE)));
   app.get("*", (c) => serveWeb(deps.webDist, c.req.path));
 
   return app;

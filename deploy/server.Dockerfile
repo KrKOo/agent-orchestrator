@@ -34,6 +34,8 @@ COPY packages/protocol packages/protocol
 COPY packages/server/src packages/server/src
 COPY packages/server/drizzle packages/server/drizzle
 COPY --from=build /app/packages/web/dist packages/web/dist
+# Built-in themes, served at runtime by /theme.css (not part of the Vite bundle).
+COPY packages/web/themes packages/web/themes
 # Named volumes inherit this ownership on first use, so the unprivileged user can write the DB.
 RUN mkdir -p /data && chown bun:bun /data
 USER bun

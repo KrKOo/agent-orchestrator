@@ -1,8 +1,7 @@
-import "@xyflow/react/dist/style.css";
 import "./styles.css";
 
 import { QueryClient, QueryClientProvider, useMutation, useQuery } from "@tanstack/react-query";
-import { StrictMode, useEffect } from "react";
+import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, Navigate, NavLink, Outlet, RouterProvider } from "react-router";
 import { api, errorMessage, redirectToLogin } from "./api";
@@ -11,6 +10,36 @@ import { Flows } from "./routes/Flows";
 import { Runners } from "./routes/Runners";
 import { Runs } from "./routes/Runs";
 import { RunView } from "./routes/RunView";
+import { currentTheme, setTheme } from "./theme";
+
+function ThemePicker() {
+  const themes = useQuery({ queryKey: ["themes"], queryFn: api.themes, staleTime: Infinity });
+  const [theme, setThemeState] = useState(currentTheme);
+  if (!themes.data) return null;
+  const { themes: names, defaultTheme } = themes.data;
+  // A cookie naming a since-removed theme is served as the default, so show it that way.
+  const value = theme !== null && names.includes(theme) ? theme : "";
+  return (
+    <label className="row gap-tight theme-picker muted">
+      Theme
+      <select
+        value={value}
+        onChange={(e) => {
+          const next = e.target.value || null;
+          setTheme(next);
+          setThemeState(next);
+        }}
+      >
+        <option value="">Default ({defaultTheme ?? "system"})</option>
+        {names.map((name) => (
+          <option key={name} value={name}>
+            {name}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
 
 function Layout() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me, staleTime: Infinity });
@@ -31,6 +60,7 @@ function Layout() {
           <NavLink to="/runners">Runners</NavLink>
         </nav>
         <span className="grow" />
+        {me.data && !loginRequired && <ThemePicker />}
         {user && (
           <span className="row gap user-menu">
             <span className="muted">

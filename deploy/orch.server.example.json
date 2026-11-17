@@ -15,5 +15,9 @@
     "clientSecret": "<GitHub App client secret>",
     "webhookSecret": "<GitHub App webhook secret>",
     "maxConcurrentPerRepo": 2
+  },
+  "ui": {
+    "theme": null,
+    "themesDir": "/data/themes"
   }
 }

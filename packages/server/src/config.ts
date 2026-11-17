@@ -38,6 +38,16 @@ const GitHubConfig = z.discriminatedUnion("kind", [
   }),
 ]);
 
+/** Theme names double as file names (`<name>.css`): no `/` or `.`, so a name cannot leave the theme directories. */
+export const THEME_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+const UiConfig = z.object({
+  /** Default theme for browsers without an `orch_theme` cookie; null = built-in styles (follow the OS). */
+  theme: z.string().regex(THEME_NAME, "theme must be 1-64 letters, digits, '-' or '_'").nullable().default(null),
+  /** Directory of custom `<name>.css` themes; relative paths resolve against the config file's directory. */
+  themesDir: z.string().min(1).nullable().default(null),
+});
+
 export const ServerConfigFile = z.object({
   bind: z
     .string()
@@ -47,10 +57,12 @@ export const ServerConfigFile = z.object({
   publicUrl: z.url().default("http://127.0.0.1:7800"),
   auth: AuthConfig.default({ mode: "none" }),
   github: GitHubConfig.nullable().default(null),
+  ui: UiConfig.default({ theme: null, themesDir: null }),
 });
 
 export type AuthConfig = z.infer<typeof AuthConfig>;
 export type GitHubConfig = z.infer<typeof GitHubConfig>;
+export type UiConfig = z.infer<typeof UiConfig>;
 
 export const DEFAULT_MAX_CONCURRENT_PER_REPO = 2;
 
@@ -64,6 +76,8 @@ export interface ServerConfig {
   auth: AuthConfig;
   /** `privateKeyPath` is absolute. */
   github: GitHubConfig | null;
+  /** `themesDir` is absolute. */
+  ui: UiConfig;
 }
 
 export function parseServerConfig(raw: unknown, baseDir: string): ServerConfig {
@@ -84,6 +98,7 @@ export function parseServerConfig(raw: unknown, baseDir: string): ServerConfig {
     publicUrl: new URL(cfg.publicUrl).origin,
     auth: cfg.auth,
     github: cfg.github?.kind === "app" ? { ...cfg.github, privateKeyPath: resolve(baseDir, cfg.github.privateKeyPath) } : cfg.github,
+    ui: { theme: cfg.ui.theme, themesDir: cfg.ui.themesDir === null ? null : resolve(baseDir, cfg.ui.themesDir) },
   };
 }
 

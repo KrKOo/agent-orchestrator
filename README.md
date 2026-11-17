@@ -204,3 +204,56 @@ GitHub App settings:
 - **Permissions:** Checks RW, Pull requests RW, Contents R, Issues RW (comments on issues), Metadata R.
 - **Events:** Pull request.
 - **Webhook:** `https://<domain>/github/webhook`.
+
+## Themes
+
+A theme is one plain CSS file, `<name>.css`, that overrides the variables below and may add any other rules.
+Names match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (letters, digits, `-`, `_`; no dots). Built-in themes `light` and `dark`
+(in `packages/web/themes/`) pin the default palette to one mode.
+
+**Adding one:** put the file in `ui.themesDir` and reload the page: it appears in the topbar's *Theme* picker, with no
+rebuild or restart. A custom theme replaces a built-in of the same name.
+
+```json
+{ "ui": { "theme": "corporate", "themesDir": "/data/themes" } }
+```
+
+`ui.theme` is the default for every browser (null = follow the OS light/dark setting); the server refuses to start if
+it names a theme that doesn't exist. `themesDir` is relative to the config file's directory.
+
+**Selection order** for `GET /theme.css`, a render-blocking `<link>` in `index.html` (so no unthemed flash):
+1. the `orch_theme` cookie set by the picker, if it names an existing theme;
+2. `ui.theme`;
+3. nothing: the built-in styles, following the OS setting.
+
+The base styles live in cascade layers (`@layer xyflow, orch`) and themes are unlayered, so a theme rule always beats
+a built-in one regardless of specificity. Light and dark values use `light-dark()` on a `:root` with
+`color-scheme: light dark`: force a mode with `:root { color-scheme: dark; }`, or give one value for both modes. The
+flow canvas maps xyflow's `--xy-*` variables onto these, so it follows the theme too. The UI needs native `light-dark()`
+(Chrome/Edge 123, Firefox 120, Safari 17.5); `vite.config.ts` sets `build.cssTarget` to match so the minifier keeps it.
+
+| Group | Variables |
+|---|---|
+| Color | `--bg` `--panel` `--panel-2` `--border` `--text` `--muted` `--accent` `--accent-text` `--danger` `--ok` `--warn` `--info` `--user-bubble` `--code-bg` `--overlay` (modal backdrop) `--on-danger` (text on danger badges) |
+| Effects | `--shadow` (a full `box-shadow` value) |
+| Type | `--font-sans` `--font-mono` `--font-size` (base, 14px) `--text-xs` (11px) `--text-sm` (12px) `--text-md` (13px) |
+| Shape | `--radius-xs` (3px) `--radius-sm` (4px) `--radius-md` (6px) `--radius-lg` (10px) |
+
+These variables are the stable contract. Class names can be targeted for bigger changes, but may change between
+releases. Example `corporate.css`:
+
+```css
+:root {
+  --accent: light-dark(#7a1fa2, #c77dff);
+  --accent-text: #ffffff;
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --radius-md: 2px;
+  --radius-lg: 4px;
+}
+.topbar {
+  border-bottom: 3px solid var(--accent);
+}
+```
+
+Theme CSS is trusted admin content: it can load external fonts or images (there is no CSP), so only admins should be
+able to write `themesDir`.

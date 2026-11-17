@@ -7,6 +7,7 @@ import type { GitHubCredentials } from "./github/credentials";
 import type { Hub } from "./hub";
 import type { RunService } from "./runs";
 import type { Scheduler } from "./scheduler";
+import type { ThemeStore } from "./themes";
 
 /** Everything route and WebSocket handlers need; tests build it around an in-memory DB. */
 export interface AppDeps {
@@ -23,4 +24,6 @@ export interface AppDeps {
   webhooks: Webhooks | null;
   /** Absolute path of the built web UI (`packages/web/dist`). */
   webDist: string;
+  /** Built-in and admin (`ui.themesDir`) theme stylesheets. */
+  themes: ThemeStore;
 }

@@ -12,6 +12,7 @@ import type {
   RunEvent,
   RunnerRow,
   RunRow,
+  ThemesResponse,
 } from "@orch/protocol";
 
 export const LOGIN_PATH = "/auth/login";
@@ -62,6 +63,7 @@ const enc = encodeURIComponent;
 export const api = {
   me: () => request<MeResponse>("GET", "/api/me"),
   logout: () => request<void>("POST", "/auth/logout"),
+  themes: () => request<ThemesResponse>("GET", "/api/themes"),
 
   listFlows: () => request<FlowRow[]>("GET", "/api/flows"),
   getFlow: (id: string) => request<FlowRow>("GET", `/api/flows/${enc(id)}`),
