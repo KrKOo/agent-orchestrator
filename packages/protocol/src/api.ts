@@ -111,6 +111,15 @@ export interface MeResponse {
   user: { id: string; login: string } | null;
 }
 
+/** Per-browser theme override; the server reads it when serving `/theme.css`. Absent = server default. */
+export const THEME_COOKIE = "orch_theme";
+
+/** `GET /api/themes`: theme names (sorted) and the server default (`ui.theme`); null default = follow the OS. */
+export interface ThemesResponse {
+  themes: string[];
+  defaultTheme: string | null;
+}
+
 /** `POST /api/runners` `{name, labels?}` → the token is shown once. */
 export interface CreateRunnerTokenResponse {
   runnerId: string;

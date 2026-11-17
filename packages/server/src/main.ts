@@ -15,6 +15,10 @@ Config: ORCH_SERVER_CONFIG (default ./orch.server.json)`;
 
 function serve(config: ServerConfig): void {
   const deps = createDeps(config);
+  const { theme } = config.ui;
+  if (theme !== null && deps.themes.resolve(theme) === null) {
+    throw new Error(`Invalid server config: ui.theme "${theme}" has no ${theme}.css in ${deps.themes.dirs.join(" or ")}`);
+  }
   const app = createApp(deps);
   // Bun.serve throws a descriptive error when the port is taken.
   const server = Bun.serve({ hostname: config.host, port: config.port, fetch: app.fetch, websocket });

@@ -13,12 +13,18 @@ export const TEST_WEB = "https://gh-web.test";
 
 /** `config` entries are merged into the raw server config file (e.g. `auth`, `github`). */
 export function testDeps(
-  opts: { credentials?: GitHubCredentials; fetch?: typeof fetch; config?: Record<string, unknown> } = {},
+  opts: {
+    credentials?: GitHubCredentials;
+    fetch?: typeof fetch;
+    config?: Record<string, unknown>;
+    builtinThemesDir?: string;
+  } = {},
 ): AppDeps {
   const config = parseServerConfig({ dataDir: "/nonexistent", ...opts.config }, "/");
   return createDeps(config, {
     db: createDb(":memory:"),
     webDist: "/nonexistent/dist",
+    builtinThemesDir: opts.builtinThemesDir ?? "/nonexistent/themes",
     ...(opts.credentials ? { credentials: opts.credentials } : {}),
     ...(opts.fetch ? { github: new GitHubApi(opts.fetch, TEST_API, TEST_WEB) } : {}),
   });

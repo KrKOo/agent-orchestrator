@@ -1,0 +1,4 @@
+/* Built-in theme: the default palette, always light regardless of the OS setting. */
+:root {
+  color-scheme: light;
+}
