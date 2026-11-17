@@ -850,6 +850,18 @@ describe("loop steps", () => {
     expect(validateFlow({ ...res.flow, steps: [{ ...review, prompt }, fix, res.flow.steps[2]] }).ok).toBe(true);
   });
 
+  test("steps after a loop cannot reference the loop step, and templateVariables does not list it", () => {
+    const after = (prompt: string) => ({ id: "after", name: "After", kind: "prompt", prompt });
+    expect(errorsOf([review, fix, loop(), after("{{steps.again.output}}")])).toEqual([
+      `steps.3 (after).prompt: {{steps.again.output}} references loop step "again", which has no output to use`,
+    ]);
+    const res = validateFlow({ ...baseFlow, steps: [review, fix, loop(), after("x")] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const paths = templateVariables(res.flow, 3).map((v) => v.path);
+    expect(paths).toContain("steps.fix.output");
+    expect(paths.some((p) => p.startsWith("steps.again"))).toBe(false);
+  });
+
   test("ask loop messages are validated templates", () => {
     expect(errorsOf([review, fix, loop({ stop: { when: "ask", message: "{{steps.later.output}}" } })])[0]).toContain("steps.2 (again).stop.message");
   });

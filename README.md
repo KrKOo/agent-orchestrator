@@ -148,16 +148,18 @@ steps:
   or **Continue run**.
 - **Falsy** values: `false`, `null`, missing, `0`, empty or whitespace-only text, `"false"`/`"no"`/`"0"` (trimmed, any
   case), `[]` and `{}`. Everything else is truthy.
-- **`onExhausted`** (`value`/`ask` loops): when the last allowed pass ends without meeting the stop condition, `continue`
-  (default) moves on to the next step and `fail` fails the run. An exhausted `continue` ask loop still asks once more,
-  without offering repeat.
+- **`onExhausted`** (`value` loops): when the last allowed pass ends without meeting the stop condition, `continue`
+  (default) moves on to the next step and `fail` fails the run. `max` and `ask` loops ignore it: an `ask` loop's stop
+  condition is the person's **Continue run**, so its last allowed pass still asks, just without offering repeat.
+- A loop step has no output of its own: templates cannot reference `{{steps.<loopId>…}}`.
 - **Forward refs**: a body step may use `{{steps.<later>.output}}` of a later step in the same (or an enclosing) body —
   the previous pass's output, empty on the first pass (like `{{steps.fix.output}}` in the review prompt above).
 - Bodies of different loops nest or are disjoint (crossing loops are rejected), and `github_pr` cannot run inside a loop
   (it would open one PR per pass). Loops are allowed in pull request flows: they are bounded by `maxIterations` and step
   timeouts.
-- The run view shows `n/max` badges on the body and an *Iteration n* divider in re-run steps' transcripts. **Retrying**
-  a run from inside a loop restarts that loop's counter at 1 (each attempt stays bounded).
+- The run view shows `n/max` badges on the body and an *Iteration n* divider in re-run steps' transcripts (both follow
+  the innermost loop that has repeated, so a body step re-run by an outer pass is marked too). **Retrying** a run from
+  inside a loop restarts that loop's counter at 1 (each attempt stays bounded).
 
 ## Structured output
 

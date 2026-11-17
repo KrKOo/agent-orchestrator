@@ -267,9 +267,11 @@ export type LoopStop = z.infer<typeof LoopStop>;
 export const LOOP_MAX_ITERATIONS = 20;
 /**
  * "Repeat from…": ends a loop body that starts at the earlier step `to` and runs up to this step. On reaching
- * it the run jumps back to `to` until the stop condition holds or `maxIterations` passes ran; then
- * `onExhausted` decides whether the run continues or the step fails. Bodies of different loops nest or
- * are disjoint. `timeoutSec` caps each wait of an `ask` gate, like an intervention's.
+ * it the run jumps back to `to` until the stop condition holds or `maxIterations` passes ran; then a `value`
+ * loop's `onExhausted` decides whether the run continues or the step fails (`max` loops just end, and an
+ * `ask` loop's last pass still asks, without offering repeat). Bodies of different loops nest or are
+ * disjoint. `timeoutSec` caps each wait of an `ask` gate, like an intervention's. A loop step has no
+ * template value: later steps cannot reference it.
  */
 export const LoopStep = z.object({
   ...stepBase,
@@ -441,6 +443,8 @@ function checkRef(
         : `references later step "${id}" of this loop; only steps.${id}.output (previous iteration) is available`;
     }
     if (id === undefined || !earlier.has(id)) return `references step "${id ?? ""}" which is not an earlier step`;
+    // A loop step only reports how it ended; the runner keeps no template value for it.
+    if (steps.get(id)?.kind === "loop") return `references loop step "${id}", which has no output to use`;
     if (parts[2] === "output" && parts.length === 3) return null;
     if (parts[2] === "structured") {
       if (parts.length === 3) return null;
@@ -487,7 +491,7 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
     }
   }
   for (const step of def.steps.slice(0, stepIndex)) {
-    if (!ID_RE.test(step.id)) continue;
+    if (!ID_RE.test(step.id) || step.kind === "loop") continue;
     add(`steps.${step.id}.output`, `Text output of "${step.name}"`);
     if (isAgentStep(step)) {
       if (step.structured) {

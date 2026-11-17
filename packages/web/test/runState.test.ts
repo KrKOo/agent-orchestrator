@@ -195,6 +195,14 @@ describe("loops", () => {
     expect(retried.steps.fix).toMatchObject({ status: "pending" });
   });
 
+  test("an outer loop.repeat drops the counters of loops nested in its body", () => {
+    seq = 0;
+    const innerRepeat = ev({ type: "loop.repeat", stepId: "inner", payload: { toStepId: "fix", iteration: 3, maxIterations: 3, stepIds: ["fix"] } });
+    const s = applyRunEvents(initialRunViewState, [innerRepeat, ...firstPass("outer", ["plan", "fix", "inner"])]);
+    // The runner restarts the inner loop at pass 1, so a kept `3/3` badge would be stale.
+    expect(s.loops).toEqual({ outer: { iteration: 2, maxIterations: 3 } });
+  });
+
   test("a skipped finish records status skipped and counts as done for retry cursors", () => {
     seq = 0;
     const s = applyRunEvents(initialRunViewState, [

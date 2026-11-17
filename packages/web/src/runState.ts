@@ -281,17 +281,17 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
     case "loop.repeat": {
       // The body steps repeat: back to pending for their next pass, transcripts kept (one per step).
       // The loop step itself keeps its finished state; RunView shows its `iteration/max` badge.
+      // Loops nested in the body restart their count (as the runner does), so their badges go too.
       const loopStepId = ev.stepId ?? "";
       const steps = { ...s.steps };
+      const loops = { ...s.loops };
       for (const id of ev.payload.stepIds) {
         const st = steps[id];
         if (st) steps[id] = resetAttempt(st, "pending");
+        delete loops[id];
       }
-      return {
-        ...s,
-        steps,
-        loops: { ...s.loops, [loopStepId]: { iteration: ev.payload.iteration, maxIterations: ev.payload.maxIterations } },
-      };
+      loops[loopStepId] = { iteration: ev.payload.iteration, maxIterations: ev.payload.maxIterations };
+      return { ...s, steps, loops };
     }
     case "acp.update":
       return withStep(s, ev.stepId, (st) => applyUpdate(st, ev.payload.update));

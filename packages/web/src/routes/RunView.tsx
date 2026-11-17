@@ -16,15 +16,6 @@ const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, suba
 /** The sandbox log shows only its newest chunks up to this much text until "Show all". */
 const LOG_TAIL_CHARS = 200_000;
 
-/** Innermost loop enclosing `stepIdx`, or undefined for top-level steps: nested bodies shrink, so the smallest end wins. */
-function enclosingLoopIdx(stepIdx: number, ranges: Map<number, number>): number | undefined {
-  let inner: number | undefined;
-  for (const [end, start] of ranges) {
-    if (start <= stepIdx && stepIdx < end && (inner === undefined || end < inner)) inner = end;
-  }
-  return inner;
-}
-
 export function RunView() {
   const { id = "" } = useParams();
   return <RunViewInner key={id} runId={id} />;
@@ -105,12 +96,15 @@ function RunViewInner({ runId }: { runId: string }) {
   const selectedRow = selectedId !== null ? stepRows.get(selectedId) : undefined;
   // Live stream first; a reloaded (or already terminal) run falls back to the persisted workspace.
   const workspace = state.workspace ?? run.workspace ?? undefined;
-  // Loop step index → body start; step index → the counter of its innermost enclosing loop.
+  // Step index → counter of its innermost enclosing loop that has repeated (nested bodies shrink, so smaller
+  // ends are inner), or undefined while none has. Same rule as the runner's `step.started` iteration dividers.
   const ranges = loopRanges(run.definition);
-  const loopOfStep = (idx: number) => {
-    const loopIdx = enclosingLoopIdx(idx, ranges);
-    return loopIdx === undefined ? undefined : state.loops[steps[loopIdx]!.id];
-  };
+  const loopOfStep = (idx: number) =>
+    [...ranges]
+      .filter(([end, start]) => start <= idx && idx < end)
+      .sort(([a], [b]) => a - b)
+      .map(([end]) => state.loops[steps[end]!.id])
+      .find((c) => c !== undefined);
 
   return (
     <div className="run-view">
@@ -346,7 +340,7 @@ function RunViewInner({ runId }: { runId: string }) {
             {selectedDef && (
               <StepResult
                 step={step}
-                stepId={selectedDef.id}
+                stepId={selectedDef.kind === "loop" ? undefined : selectedDef.id}
                 markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"}
                 mono={selectedDef.kind === "shell"}
               />

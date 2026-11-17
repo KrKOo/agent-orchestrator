@@ -790,8 +790,9 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
   /**
    * Decides whether loop step `step` repeats its body: `repeat: true` jumps back to `to`, any other outcome
-   * ends the loop. Reaching the step means no `value` stop fired during this pass. An exhausted `ask` loop
-   * with `onExhausted: "continue"` still asks (without offering repeat) so the last pass can be reviewed.
+   * ends the loop. Reaching the step means no `value` stop fired during this pass; once `maxIterations`
+   * passes ran, `onExhausted` decides between moving on and failing. An `ask` loop's stop condition is the
+   * person's `continue`, so it never exhausts: its last pass still asks, just without offering repeat.
    */
   const runLoopStep = async (step: LoopStep, previous: Step | undefined, abort: AbortSignal): Promise<StepOutcome & { repeat?: true }> => {
     const k = iterations.get(step.id) ?? 1;
@@ -800,11 +801,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     const target = def.steps[ranges.get(def.steps.indexOf(step))!]!;
     const repeat = { status: "succeeded", output: `Repeating from ${target.name} (iteration ${k + 1} of ${max})`, repeat: true } as const;
     if (step.stop.when === "max") return k < max ? repeat : { status: "succeeded", output: `Reached ${max} iterations` };
-    if (k >= max && step.onExhausted === "fail") {
-      return { status: "failed", error: `Loop "${step.name}" reached maxIterations (${max}) without meeting its stop condition` };
-    }
     if (step.stop.when === "value") {
-      return k < max ? repeat : { status: "succeeded", output: `Reached ${max} iterations without meeting the stop condition` };
+      if (k < max) return repeat;
+      return step.onExhausted === "fail"
+        ? { status: "failed", error: `Loop "${step.name}" reached maxIterations (${max}) without meeting its stop condition` }
+        : { status: "succeeded", output: `Reached ${max} iterations without meeting the stop condition` };
     }
     const offer = k < max ? { toStepId: target.id, iteration: k + 1, maxIterations: max } : undefined;
     const answer = await runInterventionStep(step, previous, abort, offer);
@@ -946,12 +947,15 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       const resetLoopsIn = (from: number, to: number) => {
         for (const end of ranges.keys()) if (from <= end && end < to) iterations.delete(def.steps[end]!.id);
       };
-      /** `step.started` of `idx`: the pass of its innermost loop, from the second pass on. */
+      /**
+       * `step.started` of `idx`: the pass of its innermost enclosing loop that has repeated (only those have
+       * a counter). An inner loop restarted by an outer repeat still gets the outer pass, so every re-run of
+       * a body step opens with a transcript divider.
+       */
       const started = (idx: number) => {
-        const inner = enclosingLoops(idx)[0];
-        const iteration = inner === undefined ? 1 : (iterations.get(def.steps[inner]!.id) ?? 1);
+        const loop = enclosingLoops(idx).find((end) => iterations.has(def.steps[end]!.id));
         currentStepId = def.steps[idx]!.id;
-        emit({ type: "step.started", payload: iteration >= 2 ? { iteration } : {} }, def.steps[idx]!.id);
+        emit({ type: "step.started", payload: loop === undefined ? {} : { iteration: iterations.get(def.steps[loop]!.id)! } }, def.steps[idx]!.id);
       };
       /** Raw value of a `value` stop ref (`<id>.output` | `<id>.structured.<field>`), for `isTruthyValue`. */
       const stopValue = (ref: string): unknown => {

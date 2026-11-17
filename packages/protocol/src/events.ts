@@ -72,7 +72,7 @@ export const RunEvent = z.discriminatedUnion("type", [
   z.object({
     ...base,
     type: z.literal("step.started"),
-    /** `iteration`: of the innermost loop enclosing the step, set only from the second iteration on. */
+    /** `iteration`: pass of the innermost loop enclosing the step that has repeated; absent while none has. */
     payload: z.object({ iteration: z.number().int().min(2).optional() }),
   }),
   z.object({

@@ -616,7 +616,7 @@ function LoopFields({
         </>
       )}
 
-      {stop.when !== "max" && (
+      {stop.when === "value" && (
         <label className="field">
           <span>When max iterations are reached</span>
           <select value={step.onExhausted} onChange={(e) => set({ onExhausted: e.target.value === "fail" ? "fail" : "continue" })}>

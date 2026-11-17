@@ -1341,7 +1341,8 @@ describe("runJob", () => {
         ["outer", 2],
         ["inner", 2],
       ]);
-      // Inner pass numbers restart after the outer repeat; the outer body's own steps show the outer pass.
+      // Inner pass numbers restart after the outer repeat; until the inner loop repeats again, its body
+      // shows the outer pass (so each re-run still opens with a divider), as do the outer body's own steps.
       expect(ofType(events, "step.started").map((e) => [e.stepId, e.payload.iteration])).toEqual([
         ["outer_start", undefined],
         ["inner_body", undefined],
@@ -1350,7 +1351,7 @@ describe("runJob", () => {
         ["inner", undefined],
         ["outer", undefined],
         ["outer_start", 2],
-        ["inner_body", undefined],
+        ["inner_body", 2],
         ["inner", 2],
         ["inner_body", 2],
         ["inner", 2],
@@ -1412,6 +1413,22 @@ describe("runJob", () => {
         [undefined, undefined],
         [undefined, "Repeat is not available here."],
       ]);
+    });
+
+    test("ask: onExhausted fail does not apply, the single pass still asks", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "continue" }]);
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: "true" },
+          { kind: "loop", id: "again", name: "Again?", to: "a", maxIterations: 1, stop: { when: "ask" }, onExhausted: "fail" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "intervention.request").map((e) => e.payload.repeat)).toEqual([undefined]);
+      expect(finishedOf(events, "again").map((p) => p.status)).toEqual(["succeeded"]);
     });
 
     test("repeat on a plain intervention is asked again with an error", async () => {
