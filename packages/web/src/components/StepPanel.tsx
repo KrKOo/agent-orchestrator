@@ -3,6 +3,9 @@ import {
   type FlowDefinition,
   isAgentStep,
   isTextStep,
+  LOOP_MAX_ITERATIONS,
+  type LoopStep,
+  loopRanges,
   pullRequestInputOf,
   type Step,
   type TemplateVariable,
@@ -21,6 +24,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   github_pr: "GitHub PR",
   intervention: "Intervention",
   github_comment: "GitHub comment",
+  loop: "Repeat from…",
 };
 
 export const KIND_ICON: Record<Step["kind"], string> = {
@@ -34,7 +38,20 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   github_pr: "🚀",
   intervention: "⏸",
   github_comment: "📝",
+  loop: "↺",
 };
+
+/** Subtitle for a loop stop condition, shared by the step panel and the canvas node. */
+export function loopStopSubtitle(stop: Extract<Step, { kind: "loop" }>["stop"], maxIterations: number): string {
+  switch (stop.when) {
+    case "max":
+      return `${maxIterations}× · fixed count`;
+    case "value":
+      return `up to ${maxIterations}× · until ${stop.is === "falsy" ? `not ${stop.ref}` : stop.ref}`;
+    case "ask":
+      return `up to ${maxIterations}× · ask each time`;
+  }
+}
 
 /** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
 function TemplateVariables({ vars, onInsert }: { vars: TemplateVariable[]; onInsert: (path: string) => void }) {
@@ -95,6 +112,25 @@ function TemplateField({
       <TemplateVariables vars={vars} onInsert={insert} />
     </div>
   );
+}
+
+/**
+ * Choices for a loop's `value` stop, mirroring validateFlow: `.output` of text steps and declared
+ * `.structured.<field>` of agent steps directly in body `[start, end)` (not inside a nested loop).
+ */
+function loopStopRefs(def: FlowDefinition, ranges: Map<number, number>, start: number, end: number): { value: string; label: string }[] {
+  const choices: { value: string; label: string }[] = [];
+  for (let i = start; i < end; i++) {
+    const s = def.steps[i]!;
+    if ([...ranges].some(([e, st]) => e < end && st >= start && st <= i && i < e)) continue;
+    if (isTextStep(s)) choices.push({ value: `${s.id}.output`, label: `${s.name} (${s.id}.output)` });
+    if (isAgentStep(s) && s.structured) {
+      for (const f of s.structured.fields) {
+        choices.push({ value: `${s.id}.structured.${f.name}`, label: `${s.name} (${s.id}.structured.${f.name})` });
+      }
+    }
+  }
+  return choices;
 }
 
 /** Editor form for one step; `onChange` receives the whole replacement step. */
@@ -214,36 +250,40 @@ export function StepPanel({
         <label className="field">
           <span>Id</span>
           <input className="mono" value={step.id} onChange={(e) => set({ id: e.target.value })} />
-          <small className="muted">
-            Later steps use <code>{`{{steps.${step.id || "<id>"}.output}}`}</code>
-          </small>
+          {step.kind !== "loop" && (
+            <small className="muted">
+              Later steps use <code>{`{{steps.${step.id || "<id>"}.output}}`}</code>
+            </small>
+          )}
         </label>
         <label className="field">
           <span>Name</span>
           <input value={step.name} onChange={(e) => set({ name: e.target.value })} />
         </label>
       </div>
-      <label className="field">
-        <span>Timeout (seconds)</span>
-        <input
-          type="number"
-          min={0}
-          value={step.timeoutSec}
-          onChange={(e) =>
-            set(
-              step.kind === "intervention" && e.target.value === ""
-                ? { timeoutSec: undefined }
-                : { timeoutSec: Number(e.target.value) },
-            )
-          }
-        />
-        {step.timeoutSec === 0 && (
-          <small className="muted">0 = no timeout (runs until the step finishes or the run is cancelled)</small>
-        )}
-        {step.kind === "intervention" && step.timeoutSec === undefined && (
-          <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
-        )}
-      </label>
+      {step.kind !== "loop" && (
+        <label className="field">
+          <span>Timeout (seconds)</span>
+          <input
+            type="number"
+            min={0}
+            value={step.timeoutSec}
+            onChange={(e) =>
+              set(
+                step.kind === "intervention" && e.target.value === ""
+                  ? { timeoutSec: undefined }
+                  : { timeoutSec: Number(e.target.value) },
+              )
+            }
+          />
+          {step.timeoutSec === 0 && (
+            <small className="muted">0 = no timeout (runs until the step finishes or the run is cancelled)</small>
+          )}
+          {step.kind === "intervention" && step.timeoutSec === undefined && (
+            <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
+          )}
+        </label>
+      )}
 
       {step.kind === "intervention" && (
         <>
@@ -261,6 +301,8 @@ export function StepPanel({
           </p>
         </>
       )}
+
+      {step.kind === "loop" && <LoopFields step={step} def={def} index={index} vars={vars} set={set} />}
 
       {step.kind === "prompt" && (
         <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />
@@ -432,5 +474,157 @@ export function StepPanel({
         </>
       )}
     </div>
+  );
+}
+
+/** Form fields for a `loop` step. */
+function LoopFields({
+  step,
+  def,
+  index,
+  vars,
+  set,
+}: {
+  step: LoopStep;
+  def: FlowDefinition;
+  index: number;
+  vars: TemplateVariable[];
+  set: (patch: Partial<LoopStep>) => void;
+}) {
+  const group = useId();
+  const ranges = loopRanges(def);
+  // `to` candidates mirror validateFlow: earlier non-loop steps whose body `[to, index]` nests with or is
+  // disjoint from every other loop body.
+  const toOptions = def.steps.slice(0, index).flatMap((s, t) => {
+    if (s.kind === "loop") return [];
+    const crosses = [...ranges].some(([end, start]) => {
+      if (end === index) return false;
+      const overlap = t <= end && start <= index;
+      const nested = (t <= start && end <= index) || (start <= t && index <= end);
+      return overlap && !nested;
+    });
+    return crosses ? [] : [{ value: s.id, label: `${s.name} (${s.id})` }];
+  });
+  const start = ranges.get(index);
+  const refChoices = start === undefined ? [] : loopStopRefs(def, ranges, start, index);
+  const stop = step.stop;
+
+  return (
+    <>
+      <label className="field">
+        <span>Repeat from</span>
+        <select value={step.to} onChange={(e) => set({ to: e.target.value })}>
+          <option value="">— choose an earlier step —</option>
+          {step.to && !toOptions.some((o) => o.value === step.to) && <option value={step.to}>{step.to} (invalid)</option>}
+          {toOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <small className="muted">The loop body runs from this step up to this loop step, then jumps back.</small>
+      </label>
+
+      <label className="field">
+        <span>Max iterations</span>
+        <input
+          type="number"
+          min={1}
+          max={LOOP_MAX_ITERATIONS}
+          value={step.maxIterations}
+          onChange={(e) => set({ maxIterations: Number(e.target.value) })}
+        />
+        <small className="muted">1–{LOOP_MAX_ITERATIONS}: the body runs at most this many times.</small>
+      </label>
+
+      <div className="field">
+        <span>Stop</span>
+        <label className="check">
+          <input type="radio" name={`${group}-stop`} checked={stop.when === "max"} onChange={() => set({ stop: { when: "max" } })} />
+          after max iterations (fixed count)
+        </label>
+        <label className="check">
+          <input
+            type="radio"
+            name={`${group}-stop`}
+            checked={stop.when === "value"}
+            onChange={() => set({ stop: { when: "value", ref: refChoices[0]?.value ?? "", is: "truthy" } })}
+          />
+          when a value is…
+        </label>
+        <label className="check">
+          <input type="radio" name={`${group}-stop`} checked={stop.when === "ask"} onChange={() => set({ stop: { when: "ask" } })} />
+          ask me each time
+        </label>
+      </div>
+
+      {stop.when === "value" && (
+        <>
+          <div className="grid2">
+            <label className="field">
+              <span>Value</span>
+              <select value={stop.ref} onChange={(e) => set({ stop: { ...stop, ref: e.target.value } })}>
+                <option value="">— choose a value in the loop body —</option>
+                {stop.ref && !refChoices.some((c) => c.value === stop.ref) && <option value={stop.ref}>{stop.ref} (invalid)</option>}
+                {refChoices.map((c) => (
+                  <option key={c.value} value={c.value}>
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>is</span>
+              <select value={stop.is} onChange={(e) => set({ stop: { ...stop, is: e.target.value === "falsy" ? "falsy" : "truthy" } })}>
+                <option value="truthy">truthy</option>
+                <option value="falsy">falsy</option>
+              </select>
+            </label>
+          </div>
+          <p className="muted small">
+            Checked right after that step succeeds, so the loop can stop mid-body (the rest of the body is skipped). Falsy:
+            empty text, <code>false</code>, <code>no</code>, <code>0</code>, <code>null</code>, <code>[]</code>, <code>{"{}"}</code>;
+            anything else is truthy. To stop on a review verdict, declare a structured field such as <code>approved</code> ("true
+            when the change needs no more fixes") on the review step; it shows up here as <code>{"<id>.structured.approved"}</code>.
+          </p>
+        </>
+      )}
+
+      {stop.when === "ask" && (
+        <>
+          <TemplateField
+            label="Question (optional)"
+            rows={3}
+            value={stop.message ?? ""}
+            vars={vars}
+            onChange={(message) => set({ stop: { when: "ask", ...(message === "" ? {} : { message }) } })}
+          />
+          <label className="field">
+            <span>Answer timeout (seconds, optional)</span>
+            <input
+              type="number"
+              min={0}
+              value={step.timeoutSec ?? ""}
+              onChange={(e) => set({ timeoutSec: e.target.value === "" ? undefined : Number(e.target.value) })}
+            />
+            <small className="muted">Caps each wait for an answer; empty = wait forever.</small>
+          </label>
+          <p className="muted small">
+            The run pauses here like an intervention: chat with the run's sessions, then repeat from the start of the body or
+            continue.
+          </p>
+        </>
+      )}
+
+      {stop.when !== "max" && (
+        <label className="field">
+          <span>When max iterations are reached</span>
+          <select value={step.onExhausted} onChange={(e) => set({ onExhausted: e.target.value === "fail" ? "fail" : "continue" })}>
+            <option value="continue">continue with the next step</option>
+            <option value="fail">fail the run</option>
+          </select>
+        </label>
+      )}
+    </>
   );
 }

@@ -1230,6 +1230,219 @@ describe("runJob", () => {
     return run;
   };
 
+  describe("loop steps", () => {
+    /** Shell snippet: bumps the counter file `name` in the worktree and leaves the new count in `$n`. */
+    const bump = (name: string) => `n=$(($(cat ${name} 2>/dev/null || echo 0) + 1)); echo $n > ${name}; `;
+    const finishedOf = (events: RunEventDraft[], stepId: string) => ofType(events, "step.finished").filter((e) => e.stepId === stepId).map((e) => e.payload);
+
+    test("max: the body runs maxIterations times, each repeat announced with its body", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: `${bump(".a")}printf 'a%s' $n` },
+          { kind: "loop", id: "again", name: "Again", to: "a", maxIterations: 3 },
+          { kind: "shell", id: "after", name: "After", command: `printf 'done:%s' "{{steps.a.output}}"` },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => [e.stepId, e.payload.iteration])).toEqual([
+        ["a", undefined],
+        ["again", undefined],
+        ["a", 2],
+        ["again", undefined],
+        ["a", 3],
+        ["again", undefined],
+        ["after", undefined],
+      ]);
+      expect(ofType(events, "loop.repeat").map((e) => [e.stepId, e.payload])).toEqual([
+        ["again", { toStepId: "a", iteration: 2, maxIterations: 3, stepIds: ["a"] }],
+        ["again", { toStepId: "a", iteration: 3, maxIterations: 3, stepIds: ["a"] }],
+      ]);
+      expect(finishedOf(events, "again").map((p) => p.output)).toEqual([
+        "Repeating from A (iteration 2 of 3)",
+        "Repeating from A (iteration 3 of 3)",
+        "Reached 3 iterations",
+      ]);
+      expect(finishedOf(events, "after")[0]).toEqual({ status: "succeeded", output: "done:a3" });
+    });
+
+    test("value: a structured stop breaks out mid-body, skipping the rest of the body", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      deps.config = { ...config, ports: { ...config.ports, mcp: 7899 } };
+      deps.mcp = await startMcpServer(deps.config);
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "count", name: "Count", command: `${bump(".count")}[ $n -ge 2 ] && printf true || printf false` },
+          {
+            kind: "prompt",
+            id: "review",
+            name: "Review",
+            prompt: `submit {"approved":{{steps.count.output}}}`,
+            structured: { fields: [{ name: "approved", description: "true when done" }] },
+          },
+          { kind: "shell", id: "fix", name: "Fix", command: `${bump(".fix")}printf 'fix%s' $n` },
+          { kind: "loop", id: "again", name: "Review/fix", to: "count", maxIterations: 5, stop: { when: "value", ref: "review.structured.approved", is: "truthy" } },
+          { kind: "shell", id: "after", name: "After", command: `printf 'after:%s' "{{steps.fix.output}}"` },
+        ],
+      });
+      try {
+        await runJob(run, deps, new AbortController().signal);
+      } finally {
+        await deps.mcp.stop();
+      }
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["count", "review", "fix", "again", "count", "review", "again", "after"]);
+      // Pass 2: review approved, so fix is skipped and keeps its pass-1 output for later templates.
+      expect(finishedOf(events, "fix")).toEqual([
+        { status: "succeeded", output: "fix1" },
+        { status: "skipped", output: "fix1" },
+      ]);
+      expect(finishedOf(events, "again").at(-1)).toEqual({ status: "succeeded", output: "Stopped: review.structured.approved is truthy (iteration 2 of 5)" });
+      expect(finishedOf(events, "after")[0]).toEqual({ status: "succeeded", output: "after:fix1" });
+      expect(ofType(events, "loop.repeat").map((e) => e.payload.stepIds)).toEqual([["count", "review", "fix"]]);
+    });
+
+    test("value: onExhausted fail fails the loop step once maxIterations passes ran", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "check", name: "Check", command: "printf no" },
+          { kind: "loop", id: "again", name: "Retry check", to: "check", maxIterations: 2, stop: { when: "value", ref: "check.output", is: "truthy" }, onExhausted: "fail" },
+          { kind: "shell", id: "after", name: "After", command: "true" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      const error = 'Loop "Retry check" reached maxIterations (2) without meeting its stop condition';
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "failed", error });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["check", "again", "check", "again"]);
+      expect(finishedOf(events, "again").at(-1)).toEqual({ status: "failed", error });
+    });
+
+    test("nested: an outer repeat restarts the inner loop's counter", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "outer_start", name: "Outer", command: "true" },
+          { kind: "shell", id: "inner_body", name: "Inner", command: `${bump(".inner")}printf %s $n` },
+          { kind: "loop", id: "inner", name: "Inner loop", to: "inner_body", maxIterations: 2 },
+          { kind: "loop", id: "outer", name: "Outer loop", to: "outer_start", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(finishedOf(events, "inner_body").map((p) => p.output)).toEqual(["1", "2", "3", "4"]);
+      expect(ofType(events, "loop.repeat").map((e) => [e.stepId, e.payload.iteration])).toEqual([
+        ["inner", 2],
+        ["outer", 2],
+        ["inner", 2],
+      ]);
+      // Inner pass numbers restart after the outer repeat; the outer body's own steps show the outer pass.
+      expect(ofType(events, "step.started").map((e) => [e.stepId, e.payload.iteration])).toEqual([
+        ["outer_start", undefined],
+        ["inner_body", undefined],
+        ["inner", undefined],
+        ["inner_body", 2],
+        ["inner", undefined],
+        ["outer", undefined],
+        ["outer_start", 2],
+        ["inner_body", undefined],
+        ["inner", 2],
+        ["inner_body", 2],
+        ["inner", 2],
+        ["outer", undefined],
+      ]);
+    });
+
+    test("forward refs: a body step reads a later body step's previous-pass output, empty on the first", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: `printf 'got:%s' "{{steps.b.output}}"` },
+          { kind: "shell", id: "b", name: "B", command: `${bump(".b")}printf 'b%s' $n` },
+          { kind: "loop", id: "again", name: "Again", to: "a", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(finishedOf(events, "a").map((p) => p.output)).toEqual(["got:", "got:b1"]);
+    });
+
+    test("ask: the gate offers repeat until the user continues", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "repeat" }, { action: "continue" }]);
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: `${bump(".a")}printf 'a%s' $n` },
+          { kind: "loop", id: "again", name: "Again?", to: "a", maxIterations: 3, stop: { when: "ask", message: "Again after {{steps.a.output}}?" } },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(events, "intervention.request");
+      expect(requests.map((e) => [e.stepId, e.payload.message, e.payload.repeat])).toEqual([
+        ["again", "Again after a1?", { toStepId: "a", iteration: 2, maxIterations: 3 }],
+        ["again", "Again after a2?", { toStepId: "a", iteration: 3, maxIterations: 3 }],
+      ]);
+      expect(finishedOf(events, "a").map((p) => p.output)).toEqual(["a1", "a2"]);
+      expect(finishedOf(events, "again").map((p) => p.output)).toEqual(["Repeating from A (iteration 2 of 3)", "Stopped: continued at iteration 2 of 3"]);
+    });
+
+    test("ask: the last allowed pass still asks, without offering repeat", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "repeat" }, { action: "repeat" }, { action: "continue" }]);
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: "true" },
+          { kind: "loop", id: "again", name: "Again?", to: "a", maxIterations: 2, stop: { when: "ask" } },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(events, "intervention.request").map((e) => e.payload);
+      expect(requests.map((r) => [r.repeat?.iteration, r.error])).toEqual([
+        [2, undefined],
+        [undefined, undefined],
+        [undefined, "Repeat is not available here."],
+      ]);
+    });
+
+    test("repeat on a plain intervention is asked again with an error", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "repeat" }, { action: "continue" }]);
+      const run = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(events, "intervention.request").map((e) => e.payload);
+      expect(requests.map((r) => r.error)).toEqual([undefined, "Repeat is not available here."]);
+      expect(requests.every((r) => r.repeat === undefined)).toBe(true);
+    });
+
+    test("an intervention after a loop preselects the session of the loop's last step", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "continue" }]);
+      const run = assigned({
+        steps: [
+          { kind: "prompt", id: "impl", name: "Implement", prompt: "hi" },
+          { kind: "loop", id: "again", name: "Again", to: "impl", maxIterations: 2 },
+          { kind: "intervention", id: "gate", name: "Gate" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "intervention.request")[0]!.payload.session).toBe("agent");
+    });
+  });
+
   describe("resumed runs", () => {
     test("renders prior step outputs in templates and starts at the cursor", async () => {
       const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());

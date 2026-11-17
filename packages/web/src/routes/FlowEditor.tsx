@@ -3,6 +3,7 @@ import {
   type FlowRow,
   isAgentStep,
   isTextStep,
+  loopRanges,
   pullRequestInputOf,
   RUN_NAME_MAX,
   type Step,
@@ -18,6 +19,7 @@ import {
   EdgeLabelRenderer,
   getStraightPath,
   Handle,
+  MarkerType,
   type Node,
   type NodeProps,
   Position,
@@ -27,7 +29,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ApiRequestError, api, errorMessage } from "../api";
 import { DEFAULT_LOCAL_WORKSPACE, InputsPanel } from "../components/InputsPanel";
-import { KIND_ICON, KIND_LABEL, StepPanel } from "../components/StepPanel";
+import { KIND_ICON, KIND_LABEL, loopStopSubtitle, StepPanel } from "../components/StepPanel";
 import { Modal } from "../ui";
 
 const NEW_FLOW: FlowDefinition = {
@@ -74,6 +76,16 @@ function newStep(kind: StepKind, id: string, earlier: Step[], inputs: FlowDefini
       const target = pullRequestInputOf({ inputs }) ?? inputs.find((i) => i.required && i.type !== "text");
       return { ...base, kind, target: target?.key ?? "", bodyFrom: earlier.filter(isTextStep).at(-1)?.id ?? "" };
     }
+    case "loop":
+      return {
+        id,
+        name: "Loop",
+        kind,
+        to: earlier.findLast((s) => s.kind !== "loop")?.id ?? "",
+        maxIterations: 3,
+        stop: { when: "max" },
+        onExhausted: "continue",
+      };
   }
 }
 
@@ -109,6 +121,8 @@ interface ChainNodeData extends Record<string, unknown> {
   subtitle: string;
   errors: string[];
   selected: boolean;
+  /** Loop step: rendered compact, with the handle its back-edge leaves from. */
+  loop?: boolean;
 }
 type ChainNode = Node<ChainNodeData, "chain">;
 
@@ -117,9 +131,15 @@ interface InsertEdgeData extends Record<string, unknown> {
 }
 type InsertEdge = Edge<InsertEdgeData, "insert">;
 
+interface LoopEdgeData extends Record<string, unknown> {
+  /** Horizontal distance of the arrow's vertical run from the nodes; outer loops get more. */
+  offset: number;
+}
+type LoopEdge = Edge<LoopEdgeData, "loop">;
+
 function ChainNodeView({ data }: NodeProps<ChainNode>) {
   return (
-    <div className={`chain-node ${data.selected ? "selected" : ""} ${data.errors.length ? "invalid" : ""}`}>
+    <div className={`chain-node ${data.loop ? "loop" : ""} ${data.selected ? "selected" : ""} ${data.errors.length ? "invalid" : ""}`}>
       <Handle type="target" position={Position.Top} isConnectable={false} />
       <span className="kind-icon">{data.icon}</span>
       <div className="chain-node-text">
@@ -139,6 +159,9 @@ function ChainNodeView({ data }: NodeProps<ChainNode>) {
         </span>
       )}
       <Handle type="source" position={Position.Bottom} isConnectable={false} />
+      {/* Declared after the chain handles: edges without a handle id take the first one (top/bottom). */}
+      <Handle type="target" id="loop-in" position={Position.Right} isConnectable={false} />
+      {data.loop && <Handle type="source" id="loop-out" position={Position.Right} isConnectable={false} />}
     </div>
   );
 }
@@ -172,11 +195,43 @@ function InsertEdgeView({ id, sourceX, sourceY, targetX, targetY, data }: EdgePr
   );
 }
 
+/** Back-arrow of a loop: out of the loop node's right side, up beside the body, into the `to` step's right side. */
+function LoopEdgeView({ id, sourceX, sourceY, targetX, targetY, data, markerEnd }: EdgeProps<LoopEdge>) {
+  const x = Math.max(sourceX, targetX) + (data?.offset ?? 24);
+  const r = 8;
+  const path = [
+    `M ${sourceX} ${sourceY}`,
+    `L ${x - r} ${sourceY}`,
+    `Q ${x} ${sourceY} ${x} ${sourceY - r}`,
+    `L ${x} ${targetY + r}`,
+    `Q ${x} ${targetY} ${x - r} ${targetY}`,
+    `L ${targetX} ${targetY}`,
+  ].join(" ");
+  return <BaseEdge id={id} path={path} markerEnd={markerEnd} className="loop-edge" />;
+}
+
 const nodeTypes = { chain: ChainNodeView, end: EndNodeView };
-const edgeTypes = { insert: InsertEdgeView };
+const edgeTypes = { insert: InsertEdgeView, loop: LoopEdgeView };
 
 const NODE_WIDTH = 300;
+const LOOP_NODE_WIDTH = 240;
 const ROW = 110;
+/** Horizontal spacing between nested loops' back-arrows. */
+const LOOP_EDGE_STEP = 22;
+
+/**
+ * Nesting height per loop step index: 1 for loops with no loop inside their body, else one more than the
+ * tallest inner loop, so outer back-arrows run outside inner ones.
+ */
+function loopHeights(ranges: Map<number, number>): Map<number, number> {
+  const heights = new Map<number, number>();
+  for (const [end, start] of [...ranges].sort(([e1, s1], [e2, s2]) => e1 - s1 - (e2 - s2))) {
+    let h = 1;
+    for (const [e, s] of ranges) if (e !== end && start <= s && e < end) h = Math.max(h, (heights.get(e) ?? 0) + 1);
+    heights.set(end, h);
+  }
+  return heights;
+}
 
 /** Subtitle of the "Trigger, Inputs & Workspace" node. */
 function settingsSubtitle(def: FlowDefinition): string {
@@ -209,6 +264,8 @@ function stepSubtitle(step: Step): string {
       return step.message?.split("\n")[0] || "wait for user";
     case "github_comment":
       return `on ${step.target || "?"} · body ${step.bodyFrom || "?"}`;
+    case "loop":
+      return loopStopSubtitle(step.stop, step.maxIterations);
   }
 }
 
@@ -281,22 +338,26 @@ export function FlowEditor() {
           selected: selection === "inputs",
         },
       } satisfies ChainNode,
-      ...draft.steps.map(
-        (step, idx): ChainNode => ({
+      ...draft.steps.map((step, idx): ChainNode => {
+        const loop = step.kind === "loop";
+        const width = loop ? LOOP_NODE_WIDTH : NODE_WIDTH;
+        const target = loop ? draft.steps.find((s, i) => i < idx && s.id === step.to) : undefined;
+        return {
           id: `step-${idx}`,
           type: "chain",
-          position: { x: 0, y: (idx + 1) * ROW },
-          style: { width: NODE_WIDTH },
+          position: { x: (NODE_WIDTH - width) / 2, y: (idx + 1) * ROW },
+          style: { width },
           data: {
             icon: KIND_ICON[step.kind],
-            title: step.name || "(unnamed step)",
+            title: loop ? `Repeat from ${target?.name || step.to || "?"}` : step.name || "(unnamed step)",
             stepId: step.id,
-            subtitle: `${KIND_LABEL[step.kind]} · ${stepSubtitle(step)}`,
+            subtitle: loop ? stepSubtitle(step) : `${KIND_LABEL[step.kind]} · ${stepSubtitle(step)}`,
             errors: errorsByNode.get(idx) ?? [],
             selected: selection === idx,
+            loop,
           },
-        }),
-      ),
+        };
+      }),
       {
         id: "end",
         type: "end",
@@ -306,13 +367,27 @@ export function FlowEditor() {
       },
     ];
     const ids = nodes.map((n) => n.id);
-    const edges: InsertEdge[] = ids.slice(1).map((target, idx) => ({
+    const edges: (InsertEdge | LoopEdge)[] = ids.slice(1).map((target, idx) => ({
       id: `e-${idx}`,
       source: ids[idx]!,
       target,
       type: "insert",
       data: { onInsert: () => setInsertAt(idx) },
     }));
+    const ranges = loopRanges(draft);
+    const heights = loopHeights(ranges);
+    for (const [end, start] of ranges) {
+      edges.push({
+        id: `loop-${end}`,
+        source: `step-${end}`,
+        sourceHandle: "loop-out",
+        target: `step-${start}`,
+        targetHandle: "loop-in",
+        type: "loop",
+        markerEnd: { type: MarkerType.ArrowClosed, color: "var(--accent)", width: 16, height: 16 },
+        data: { offset: LOOP_EDGE_STEP * heights.get(end)! },
+      });
+    }
     return { nodes, edges };
   }, [draft, errorsByNode, selection]);
 
@@ -510,6 +585,7 @@ const KIND_HELP: Record<StepKind, string> = {
   github_pr: "Open a pull request from the run branch",
   intervention: "Pause and chat with the run's agent sessions, then continue",
   github_comment: "Post a comment on an issue or pull request input",
+  loop: "Jump back to an earlier step: repeat a fixed count, until a value is truthy/falsy, or ask each time",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {

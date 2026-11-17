@@ -1,4 +1,4 @@
-import { isAgentStep, RETRYABLE_STATUSES, TERMINAL_STATUSES, type WorkspaceInfo } from "@orch/protocol";
+import { isAgentStep, loopRanges, RETRYABLE_STATUSES, TERMINAL_STATUSES, type LoopStep, type WorkspaceInfo } from "@orch/protocol";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
@@ -15,6 +15,15 @@ import { useRunEventStream } from "../ws";
 const EMPTY_STEP: StepView = { status: "pending", items: [], toolCalls: {}, subagents: [] };
 /** The sandbox log shows only its newest chunks up to this much text until "Show all". */
 const LOG_TAIL_CHARS = 200_000;
+
+/** Innermost loop enclosing `stepIdx`, or undefined for top-level steps: nested bodies shrink, so the smallest end wins. */
+function enclosingLoopIdx(stepIdx: number, ranges: Map<number, number>): number | undefined {
+  let inner: number | undefined;
+  for (const [end, start] of ranges) {
+    if (start <= stepIdx && stepIdx < end && (inner === undefined || end < inner)) inner = end;
+  }
+  return inner;
+}
 
 export function RunView() {
   const { id = "" } = useParams();
@@ -74,8 +83,8 @@ function RunViewInner({ runId }: { runId: string }) {
   const error = state.error ?? run.error;
   const stepRows = new Map(detail.data!.steps.map((s) => [s.stepId, s]));
   const stepStatus = (stepId: string) => state.steps[stepId]?.status ?? stepRows.get(stepId)?.status ?? "pending";
-  /** "Run from here" needs every earlier step's output, so it's offered up to the first unsucceeded step. */
-  const firstUnfinished = steps.findIndex((s) => stepStatus(s.id) !== "succeeded");
+  /** "Run from here" needs every earlier step's output, so it's offered up to the first unfinished step. */
+  const firstUnfinished = steps.findIndex((s) => !["succeeded", "skipped"].includes(stepStatus(s.id)));
   const findings = state.lastSeq > 0 ? state.findings : detail.data!.findings;
   const permission = state.permissions.find((p) => !p.resolved && !submitted.has(p.requestId));
   const elicitation = state.elicitations.find((e) => !e.resolved && !submitted.has(e.requestId));
@@ -96,6 +105,12 @@ function RunViewInner({ runId }: { runId: string }) {
   const selectedRow = selectedId !== null ? stepRows.get(selectedId) : undefined;
   // Live stream first; a reloaded (or already terminal) run falls back to the persisted workspace.
   const workspace = state.workspace ?? run.workspace ?? undefined;
+  // Loop step index → body start; step index → the counter of its innermost enclosing loop.
+  const ranges = loopRanges(run.definition);
+  const loopOfStep = (idx: number) => {
+    const loopIdx = enclosingLoopIdx(idx, ranges);
+    return loopIdx === undefined ? undefined : state.loops[steps[loopIdx]!.id];
+  };
 
   return (
     <div className="run-view">
@@ -255,6 +270,8 @@ function RunViewInner({ runId }: { runId: string }) {
         <nav className="step-list">
           {steps.map((s, idx) => {
             const row = stepRows.get(s.id);
+            // Once a loop has repeated, its body rows (and the loop row) show which pass is running.
+            const loop = s.kind === "loop" ? state.loops[s.id] : loopOfStep(idx);
             return (
               <div key={s.id} className={`step-item ${s.id === selectedId ? "active" : ""}`}>
                 <button type="button" className="step-item-select" onClick={() => setSelected(s.id)}>
@@ -267,6 +284,11 @@ function RunViewInner({ runId }: { runId: string }) {
                     </span>
                   </span>
                 </button>
+                {loop && (
+                  <span className="tag loop-iter" title="Current pass of the enclosing loop">
+                    {loop.iteration}/{loop.maxIterations}
+                  </span>
+                )}
                 {retryable && (firstUnfinished < 0 || idx <= firstUnfinished) && (
                   <button
                     type="button"
@@ -299,6 +321,16 @@ function RunViewInner({ runId }: { runId: string }) {
                 <span className="step-id">{selectedDef.id}</span>
                 <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
                 <span className="grow" />
+                {(() => {
+                  // The loop step shows its own counter; body steps their enclosing loop's.
+                  const idx = steps.indexOf(selectedDef);
+                  const loop = selectedDef.kind === "loop" ? state.loops[selectedDef.id] : idx >= 0 ? loopOfStep(idx) : undefined;
+                  return loop ? (
+                    <span className="tag loop-iter" title="Current pass of the enclosing loop">
+                      {loop.iteration}/{loop.maxIterations}
+                    </span>
+                  ) : null;
+                })()}
                 {selectedRow?.startedAt && (
                   <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>
                 )}
@@ -337,6 +369,7 @@ function RunViewInner({ runId }: { runId: string }) {
               stepId={selectedId}
               request={gateRequest}
               session={gateSession}
+              steps={steps}
               awaiting={!gateRequest.resolved && !submitted.has(gateRequest.requestId)}
               onPick={(id) => setPickedSession({ stepId: selectedId, id })}
               onSubmitted={(requestId) => {

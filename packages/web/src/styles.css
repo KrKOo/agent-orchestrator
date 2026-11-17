@@ -256,6 +256,11 @@ textarea:focus {
   background: color-mix(in srgb, var(--info) 18%, transparent);
   color: var(--info);
 }
+/* Loops in flows (#29): skipped body step (a value stop fired mid-iteration) — done, but not successful. */
+.chip-skipped {
+  background: color-mix(in srgb, var(--muted) 14%, transparent);
+  color: var(--muted);
+}
 .tag {
   display: inline-block;
   margin: 0 4px 0 0;
@@ -650,6 +655,18 @@ textarea:focus {
 }
 .chain-node.invalid {
   border-color: color-mix(in srgb, var(--danger) 60%, var(--border));
+}
+/* Loops in flows (#29): compact "Repeat from…" node and its back-arrow to the body's first step. */
+.chain-node.loop {
+  padding: 4px 10px;
+  border-style: dashed;
+}
+.chain-node.loop .chain-node-title {
+  font-size: 12px;
+}
+.react-flow__edge-path.loop-edge {
+  stroke: var(--accent);
+  stroke-dasharray: 5 3;
 }
 .chain-node-text {
   min-width: 0;
@@ -1223,4 +1240,25 @@ pre.output-card-body {
 .model-role-row .field {
   flex: 1;
   margin: 0;
+}
+
+/* Loops in flows (#29): iteration divider inside a step transcript, and the n/max pass badge. */
+.iteration-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.iteration-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.loop-iter {
+  flex: none;
 }

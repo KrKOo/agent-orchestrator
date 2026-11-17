@@ -189,14 +189,20 @@ export class Scheduler {
         .all();
       if (claimed.length === 0) continue;
       const gh = run.github;
-      // Retried runs carry the step cursor plus prior succeeded outputs; `seqFrom` continues the
+      // Retried runs carry the step cursor plus prior done outputs (succeeded or skipped); `seqFrom` continues the
       // transcript's seq numbering even when a different runner resumes (its outbox restarts at 1).
       const prior =
         run.resumeFrom !== null
           ? db
               .select({ stepId: runSteps.stepId, output: runSteps.output, structured: runSteps.structured })
               .from(runSteps)
-              .where(and(eq(runSteps.runId, run.id), lt(runSteps.idx, run.resumeFrom), eq(runSteps.status, "succeeded")))
+              .where(
+                and(
+                  eq(runSteps.runId, run.id),
+                  lt(runSteps.idx, run.resumeFrom),
+                  inArray(runSteps.status, ["succeeded", "skipped"]),
+                ),
+              )
               .orderBy(asc(runSteps.idx))
               .all()
               .map((s) => ({ stepId: s.stepId, output: s.output ?? "", ...(s.structured === null ? {} : { structured: s.structured }) }))

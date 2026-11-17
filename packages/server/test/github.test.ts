@@ -749,6 +749,35 @@ describe("check run reporting", () => {
     expect(final.output!.summary).toContain("other.py");
   });
 
+  test("skipped body steps count as done in the progress title", async () => {
+    const gh = fakeGitHub();
+    const deps = testDeps({ config: APP_CONFIG, credentials: new FakeCredentials(), fetch: gh.fetch });
+    const runId = addRun(deps, {
+      status: "assigned",
+      runnerId: "r1",
+      trust: "untrusted",
+      triggerKind: "github",
+      definition: prFlowDef({}, [
+        { id: "review", name: "Review", kind: "prompt", prompt: "Review {{inputs.pr.diffPath}}: {{inputs.pr.title}}" },
+        { id: "extra", name: "Extra", kind: "prompt", prompt: "double-check" },
+      ]),
+      github: { installationId: 55, repo: "o/r", number: 7, headSha: "h".repeat(40), baseSha: "b", checkRunId: 9 },
+    });
+    deps.runs.ingest(runId, [ev(runId, 1, "step.finished", { status: "succeeded", output: "ok" }, "review")]);
+    await deps.checks.idle();
+    // A loop stop bypassed this step in the current iteration.
+    deps.runs.ingest(runId, [ev(runId, 2, "step.finished", { status: "skipped", output: "" }, "extra")]);
+    await deps.checks.idle();
+
+    expect(gh.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      "PATCH /repos/o/r/check-runs/9",
+      "PATCH /repos/o/r/check-runs/9",
+    ]);
+    expect(gh.calls[0]!.body!.output!.title).toBe("1/2 steps");
+    expect(gh.calls[1]!.body!.output!.title).toBe("2/2 steps");
+    expect(gh.calls[1]!.body!.output!.summary).toContain("— skipped");
+  });
+
   test("annotations go out in batches of 50 and only the last PATCH carries the conclusion", async () => {
     const gh = fakeGitHub();
     const deps = testDeps({ config: APP_CONFIG, credentials: new FakeCredentials(), fetch: gh.fetch });

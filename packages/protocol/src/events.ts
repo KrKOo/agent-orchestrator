@@ -11,7 +11,8 @@ export const RETRYABLE_STATUSES: readonly RunStatus[] = ["failed", "cancelled"];
 /** Max run name length (UTF-16 code units, as zod counts), for user-given and agent-generated names alike. */
 export const RUN_NAME_MAX = 120;
 
-export const StepStatus = z.enum(["pending", "running", "succeeded", "failed", "cancelled"]);
+/** `skipped`: a loop body step bypassed because a `value` stop ended the iteration before it. */
+export const StepStatus = z.enum(["pending", "running", "succeeded", "failed", "cancelled", "skipped"]);
 export type StepStatus = z.infer<typeof StepStatus>;
 
 export const Finding = z.object({
@@ -68,7 +69,12 @@ export const RunEvent = z.discriminatedUnion("type", [
       resumeFromStepId: z.string().optional(),
     }),
   }),
-  z.object({ ...base, type: z.literal("step.started"), payload: z.object({}) }),
+  z.object({
+    ...base,
+    type: z.literal("step.started"),
+    /** `iteration`: of the innermost loop enclosing the step, set only from the second iteration on. */
+    payload: z.object({ iteration: z.number().int().min(2).optional() }),
+  }),
   z.object({
     ...base,
     type: z.literal("run.name"),
@@ -78,10 +84,24 @@ export const RunEvent = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("step.finished"),
     payload: z.object({
-      status: z.enum(["succeeded", "failed", "cancelled"]),
+      status: z.enum(["succeeded", "failed", "cancelled", "skipped"]),
       output: z.string().optional(),
       structured: z.unknown().optional(),
       error: z.string().optional(),
+    }),
+  }),
+  /**
+   * Loop step `stepId` jumps back to `toStepId`: body steps `stepIds` (from `toStepId` up to, not including,
+   * the loop step) are pending again for iteration `iteration` of at most `maxIterations`.
+   */
+  z.object({
+    ...base,
+    type: z.literal("loop.repeat"),
+    payload: z.object({
+      toStepId: z.string(),
+      iteration: z.number().int().min(2),
+      maxIterations: z.number().int().min(1),
+      stepIds: z.array(z.string()),
     }),
   }),
   z.object({ ...base, type: z.literal("acp.update"), payload: z.object({ update: SessionUpdate }) }),
@@ -117,6 +137,8 @@ export const RunEvent = z.discriminatedUnion("type", [
       session: z.string().optional(),
       /** Why the last chat turn failed. */
       error: z.string().optional(),
+      /** Set on `ask` loop gates that can still repeat: `iteration` is the one a repeat starts. */
+      repeat: z.object({ toStepId: z.string(), iteration: z.number().int().min(2), maxIterations: z.number().int().min(1) }).optional(),
     }),
   }),
   z.object({

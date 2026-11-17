@@ -22,6 +22,9 @@ import {
   UNTRUSTED_PREAMBLE,
   isActionStep,
   isAgentStep,
+  isTruthyValue,
+  type LoopStep,
+  loopRanges,
   renderTemplate,
   type StructuredOutput,
   validateFlow,
@@ -322,6 +325,15 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   for (const prior of resume?.prior ?? []) {
     ctx.steps[prior.stepId] = { output: prior.output, ...(prior.structured !== undefined ? { structured: prior.structured } : {}) };
   }
+  /** Loop step index → index of its body's first step (`to`). */
+  const ranges = loopRanges(def);
+  /** Current pass (1-based) of loops that have repeated; absent = first pass. A retry restarts them at 1. */
+  const iterations = new Map<string, number>();
+  // Loop bodies may reference later body steps (`{{steps.<later>.output}}`, the previous pass's value):
+  // empty on the first pass.
+  for (const [end, start] of ranges) {
+    for (const s of def.steps.slice(start, end)) if (s.kind !== "loop") ctx.steps[s.id] ??= { output: "" };
+  }
   let status: StepOutcome["status"] = "succeeded";
   let error: string | undefined;
   let workspace: PreparedWorkspace | null = null;
@@ -515,10 +527,17 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /**
    * Lets the user chat with the run's sessions: each `message` answer sends its text verbatim to the
    * chosen session (replies stream under the gate), then the gate asks again. `continue` passes the
-   * chosen session's latest result on as the gate output.
+   * chosen session's latest result on as the gate output. `ask` loop gates also offer `repeat`
+   * (when `repeat` is set): the outcome then carries `repeat: true` and the loop jumps back.
    */
-  const runInterventionStep = async (step: Extract<Step, { kind: "intervention" }>, previous: Step | undefined, abort: AbortSignal): Promise<StepOutcome> => {
-    const message = step.message ? renderTemplate(step.message, ctx) : "";
+  const runInterventionStep = async (
+    step: Extract<Step, { kind: "intervention" }> | LoopStep,
+    previous: Step | undefined,
+    abort: AbortSignal,
+    repeat?: { toStepId: string; iteration: number; maxIterations: number },
+  ): Promise<StepOutcome & { repeat?: true }> => {
+    const template = step.kind === "intervention" ? step.message : step.stop.when === "ask" ? step.stop.message : undefined;
+    const message = template ? renderTemplate(template, ctx) : "";
     // Preselect the session that produced the previous step's result.
     const previousSession = previous && isAgentStep(previous) ? AGENT_SESSION : previous?.kind === "slash" ? `slash:${previous.id}` : undefined;
     let selected = previousSession !== undefined && sessions.has(previousSession) ? previousSession : undefined;
@@ -534,6 +553,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
             sessions: [...sessions].map(([id, s]) => ({ id, label: s.label, output: s.output })),
             ...(selected !== undefined ? { session: selected } : {}),
             ...(error !== undefined ? { error } : {}),
+            ...(repeat !== undefined ? { repeat } : {}),
           },
         },
         step.id,
@@ -552,6 +572,14 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       if (action === "continue") {
         emit({ type: "run.status", payload: { status: "running" } });
         return { status: "succeeded", output: chat?.output ?? "" };
+      }
+      if (action === "repeat") {
+        if (repeat === undefined) {
+          error = "Repeat is not available here.";
+          continue;
+        }
+        emit({ type: "run.status", payload: { status: "running" } });
+        return { status: "succeeded", output: chat?.output ?? "", repeat: true };
       }
 
       if (!chat || !text?.trim()) {
@@ -723,7 +751,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   };
 
   const runActionStep = async (
-    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" }>,
+    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" } | { kind: "loop" }>,
     abort: AbortSignal,
   ): Promise<StepOutcome> => {
     const ws = workspace!;
@@ -760,15 +788,39 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     return { status: "succeeded", output: pr.url };
   };
 
-  /** `previous` is the step that ran right before `step` (an intervention gate reviews it). */
-  const runStep = async (step: Step, previous: Step | undefined): Promise<StepOutcome> => {
+  /**
+   * Decides whether loop step `step` repeats its body: `repeat: true` jumps back to `to`, any other outcome
+   * ends the loop. Reaching the step means no `value` stop fired during this pass. An exhausted `ask` loop
+   * with `onExhausted: "continue"` still asks (without offering repeat) so the last pass can be reviewed.
+   */
+  const runLoopStep = async (step: LoopStep, previous: Step | undefined, abort: AbortSignal): Promise<StepOutcome & { repeat?: true }> => {
+    const k = iterations.get(step.id) ?? 1;
+    const max = step.maxIterations;
+    // `rejectReason` validated the flow, so every loop step has a body.
+    const target = def.steps[ranges.get(def.steps.indexOf(step))!]!;
+    const repeat = { status: "succeeded", output: `Repeating from ${target.name} (iteration ${k + 1} of ${max})`, repeat: true } as const;
+    if (step.stop.when === "max") return k < max ? repeat : { status: "succeeded", output: `Reached ${max} iterations` };
+    if (k >= max && step.onExhausted === "fail") {
+      return { status: "failed", error: `Loop "${step.name}" reached maxIterations (${max}) without meeting its stop condition` };
+    }
+    if (step.stop.when === "value") {
+      return k < max ? repeat : { status: "succeeded", output: `Reached ${max} iterations without meeting the stop condition` };
+    }
+    const offer = k < max ? { toStepId: target.id, iteration: k + 1, maxIterations: max } : undefined;
+    const answer = await runInterventionStep(step, previous, abort, offer);
+    if (answer.status !== "succeeded") return answer;
+    return answer.repeat ? repeat : { status: "succeeded", output: `Stopped: continued at iteration ${k} of ${max}` };
+  };
+
+  /** `previous` is the last non-loop step that ran before `step` (an intervention gate reviews it). */
+  const runStep = async (step: Step, previous: Step | undefined): Promise<StepOutcome & { repeat?: true }> => {
     const abort = new AbortController();
     stepAbort = abort;
     let timedOut = false;
     // Gates cap each wait for an answer themselves (revisions run under the reviewed step's timeout);
-    // `timeoutSec: 0` runs without a cap.
+    // loop steps decide at once or wait on an `ask` gate; `timeoutSec: 0` runs without a cap.
     const timer =
-      step.kind === "intervention" || step.timeoutSec === 0
+      step.kind === "intervention" || step.kind === "loop" || step.timeoutSec === 0
         ? undefined
         : setTimeout(() => {
             timedOut = true;
@@ -788,9 +840,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
             ? await runShellStep(step, abort.signal)
             : step.kind === "intervention"
               ? await runInterventionStep(step, previous, abort.signal)
-              : step.kind === "github_comment"
-                ? await runCommentStep(step, abort.signal)
-                : await runActionStep(step, abort.signal);
+              : step.kind === "loop"
+                ? await runLoopStep(step, previous, abort.signal)
+                : step.kind === "github_comment"
+                  ? await runCommentStep(step, abort.signal)
+                  : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };
@@ -882,30 +936,115 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         await rejectWhenAborted(harness.newSession(), signal);
       }
 
-      for (const [i, step] of def.steps.entries()) {
-        if (i < fromStepIdx) continue;
+      /** Loop step indexes whose body `[start, end)` contains `idx`, innermost first (nested bodies end earlier). */
+      const enclosingLoops = (idx: number): number[] =>
+        [...ranges]
+          .filter(([end, start]) => start <= idx && idx < end)
+          .map(([end]) => end)
+          .sort((a, b) => a - b);
+      /** Restarts the counters of loops whose step lies in `[from, to)` (their bodies run anew). */
+      const resetLoopsIn = (from: number, to: number) => {
+        for (const end of ranges.keys()) if (from <= end && end < to) iterations.delete(def.steps[end]!.id);
+      };
+      /** `step.started` of `idx`: the pass of its innermost loop, from the second pass on. */
+      const started = (idx: number) => {
+        const inner = enclosingLoops(idx)[0];
+        const iteration = inner === undefined ? 1 : (iterations.get(def.steps[inner]!.id) ?? 1);
+        currentStepId = def.steps[idx]!.id;
+        emit({ type: "step.started", payload: iteration >= 2 ? { iteration } : {} }, def.steps[idx]!.id);
+      };
+      /** Raw value of a `value` stop ref (`<id>.output` | `<id>.structured.<field>`), for `isTruthyValue`. */
+      const stopValue = (ref: string): unknown => {
+        const [id, kind, field] = ref.split(".");
+        const entry = ctx.steps[id!];
+        if (kind === "output") return entry?.output;
+        const structured = entry?.structured;
+        return structured !== null && typeof structured === "object" && Object.hasOwn(structured, field!)
+          ? (structured as Record<string, unknown>)[field!]
+          : undefined;
+      };
+      // Written even when empty so every finished step replaces any snapshot an older attempt left.
+      // Copies: gate chats mutate sessions in place, which must not rewrite earlier snapshots.
+      const snapshotSessions = async (stepIds: string[]) => {
+        for (const id of stepIds) chatSnapshots[id] = Object.fromEntries([...sessions].map(([sid, s]) => [sid, { ...s }]));
+        await writeFile(join(runDir, CHAT_SESSIONS_FILE), JSON.stringify(chatSnapshots)).catch((err) =>
+          console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
+        );
+      };
+      // The step an intervention gate reviews: the last non-loop step that ran (a gate after a loop
+      // still preselects the session that produced the loop's last result).
+      let lastRan = def.steps.slice(0, fromStepIdx).findLast((s) => s.kind !== "loop");
+
+      let i = fromStepIdx;
+      while (i < def.steps.length) {
+        const step = def.steps[i]!;
         if (signal.aborted) {
           status = "cancelled";
           break;
         }
-        currentStepId = step.id;
-        emit({ type: "step.started", payload: {} }, step.id);
-        const outcome = await runStep(step, def.steps[i - 1]);
-        ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
-        emit({ type: "step.finished", payload: outcome }, step.id);
-        if (outcome.status === "succeeded") {
-          // Written even when empty so every succeeded step replaces any snapshot an older attempt left.
-          // Copies: gate chats mutate sessions in place, which must not rewrite earlier snapshots.
-          chatSnapshots[step.id] = Object.fromEntries([...sessions].map(([id, s]) => [id, { ...s }]));
-          await writeFile(join(runDir, CHAT_SESSIONS_FILE), JSON.stringify(chatSnapshots)).catch((err) =>
-            console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
-          );
+        started(i);
+        const { repeat, ...outcome } = await runStep(step, lastRan);
+        if (step.kind !== "loop") {
+          lastRan = step;
+          ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
         }
+        emit({ type: "step.finished", payload: outcome }, step.id);
+        if (outcome.status === "succeeded") await snapshotSessions([step.id]);
         if (outcome.status !== "succeeded") {
           status = outcome.status;
           error = outcome.error;
           break;
         }
+
+        if (step.kind === "loop") {
+          const start = ranges.get(i)!;
+          if (repeat) {
+            const iteration = (iterations.get(step.id) ?? 1) + 1;
+            const stepIds = def.steps.slice(start, i).map((s) => s.id);
+            emit({ type: "loop.repeat", payload: { toStepId: def.steps[start]!.id, iteration, maxIterations: step.maxIterations, stepIds } }, step.id);
+            iterations.set(step.id, iteration);
+            resetLoopsIn(start, i);
+            i = start;
+          } else {
+            iterations.delete(step.id);
+            i++;
+          }
+          continue;
+        }
+
+        // A `value` stop on this step ends its loop mid-body: the rest of the body is skipped (keeping
+        // the previous pass's values for later templates) and the run continues after the loop step.
+        const stopIdx = enclosingLoops(i).find((end) => {
+          const loop = def.steps[end] as LoopStep;
+          return loop.stop.when === "value" && loop.stop.ref.split(".")[0] === step.id && isTruthyValue(stopValue(loop.stop.ref)) === (loop.stop.is === "truthy");
+        });
+        if (stopIdx === undefined) {
+          i++;
+          continue;
+        }
+        const loop = def.steps[stopIdx] as LoopStep;
+        const stop = loop.stop as Extract<LoopStep["stop"], { when: "value" }>;
+        const skipped = def.steps.slice(i + 1, stopIdx);
+        for (const s of skipped) {
+          const prev = ctx.steps[s.id];
+          emit(
+            {
+              type: "step.finished",
+              payload: { status: "skipped", output: prev?.output ?? "", ...(prev?.structured !== undefined ? { structured: prev.structured } : {}) },
+            },
+            s.id,
+          );
+        }
+        resetLoopsIn(i + 1, stopIdx);
+        started(stopIdx);
+        const k = iterations.get(loop.id) ?? 1;
+        emit(
+          { type: "step.finished", payload: { status: "succeeded", output: `Stopped: ${stop.ref} is ${stop.is} (iteration ${k} of ${loop.maxIterations})` } },
+          loop.id,
+        );
+        await snapshotSessions([...skipped.map((s) => s.id), loop.id]);
+        iterations.delete(loop.id);
+        i = stopIdx + 1;
       }
     } catch (err) {
       status = signal.aborted ? "cancelled" : "failed";

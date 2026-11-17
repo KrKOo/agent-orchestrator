@@ -1,4 +1,4 @@
-import type { InterventionAction, InterventionSession } from "@orch/protocol";
+import type { InterventionAction, InterventionSession, Step } from "@orch/protocol";
 import { useState } from "react";
 import { api, errorMessage } from "../api";
 import type { InterventionView } from "../runState";
@@ -36,6 +36,8 @@ export function InterventionComposer({
   stepId,
   request,
   session,
+  /** Definition of the run, to spell out what a `repeat` answers to (falls back to the step id). */
+  steps,
   awaiting,
   onPick,
   onSubmitted,
@@ -45,6 +47,8 @@ export function InterventionComposer({
   /** Latest request of this step; it carries the session list. */
   request: InterventionView;
   session: InterventionSession | undefined;
+  /** The run's flow definition, only for naming the `repeat` target. */
+  steps: Step[];
   /** The request is open (no reply is streaming and it was not answered from here). */
   awaiting: boolean;
   onPick: (sessionId: string) => void;
@@ -145,10 +149,26 @@ export function InterventionComposer({
             Send
           </button>
         )}
+        {request.repeat && (
+          <button
+            type="button"
+            className="btn"
+            disabled={!enabled}
+            title={`Re-run the flow from "${repeatTarget(steps, request.repeat.toStepId)}" for iteration ${request.repeat.iteration} of ${request.repeat.maxIterations}`}
+            onClick={() => respond("repeat")}
+          >
+            Repeat from {repeatTarget(steps, request.repeat.toStepId)} ({request.repeat.iteration}/{request.repeat.maxIterations})
+          </button>
+        )}
         <button type="button" className="btn primary" disabled={!enabled} onClick={() => respond("continue")}>
           Continue run
         </button>
       </div>
     </div>
   );
+}
+
+/** Name of the step a `repeat` jumps back to, or its id if the definition no longer lists it. */
+function repeatTarget(steps: Step[], toStepId: string): string {
+  return steps.find((s) => s.id === toStepId)?.name ?? toStepId;
 }

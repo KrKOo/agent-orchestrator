@@ -103,6 +103,73 @@ describe("RunnerSession", () => {
     expect(fs[0]).toMatchObject({ runId, stepId: "impl", file: "src/a.ts", line: 3, severity: "warning", endLine: null });
   });
 
+  test("loop.repeat resets only the body rows to pending with cleared output; step.started clears prior output", async () => {
+    const { deps, session } = setup();
+    const def = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "first" },
+        { id: "b", name: "B", kind: "prompt", prompt: "second" },
+        { id: "again", name: "Repeat", kind: "loop", to: "a", maxIterations: 5 },
+        { id: "c", name: "C", kind: "prompt", prompt: "after" },
+      ],
+    });
+    const runId = addRun(deps, { status: "running", runnerId: "r1", definition: def });
+    // Seed the rows a first iteration (plus the post-loop step) would leave behind.
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [
+          ev(runId, 1, "step.finished", { status: "succeeded", output: "A1", structured: { n: 1 } }, "a", 10),
+          ev(runId, 2, "step.finished", { status: "succeeded", output: "B1" }, "b", 20),
+          ev(runId, 3, "step.finished", { status: "succeeded", output: "C" }, "c", 30),
+        ],
+      }),
+    );
+
+    // Iteration 2: the loop step jumps back to `a`; body rows [a, again) reset, the post-loop step keeps its row.
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [
+          ev(runId, 4, "loop.repeat", { toStepId: "a", iteration: 2, maxIterations: 5, stepIds: ["a", "b"] }, "again", 40),
+        ],
+      }),
+    );
+    const rows = () =>
+      Object.fromEntries(deps.db.select().from(schema.runSteps).where(eq(schema.runSteps.runId, runId)).all().map((s) => [s.stepId, s]));
+    let byId = rows();
+    expect(byId.a).toMatchObject({ idx: 0, status: "pending", output: null, structured: null, startedAt: null, finishedAt: null });
+    expect(byId.b).toMatchObject({ idx: 1, status: "pending", output: null, structured: null, startedAt: null, finishedAt: null });
+    expect(byId.c).toMatchObject({ status: "succeeded", output: "C", finishedAt: 30 }); // outside the body: untouched
+
+    // An endpoint without a run_steps row is ignored — nothing changes.
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [ev(runId, 5, "loop.repeat", { toStepId: "ghost", iteration: 3, maxIterations: 5, stepIds: ["a", "b"] }, "again", 50)],
+      }),
+    );
+    byId = rows();
+    expect(byId.b).toMatchObject({ status: "pending", output: null });
+    expect(byId.c).toMatchObject({ status: "succeeded", output: "C" });
+
+    // Re-running a step clears the previous attempt's output (loops re-run steps).
+    await session.handle(
+      JSON.stringify({
+        t: "job.events",
+        runId,
+        events: [
+          ev(runId, 6, "step.finished", { status: "succeeded", output: "A2" }, "a", 60),
+          ev(runId, 7, "step.started", {}, "a", 70),
+        ],
+      }),
+    );
+    expect(rows().a).toMatchObject({ status: "running", startedAt: 70, output: null, structured: null, finishedAt: null });
+  });
+
   test("run.name sets the run's name; a second event never overwrites (first write wins)", async () => {
     const { deps, session } = setup();
     const runId = addRun(deps, { status: "assigned", runnerId: "r1" });

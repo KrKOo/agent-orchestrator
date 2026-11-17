@@ -30,6 +30,12 @@ export function Transcript({ step }: { step: StepView }) {
             const call = step.toolCalls[item.toolCallId];
             return call ? <ToolCallCard key={i} call={call} /> : null;
           }
+          case "iteration":
+            return (
+              <div key={i} className="iteration-divider">
+                <span className="iteration-label">Iteration {item.n}</span>
+              </div>
+            );
           case "plan":
             return (
               <div key={i} className="plan">
