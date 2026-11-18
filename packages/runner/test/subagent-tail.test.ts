@@ -62,16 +62,16 @@ test("tails sibling-stem subagent transcripts with partial lines", async () => {
     },
   });
 
-  // Tool results are truncated; unknown entries ignored; nothing re-emitted.
+  // Tool results are truncated and carry their call id and error flag; unknown entries ignored; nothing re-emitted.
   appendFileSync(
     join(dir, "S", "Scout1.jsonl"),
-    `${JSON.stringify({ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "x".repeat(5000) }] } })}\n${JSON.stringify({ type: "model_change" })}\n`,
+    `${JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: "t1", toolName: "find", isError: false, content: [{ type: "text", text: "x".repeat(5000) }] } })}\n${JSON.stringify({ type: "model_change" })}\n`,
   );
   await tail.poll();
   expect(events).toHaveLength(3);
   expect(events[2]).toEqual({
     type: "subagent.message",
-    payload: { agentId: "Scout1", role: "toolResult", blocks: [{ type: "toolResult", text: "x".repeat(4000) }] },
+    payload: { agentId: "Scout1", role: "toolResult", blocks: [{ type: "toolResult", text: "x".repeat(4000), toolCallId: "t1", isError: false }] },
   });
   await tail.stop();
 });

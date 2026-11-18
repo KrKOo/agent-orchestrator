@@ -28,13 +28,21 @@ function blockText(b: Json): string {
   return JSON.stringify(b);
 }
 
-function mapBlocks(role: Role, content: unknown): SubagentBlock[] {
+function mapBlocks(role: Role, message: Json): SubagentBlock[] {
+  const content = message.content;
   const blocks = typeof content === "string" ? [{ type: "text", text: content }] : Array.isArray(content) ? content : [];
   const out: SubagentBlock[] = [];
+  // The web pairs a result with its call by id; without it, only by order.
+  const pairing = role === "toolResult"
+    ? {
+        ...(typeof message.toolCallId === "string" ? { toolCallId: message.toolCallId } : {}),
+        ...(typeof message.isError === "boolean" ? { isError: message.isError } : {}),
+      }
+    : {};
   for (const b of blocks) {
     if (!isObj(b)) continue;
     if (role === "toolResult") {
-      out.push({ type: "toolResult", text: blockText(b).slice(0, TOOL_RESULT_MAX) });
+      out.push({ type: "toolResult", text: blockText(b).slice(0, TOOL_RESULT_MAX), ...pairing });
     } else if (b.type === "text") {
       out.push({ type: "text", text: str(b.text) });
     } else if (b.type === "thinking") {
@@ -49,6 +57,8 @@ function mapBlocks(role: Role, content: unknown): SubagentBlock[] {
       });
     }
   }
+  // A result without content still answers its call.
+  if (role === "toolResult" && out.length === 0) out.push({ type: "toolResult", text: "", ...pairing });
   return out;
 }
 
@@ -64,7 +74,7 @@ export function mapEntry(agentId: string, e: unknown): SubagentEvent | null {
   if (e.type === "message" && isObj(e.message)) {
     const role = e.message.role;
     if (!isRole(role)) return null;
-    return { type: "subagent.message", payload: { agentId, role, blocks: mapBlocks(role, e.message.content) } };
+    return { type: "subagent.message", payload: { agentId, role, blocks: mapBlocks(role, e.message) } };
   }
   return null;
 }

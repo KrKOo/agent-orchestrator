@@ -42,7 +42,8 @@ export const SubagentBlock = z.discriminatedUnion("type", [
     intent: z.string().optional(),
     arguments: z.unknown(),
   }),
-  z.object({ type: z.literal("toolResult"), text: z.string() }),
+  /** `toolCallId`/`isError`: absent on events stored before they were tailed (pair those with calls by order). */
+  z.object({ type: z.literal("toolResult"), text: z.string(), toolCallId: z.string().optional(), isError: z.boolean().optional() }),
 ]);
 export type SubagentBlock = z.infer<typeof SubagentBlock>;
 
