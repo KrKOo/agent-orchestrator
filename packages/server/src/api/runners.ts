@@ -1,5 +1,5 @@
 import type { Catalog, CatalogItem, CreateRunnerTokenResponse, FsListResult, ModelEntry, RunnerRow } from "@orch/protocol";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { randomBytes } from "node:crypto";
 import { ulid } from "ulid";
@@ -7,11 +7,11 @@ import { z } from "zod";
 import { schema, type Db } from "../db";
 import type { AppDeps } from "../deps";
 import { RpcError } from "../hub";
-import { isOnline } from "../scheduler";
+import { ACTIVE_STATUSES, isOnline } from "../scheduler";
 import { hashToken } from "../ws/runner";
 import { issueMessages, readJson } from "./util";
 
-const { runners } = schema;
+const { runners, runs } = schema;
 
 export const FS_LIST_TIMEOUT_MS = 10_000;
 
@@ -87,6 +87,40 @@ export function runnerRoutes(deps: AppDeps): { runners: Hono; catalog: Hono } {
     if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
     const created = registerRunner(deps.db, { ...parsed.data, ownerUserId: c.get("user")?.id ?? null });
     return c.json(created, 201);
+  });
+
+  /**
+   * Deletes a runner permanently: removing the row revokes its token. Runs it holds are cancelled on the runner and
+   * failed here; queued runs pinned to it fail too, since nothing else can resume them.
+   * Everything up to the row delete runs synchronously (no await) so a scheduler `kick()` cannot interleave and
+   * misreport these runs as `runner_lost`; `terminate` opens its own transaction, so no outer one is used.
+   */
+  app.delete("/:id", (c) => {
+    const id = c.req.param("id");
+    const { db, hub } = deps;
+    if (!db.select({ id: runners.id }).from(runners).where(eq(runners.id, id)).get()) {
+      return c.json({ error: "Runner not found" }, 404);
+    }
+    const held = db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(and(eq(runs.runnerId, id), inArray(runs.status, [...ACTIVE_STATUSES])))
+      .all();
+    for (const run of held) {
+      hub.sendToRunner(id, { t: "job.cancel", runId: run.id });
+      deps.runs.terminate(run.id, "failed", "runner_deleted");
+    }
+    const pinned = db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(and(eq(runs.resumeRunnerId, id), eq(runs.status, "queued")))
+      .all();
+    for (const run of pinned) deps.runs.terminate(run.id, "failed", "resume_runner_deleted");
+    db.delete(runners).where(eq(runners.id, id)).run();
+    // Frames are ordered on the socket, so the runner sees every `job.cancel` before this close.
+    hub.disconnectRunner(id, 4401, "runner deleted");
+    deps.scheduler.kick();
+    return c.body(null, 204);
   });
 
   app.get("/:id/fs", async (c) => {

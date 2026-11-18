@@ -1,16 +1,44 @@
 // Runners: a responsive card grid. Token creation lives in a modal; the token is shown once there.
-import type { CreateRunnerTokenResponse } from "@orch/protocol";
+// Deleting a runner (confirm dialog) revokes its token, disconnects it and fails the runs it holds.
+import type { CreateRunnerTokenResponse, RunnerRow } from "@orch/protocol";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Server } from "lucide-react";
+import { Plus, Server, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { api, errorMessage } from "../api";
-import { Collapsible, CopyButton, EmptyState, Modal, PageHeader, RelativeTime, Skeleton, usePageTitle } from "../ui";
+import { Collapsible, CopyButton, EmptyState, Modal, PageHeader, RelativeTime, Skeleton, useConfirm, usePageTitle } from "../ui";
 import { useToast } from "../components/Toast";
 
 export function Runners() {
   usePageTitle("Runners");
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [confirm, confirmDialog] = useConfirm();
   const [adding, setAdding] = useState(false);
   const runners = useQuery({ queryKey: ["runners"], queryFn: api.listRunners, refetchInterval: 5000 });
+  const del = useMutation({
+    mutationFn: api.deleteRunner,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["runners"] });
+      // FlowEditor's model/skill pickers read the catalog merged from runner capabilities.
+      qc.invalidateQueries({ queryKey: ["catalog"] });
+      toast("Runner deleted", { kind: "success" });
+    },
+    onError: (err) => toast(`Delete failed: ${errorMessage(err)}`, { kind: "error" }),
+  });
+
+  const remove = async (r: RunnerRow) => {
+    const jobs =
+      r.runningJobs > 0
+        ? ` Its ${r.runningJobs} running job${r.runningJobs === 1 ? "" : "s"} will be cancelled and marked failed.`
+        : "";
+    const ok = await confirm({
+      title: `Delete “${r.name}”?`,
+      body: `The runner's token is revoked and it disconnects; to bring the host back, create a new runner.${jobs} Run history is kept.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (ok) del.mutate(r.id);
+  };
 
   return (
     <div className="page">
@@ -25,6 +53,7 @@ export function Runners() {
         }
       />
       {adding && <AddRunnerModal onClose={() => setAdding(false)} />}
+      {confirmDialog}
       {runners.isPending ? (
         <Skeleton rows={3} />
       ) : runners.error && !runners.data ? (
@@ -57,6 +86,16 @@ export function Runners() {
                     <strong>{r.name}</strong>
                     <div className="mono small muted">{r.id}</div>
                   </div>
+                  <button
+                    type="button"
+                    className="btn small danger"
+                    title={`Delete ${r.name}`}
+                    disabled={del.isPending}
+                    onClick={() => void remove(r)}
+                  >
+                    <Trash2 size={13} aria-hidden />
+                    Delete
+                  </button>
                 </div>
                 <div className="runner-facts">
                   <div className="runner-fact">

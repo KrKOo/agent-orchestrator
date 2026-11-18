@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { type Catalog, type FlowRow, type RunDetail, type RunRow, RUNS_PAGE_SIZE, runsCursor } from "@orch/protocol";
-import { FS_LIST_TIMEOUT_MS } from "../src/api/runners";
+import { FS_LIST_TIMEOUT_MS, registerRunner } from "../src/api/runners";
 import { createApp } from "../src/app";
 import { schema } from "../src/db";
 import type { AppDeps } from "../src/deps";
 import { PatCredentials } from "../src/github/credentials";
 import { eventsAfter } from "../src/ws/browser";
-import { addRun, caps, connectRunner, flowDef, testDeps } from "./helpers";
+import { authenticateRunner } from "../src/ws/runner";
+import { addRun, caps, connectRunner, FakeLink, flowDef, testDeps } from "./helpers";
 
 const flowBody = {
   name: "Issue to commit",
@@ -539,6 +540,40 @@ describe("runners API", () => {
         { id: "litellm/glm-5.3", name: "GLM 5.3" },
       ],
     });
+  });
+
+  test("DELETE of an unknown runner is a 404", async () => {
+    expect(await client(testDeps())("DELETE", "/api/runners/nobody")).toEqual({ status: 404, json: { error: "Runner not found" } });
+  });
+
+  test("DELETE revokes the token, cancels and fails held runs, fails pinned retries and closes the link", async () => {
+    const deps = testDeps();
+    const { runnerId, token } = registerRunner(deps.db, { name: "laptop", labels: [], ownerUserId: null });
+    const link = new FakeLink();
+    deps.hub.attachRunner(runnerId, link);
+    deps.hub.setReplayed(link, true);
+    const held = addRun(deps, { status: "running", runnerId });
+    const pinned = addRun(deps, { status: "queued", resumeRunnerId: runnerId });
+    const call = client(deps);
+
+    expect((await call("DELETE", `/api/runners/${runnerId}`)).status).toBe(204);
+
+    expect(link.of("job.cancel")).toEqual([{ t: "job.cancel", runId: held }]);
+    expect(link.closed).toEqual({ code: 4401, reason: "runner deleted" });
+    expect(deps.hub.isConnected(runnerId)).toBe(false);
+    expect(deps.runs.get(held)).toMatchObject({ status: "failed", error: "runner_deleted" });
+    expect(deps.runs.get(pinned)).toMatchObject({ status: "failed", error: "resume_runner_deleted" });
+    expect((await call("GET", "/api/runners")).json).toEqual([]);
+    expect(authenticateRunner(deps, `Bearer ${token}`)).toBeNull();
+  });
+
+  test("DELETE fails a pending fs RPC as offline", async () => {
+    const deps = testDeps();
+    connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const pending = call("GET", "/api/runners/r1/fs?path=/Users/me/Documents");
+    expect((await call("DELETE", "/api/runners/r1")).status).toBe(204);
+    expect(await pending).toEqual({ status: 404, json: { error: "Runner offline" } });
   });
 
   test("unknown API paths are JSON 404s and the SPA hint is served when the UI is not built", async () => {

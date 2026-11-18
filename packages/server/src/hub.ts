@@ -81,6 +81,14 @@ export class Hub {
     }
   }
 
+  /** Drops the runner's current link (failing its pending RPCs) and closes the socket; the later `detachRunner` is a no-op. */
+  disconnectRunner(runnerId: string, code: number, reason: string): void {
+    const link = this.runners.get(runnerId);
+    if (!link) return;
+    this.detachRunner(runnerId, link);
+    link.close(code, reason);
+  }
+
   isConnected(runnerId: string): boolean {
     return this.runners.has(runnerId);
   }

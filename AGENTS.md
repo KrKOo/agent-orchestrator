@@ -43,7 +43,7 @@ flowchart LR
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).
 - **RPC**:
   - runner→server: `github.token`, `github.createPullRequest`, `github.createComment`. Authorization lives in `server/src/ws/runner.ts:handleRunnerRpc`. Comment targets are resolved server-side, never taken from the runner.
-  - server→runner: only `fs.list` (`Hub.rpc`).
+  - server→runner: only `fs.list` (`Hub.rpc`). `DELETE /api/runners/:id` sends `job.cancel` for held runs, deletes the row (revoking the token) and closes the link with 4401 (`Hub.disconnectRunner`).
 - **Runner job** (`runner/src/job.ts:runJob`):
   - Re-validates trust runner-side (`rejectReason`), then loops over steps with a `TemplateContext` (`{{inputs.x}}`, `{{steps.<id>.output}}` via `renderTemplate`).
   - Agent steps run `omp acp` over ACP (`acp-session.ts`). Output and findings come back through the per-run MCP server (`mcp-output.ts`, `/mcp/<runId>`, bearer secret).

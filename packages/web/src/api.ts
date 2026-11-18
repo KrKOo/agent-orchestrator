@@ -108,6 +108,7 @@ export const api = {
   listRunners: () => request<RunnerRow[]>("GET", "/api/runners"),
   createRunnerToken: (name: string, labels: string[]) =>
     request<CreateRunnerTokenResponse>("POST", "/api/runners", { name, labels }),
+  deleteRunner: (id: string) => request<void>("DELETE", `/api/runners/${enc(id)}`),
   listFs: (runnerId: string, path: string) =>
     request<FsListResult>("GET", `/api/runners/${enc(runnerId)}/fs?path=${enc(path)}`),
   catalog: () => request<Catalog>("GET", "/api/catalog"),

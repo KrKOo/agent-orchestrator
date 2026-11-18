@@ -126,6 +126,10 @@ Custom images not built from `orch/sandbox-omp` need `RUN mkdir -m 1777 /home/ag
 
 See `deploy/`: `server.Dockerfile`, `compose.yml` (server + Caddy TLS, `ORCH_DOMAIN`), `orch.server.example.json`, `orch-runner.service`, and `runner*.example.json`. Runners connect outbound over `wss://<domain>/runner/ws`. Create owner-bound tokens with `runner-token create --name <n> --owner <login>` or from the Runners page.
 
+Delete a runner from its card on the Runners page (`DELETE /api/runners/:id`): its token is revoked, a connected runner is
+disconnected, and the runs it holds are cancelled on the runner and marked `failed` (`runner_deleted`; queued retries pinned
+to it fail with `resume_runner_deleted`). Run history is kept. Deletion is permanent: create a new runner to bring the host back.
+
 ## Pull request reviews (M3)
 
 A pull request is a flow input, like a GitHub issue: declare one input of type `github_pull_request` and paste the
