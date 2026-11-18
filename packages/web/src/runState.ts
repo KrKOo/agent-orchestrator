@@ -30,27 +30,29 @@ export type TranscriptItem =
   | { kind: "models"; models: HarnessModels; applied: "live" | "restart" }
   | { kind: "other"; update: { sessionUpdate: string; [k: string]: unknown } };
 
-export interface SubagentMessageView {
-  seq: number;
-  role: "user" | "assistant" | "toolResult";
-  blocks: SubagentBlock[];
+/** A transcript the UI renders the same way for a step's main thread and for each of its subagents. */
+export interface TranscriptSource {
+  items: TranscriptItem[];
+  toolCalls: Record<string, ToolCallView>;
 }
 
-export interface SubagentView {
+export interface SubagentView extends TranscriptSource {
   agentId: string;
   agent: string;
   task: string;
   model: string | null;
-  messages: SubagentMessageView[];
+  /**
+   * `task` tool calls (main thread or another subagent) still running when this agent started: links an agent
+   * whose name matches no call (omp generates names for unnamed tasks) when exactly one was running.
+   */
+  openTaskCalls: string[];
 }
 
-export interface StepView {
+export interface StepView extends TranscriptSource {
   status: StepStatus;
   output?: string;
   structured?: unknown;
   error?: string;
-  items: TranscriptItem[];
-  toolCalls: Record<string, ToolCallView>;
   subagents: SubagentView[];
 }
 
@@ -220,6 +222,201 @@ function applyUpdate(step: StepView, update: { sessionUpdate: string; [k: string
   }
 }
 
+/** omp's subagent tool: its ACP `tool_call` carries `name: "task"`, and a subagent's own call the same name. */
+export function isTaskCall(call: ToolCallView): boolean {
+  return call.name === "task";
+}
+
+function newSubagent(step: StepView, started: Pick<SubagentView, "agentId" | "agent" | "task" | "model">): SubagentView {
+  const openTaskCalls = [step, ...step.subagents].flatMap((src) =>
+    Object.values(src.toolCalls)
+      .filter((c) => isTaskCall(c) && (c.status === undefined || c.status === "pending" || c.status === "in_progress"))
+      .map((c) => c.toolCallId),
+  );
+  return { ...started, items: [], toolCalls: {}, openTaskCalls };
+}
+
+/**
+ * Folds one transcript message into a subagent's view, shaped like the main thread's: text and thinking
+ * blocks become (merged) message items, a tool call a `tool` item whose result arrives by `toolCallId`.
+ * Results stored before the id was tailed answer the oldest unanswered call instead (omp runs a turn's
+ * calls and writes their results in call order).
+ */
+export function applySubagentMessage(agent: SubagentView, msg: { role: "user" | "assistant" | "toolResult"; blocks: SubagentBlock[] }): SubagentView {
+  const items = agent.items.slice();
+  const toolCalls = { ...agent.toolCalls };
+  const pushText = (kind: "assistant" | "thought" | "user", text: string) => {
+    if (!text) return;
+    const last = items[items.length - 1];
+    if (last && last.kind === kind) items[items.length - 1] = { kind, text: `${last.text}\n\n${text}` };
+    else items.push({ kind, text });
+  };
+  // One result message answers one call; its blocks are the parts of that result.
+  const results = new Map<string | undefined, { texts: string[]; isError: boolean }>();
+  for (const b of msg.blocks) {
+    switch (b.type) {
+      case "text":
+        pushText(msg.role === "user" ? "user" : "assistant", b.text);
+        break;
+      case "thinking":
+        pushText("thought", b.text);
+        break;
+      case "toolCall":
+        if (!toolCalls[b.id]) items.push({ kind: "tool", toolCallId: b.id });
+        toolCalls[b.id] = {
+          toolCallId: b.id,
+          title: b.intent ?? b.name,
+          name: b.name,
+          kind: b.name,
+          status: "in_progress",
+          content: [],
+          locations: [],
+          rawInput: b.arguments,
+        };
+        break;
+      case "toolResult": {
+        const r = results.get(b.toolCallId) ?? { texts: [], isError: false };
+        r.texts.push(b.text);
+        r.isError ||= b.isError === true;
+        results.set(b.toolCallId, r);
+        break;
+      }
+    }
+  }
+  // Runners before results carried a call id sent an empty result as no blocks: it still answers a call.
+  if (msg.role === "toolResult" && results.size === 0) results.set(undefined, { texts: [], isError: false });
+  for (const [id, r] of results) {
+    const target =
+      id ??
+      items.find((i): i is { kind: "tool"; toolCallId: string } => i.kind === "tool" && toolCalls[i.toolCallId]?.status === "in_progress")?.toolCallId;
+    const text = r.texts.filter(Boolean).join("\n");
+    const answered = {
+      status: r.isError ? "failed" : "completed",
+      content: text ? [{ type: "content", content: { type: "text", text } }] : [],
+    };
+    const call = target !== undefined ? toolCalls[target] : undefined;
+    if (call) {
+      toolCalls[call.toolCallId] = { ...call, ...answered };
+    } else {
+      // A result whose call we never saw still shows, as a call of its own.
+      const orphan = target ?? `result-${items.length}`;
+      items.push({ kind: "tool", toolCallId: orphan });
+      toolCalls[orphan] = { toolCallId: orphan, title: "Tool result", locations: [], ...answered };
+    }
+  }
+  return { ...agent, items, toolCalls };
+}
+
+export interface SubagentLinks {
+  /** Agents each `task` call spawned, keyed by the call's id (main-thread and subagent calls alike). */
+  byToolCall: Map<string, SubagentView[]>;
+  /** The `task` call that spawned each linked agent, keyed by agentId. */
+  parentCall: Map<string, ToolCallView>;
+  /** Agents no call could be matched to. */
+  unlinked: SubagentView[];
+}
+
+/** Agent names a `task` call asked for (`rawInput.tasks[].name`; omp names the agent's transcript after it). */
+function taskNames(call: ToolCallView): string[] {
+  const tasks = (call.rawInput as { tasks?: unknown } | null | undefined)?.tasks;
+  if (!Array.isArray(tasks)) return [];
+  return tasks.flatMap((t) => {
+    const name = (t as { name?: unknown } | null)?.name;
+    return typeof name === "string" && name ? [name] : [];
+  });
+}
+
+/**
+ * Matches each subagent of a step to the `task` call that spawned it, from the main thread down through
+ * subagents' own `task` calls (nested agents). Calls are visited in transcript order, the main thread
+ * first; each requested name claims the first unclaimed agent (in start order) with that id, exactly,
+ * else case-insensitively (omp only requires names to be unique per call, case-insensitively). An agent
+ * left over is linked to the one `task` call that was running when it started, if there was exactly one
+ * once calls that are ancestors of another running call are set aside: omp keeps a `task` call running
+ * until its agents finish, so an agent spawned by a nested call also sees every call above it running.
+ */
+export function linkSubagents(step: StepView): SubagentLinks {
+  const pool = step.subagents;
+  const byToolCall = new Map<string, SubagentView[]>();
+  const parentCall = new Map<string, ToolCallView>();
+  const taskCalls = new Map<string, ToolCallView>();
+  const queue: (StepView | SubagentView)[] = [step];
+  /** The agent whose transcript holds each `task` call; absent for the main thread's. */
+  const owner = new Map<string, string>();
+  const claim = (agent: SubagentView, call: ToolCallView) => {
+    parentCall.set(agent.agentId, call);
+    byToolCall.set(call.toolCallId, [...(byToolCall.get(call.toolCallId) ?? []), agent]);
+    queue.push(agent);
+  };
+  const free = (a: SubagentView) => !parentCall.has(a.agentId);
+  const drain = () => {
+    for (let src = queue.shift(); src; src = queue.shift()) {
+      for (const item of src.items) {
+        const call = item.kind === "tool" ? src.toolCalls[item.toolCallId] : undefined;
+        if (!call || !isTaskCall(call)) continue;
+        taskCalls.set(call.toolCallId, call);
+        if (src !== step) owner.set(call.toolCallId, (src as SubagentView).agentId);
+        for (const name of taskNames(call)) {
+          const lower = name.toLowerCase();
+          const agent = pool.find((a) => free(a) && a.agentId === name) ?? pool.find((a) => free(a) && a.agentId.toLowerCase() === lower);
+          if (agent) claim(agent, call);
+        }
+      }
+    }
+  };
+  /** Whether `callId` spawned (through any depth of agents) the agent that made call `of`. */
+  const isAncestor = (callId: string, of: string) => {
+    for (let agentId = owner.get(of); agentId !== undefined; ) {
+      const parent = parentCall.get(agentId);
+      if (!parent) return false;
+      if (parent.toolCallId === callId) return true;
+      agentId = owner.get(parent.toolCallId);
+    }
+    return false;
+  };
+  const spawner = (a: SubagentView) => {
+    const open = a.openTaskCalls.filter((c) => !a.openTaskCalls.some((d) => d !== c && isAncestor(c, d)));
+    return open.length === 1 ? taskCalls.get(open[0]!) : undefined;
+  };
+  drain();
+  for (;;) {
+    const agent = pool.find((a) => free(a) && spawner(a));
+    if (!agent) break;
+    claim(agent, spawner(agent)!);
+    drain();
+  }
+  return { byToolCall, parentCall, unlinked: pool.filter(free) };
+}
+
+export type GroupedItem = TranscriptItem | { kind: "toolGroup"; toolCallIds: string[] };
+
+/** Consecutive finished tool calls fold into one row from this many on. */
+export const TOOL_GROUP_MIN = 3;
+
+/**
+ * `items` with each run of at least `TOOL_GROUP_MIN` consecutive completed tool calls folded into one
+ * `toolGroup`. Running and failed calls, and `pinned` ones (calls with subagents), always stay visible.
+ */
+export function groupToolRuns(items: TranscriptItem[], toolCalls: Record<string, ToolCallView>, pinned: ReadonlySet<string>): GroupedItem[] {
+  const out: GroupedItem[] = [];
+  let run: { kind: "tool"; toolCallId: string }[] = [];
+  const flush = () => {
+    if (run.length >= TOOL_GROUP_MIN) out.push({ kind: "toolGroup", toolCallIds: run.map((i) => i.toolCallId) });
+    else out.push(...run);
+    run = [];
+  };
+  for (const item of items) {
+    if (item.kind === "tool" && toolCalls[item.toolCallId]?.status === "completed" && !pinned.has(item.toolCallId)) {
+      run.push(item);
+    } else {
+      flush();
+      out.push(item);
+    }
+  }
+  flush();
+  return out;
+}
+
 function withStep(state: RunViewState, stepId: string | undefined, fn: (s: StepView) => StepView): RunViewState {
   const key = stepId ?? NO_STEP;
   const known = key in state.steps;
@@ -371,30 +568,21 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
       return withStep(s, ev.stepId, (st) => {
         const existing = st.subagents.find((a) => a.agentId === ev.payload.agentId);
         if (existing) {
-          return {
-            ...st,
-            subagents: st.subagents.map((a) => (a === existing ? { ...a, ...ev.payload, messages: a.messages } : a)),
-          };
+          return { ...st, subagents: st.subagents.map((a) => (a === existing ? { ...a, ...ev.payload } : a)) };
         }
-        return { ...st, subagents: [...st.subagents, { ...ev.payload, messages: [] }] };
+        return { ...st, subagents: [...st.subagents, newSubagent(st, ev.payload)] };
       });
     case "subagent.message":
       return withStep(s, ev.stepId, (st) => {
-        const msg: SubagentMessageView = { seq: ev.seq, role: ev.payload.role, blocks: ev.payload.blocks };
         const existing = st.subagents.find((a) => a.agentId === ev.payload.agentId);
         if (!existing) {
-          const placeholder: SubagentView = {
-            agentId: ev.payload.agentId,
-            agent: ev.payload.agentId,
-            task: "",
-            model: null,
-            messages: [msg],
-          };
-          return { ...st, subagents: [...st.subagents, placeholder] };
+          const { agentId } = ev.payload;
+          const placeholder = newSubagent(st, { agentId, agent: agentId, task: "", model: null });
+          return { ...st, subagents: [...st.subagents, applySubagentMessage(placeholder, ev.payload)] };
         }
         return {
           ...st,
-          subagents: st.subagents.map((a) => (a === existing ? { ...a, messages: [...a.messages, msg] } : a)),
+          subagents: st.subagents.map((a) => (a === existing ? applySubagentMessage(a, ev.payload) : a)),
         };
       });
   }

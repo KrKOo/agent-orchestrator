@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RunEvent } from "@orch/protocol";
 import { pendingRequest } from "../src/runRequests";
-import { applyRunEvents, initialRunViewState, modelsSwitchText } from "../src/runState";
+import { applyRunEvents, groupToolRuns, initialRunViewState, linkSubagents, modelsSwitchText, type StepView, type ToolCallView, type TranscriptItem } from "../src/runState";
 
 let seq = 0;
 const ev = (e: Omit<RunEvent, "seq" | "runId" | "ts">): RunEvent =>
@@ -62,7 +62,7 @@ describe("applyRunEvents", () => {
     expect(step.items[3]).toMatchObject({ entries: [{ status: "completed" }] });
     expect(step.toolCalls.t1).toMatchObject({ title: "task", status: "completed" });
     expect(step.subagents).toHaveLength(1);
-    expect(step.subagents[0]!.messages).toHaveLength(1);
+    expect(step.subagents[0]!.items).toEqual([{ kind: "assistant", text: "hi" }]);
     expect(s.permissions[0]!.resolved).toBe(true);
     expect(s.interventions[0]).toMatchObject({ requestId: "i1", stepId: "gate", message: "review it", resolved: true });
     // Replayed events (seq <= lastSeq) are ignored.
@@ -302,5 +302,168 @@ describe("intervention choices", () => {
     ]);
     expect(s.interventions[0]!.choice).toBeUndefined();
     expect(s.interventions[0]!.resolved).toBe(true);
+  });
+});
+
+describe("subagents", () => {
+  const started = (agentId: string) =>
+    ev({ type: "subagent.started", stepId: "a", payload: { agentId, agent: "task", task: `do ${agentId}`, model: null } });
+  type Blocks = Extract<RunEvent, { type: "subagent.message" }>["payload"]["blocks"];
+  const message = (agentId: string, role: "user" | "assistant" | "toolResult", blocks: Blocks) =>
+    ev({ type: "subagent.message", stepId: "a", payload: { agentId, role, blocks } });
+  /** A main-thread `task` call; `undefined` stands for an unnamed task. */
+  const taskCall = (toolCallId: string, names: (string | undefined)[]) =>
+    ev({
+      type: "acp.update",
+      stepId: "a",
+      payload: {
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          name: "task",
+          title: "task",
+          status: "in_progress",
+          rawInput: { tasks: names.map((name) => (name === undefined ? { task: "t" } : { name, task: "t" })) },
+        },
+      },
+    });
+  const finished = (toolCallId: string) =>
+    ev({ type: "acp.update", stepId: "a", payload: { update: { sessionUpdate: "tool_call_update", toolCallId, status: "completed" } } });
+  const stepOf = (events: RunEvent[]): StepView => applyRunEvents(initialRunViewState, events).steps.a!;
+  const linked = (step: StepView) => {
+    const links = linkSubagents(step);
+    return {
+      byToolCall: Object.fromEntries([...links.byToolCall].map(([id, agents]) => [id, agents.map((a) => a.agentId)])),
+      unlinked: links.unlinked.map((a) => a.agentId),
+    };
+  };
+
+  test("pairs results with calls by toolCallId, isError fails the call, consecutive text merges", () => {
+    seq = 0;
+    const step = stepOf([
+      started("S1"),
+      message("S1", "user", [{ type: "text", text: "Find it" }]),
+      message("S1", "assistant", [
+        { type: "thinking", text: "plan" },
+        { type: "text", text: "a" },
+        { type: "text", text: "b" },
+        { type: "toolCall", id: "c1", name: "read", intent: "Reading x", arguments: { path: "x" } },
+        { type: "toolCall", id: "c2", name: "grep", arguments: { pattern: "y" } },
+      ]),
+      message("S1", "toolResult", [{ type: "toolResult", text: "no such file", toolCallId: "c2", isError: true }]),
+      message("S1", "toolResult", [
+        { type: "toolResult", text: "p1", toolCallId: "c1", isError: false },
+        { type: "toolResult", text: "p2", toolCallId: "c1", isError: false },
+      ]),
+    ]);
+    const agent = step.subagents[0]!;
+    expect(agent.items).toEqual([
+      { kind: "user", text: "Find it" },
+      { kind: "thought", text: "plan" },
+      { kind: "assistant", text: "a\n\nb" },
+      { kind: "tool", toolCallId: "c1" },
+      { kind: "tool", toolCallId: "c2" },
+    ]);
+    expect(agent.toolCalls.c1).toMatchObject({
+      title: "Reading x",
+      name: "read",
+      status: "completed",
+      rawInput: { path: "x" },
+      content: [{ type: "content", content: { type: "text", text: "p1\np2" } }],
+    });
+    expect(agent.toolCalls.c2).toMatchObject({ title: "grep", status: "failed" });
+  });
+
+  test("results stored without a call id answer the oldest unanswered call", () => {
+    seq = 0;
+    const step = stepOf([
+      started("S1"),
+      message("S1", "assistant", [
+        { type: "toolCall", id: "c1", name: "read", arguments: {} },
+        { type: "toolCall", id: "c2", name: "read", arguments: {} },
+        { type: "toolCall", id: "c3", name: "read", arguments: {} },
+      ]),
+      message("S1", "toolResult", [{ type: "toolResult", text: "r1" }]),
+      // An empty result, stored as no blocks before the tail sent a placeholder.
+      message("S1", "toolResult", []),
+      message("S1", "toolResult", [{ type: "toolResult", text: "r3" }]),
+    ]);
+    const calls = step.subagents[0]!.toolCalls;
+    expect(calls.c1).toMatchObject({ status: "completed", content: [{ content: { text: "r1" } }] });
+    expect(calls.c2).toMatchObject({ status: "completed", content: [] });
+    expect(calls.c3).toMatchObject({ status: "completed", content: [{ content: { text: "r3" } }] });
+  });
+
+  test("links agents to task calls by name, exactly before case-insensitively, across calls", () => {
+    seq = 0;
+    const step = stepOf([
+      taskCall("t1", ["Alpha", "Beta"]),
+      started("Alpha"),
+      started("Beta"),
+      finished("t1"),
+      taskCall("t2", ["gamma"]),
+      started("Gamma"),
+    ]);
+    expect(linked(step)).toEqual({ byToolCall: { t1: ["Alpha", "Beta"], t2: ["Gamma"] }, unlinked: [] });
+  });
+
+  test("a name asked for again in a later call goes to the first agent no earlier call claimed", () => {
+    seq = 0;
+    const step = stepOf([taskCall("t1", ["Scout"]), started("Scout"), finished("t1"), taskCall("t2", ["Scout"]), started("scout")]);
+    expect(linked(step)).toEqual({ byToolCall: { t1: ["Scout"], t2: ["scout"] }, unlinked: [] });
+  });
+
+  test("an unnamed task links through the one running call; otherwise the agent is unlinked", () => {
+    seq = 0;
+    expect(linked(stepOf([taskCall("t1", [undefined]), started("Gen-1")]))).toEqual({ byToolCall: { t1: ["Gen-1"] }, unlinked: [] });
+    seq = 0;
+    expect(linked(stepOf([taskCall("t1", [undefined]), taskCall("t2", [undefined]), started("Gen-1")]))).toEqual({
+      byToolCall: {},
+      unlinked: ["Gen-1"],
+    });
+    seq = 0;
+    expect(linked(stepOf([started("Stray")]))).toEqual({ byToolCall: {}, unlinked: ["Stray"] });
+  });
+
+  test("nested agents link through their parent agent's own task calls, unnamed ones despite the outer call running", () => {
+    seq = 0;
+    const step = stepOf([
+      taskCall("t1", ["Outer"]),
+      started("Outer"),
+      message("Outer", "assistant", [{ type: "toolCall", id: "n1", name: "task", arguments: { tasks: [{ name: "Inner", task: "t" }] } }]),
+      started("Inner"),
+      message("Outer", "toolResult", [{ type: "toolResult", text: "", toolCallId: "n1" }]),
+      // t1 stays running while Outer runs: Gen-2 starts with both t1 and n2 open.
+      message("Outer", "assistant", [{ type: "toolCall", id: "n2", name: "task", arguments: { tasks: [{ task: "t" }] } }]),
+      started("Gen-2"),
+    ]);
+    expect(step.subagents.find((a) => a.agentId === "Gen-2")!.openTaskCalls).toEqual(["t1", "n2"]);
+    expect(linked(step)).toEqual({ byToolCall: { t1: ["Outer"], n1: ["Inner"], n2: ["Gen-2"] }, unlinked: [] });
+    expect(linkSubagents(step).parentCall.get("Inner")?.toolCallId).toBe("n1");
+  });
+});
+
+describe("groupToolRuns", () => {
+  const call = (toolCallId: string, status: string): ToolCallView => ({ toolCallId, title: toolCallId, name: "read", status, content: [], locations: [] });
+  const statuses: Record<string, string> = {
+    a: "completed", b: "completed", c: "completed", d: "completed", e: "completed", f: "failed",
+    g: "completed", h: "completed", i: "completed", j: "completed", k: "completed", l: "completed", m: "in_progress",
+  };
+  const toolCalls = Object.fromEntries(Object.entries(statuses).map(([id, s]) => [id, call(id, s)]));
+  const tool = (toolCallId: string): TranscriptItem => ({ kind: "tool", toolCallId });
+
+  test("folds runs of 3+ completed calls; running, failed and pinned calls split runs and stay", () => {
+    const items: TranscriptItem[] = [
+      tool("a"), tool("b"), { kind: "assistant", text: "x" },
+      tool("c"), tool("d"), tool("e"), tool("f"),
+      tool("g"), tool("h"), tool("i"),
+      tool("j"), tool("k"), tool("l"), tool("m"),
+    ];
+    expect(groupToolRuns(items, toolCalls, new Set(["i"]))).toEqual([
+      tool("a"), tool("b"), { kind: "assistant", text: "x" },
+      { kind: "toolGroup", toolCallIds: ["c", "d", "e"] }, tool("f"),
+      tool("g"), tool("h"), tool("i"),
+      { kind: "toolGroup", toolCallIds: ["j", "k", "l"] }, tool("m"),
+    ]);
   });
 });

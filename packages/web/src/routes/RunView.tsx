@@ -10,9 +10,10 @@ import { KindIcon, StatusIcon } from "../components/icons";
 import { HarnessModelPickers } from "../components/ModelPickers";
 import { PermissionPanel } from "../components/PermissionPanel";
 import { KIND_LABEL } from "../components/StepPanel";
+import { SubagentTranscript } from "../components/Subagents";
 import { StepResult, Transcript } from "../components/Transcript";
 import { useToast } from "../components/Toast";
-import { applyRunEvents, initialRunViewState, type LogLine, type StepView } from "../runState";
+import { applyRunEvents, initialRunViewState, type LogLine, type StepView, type SubagentView } from "../runState";
 import { pendingRequest } from "../runRequests";
 import {
   Collapsible,
@@ -58,6 +59,8 @@ function RunViewInner({ runId }: { runId: string }) {
     refetchInterval: terminal ? false : 5000,
   });
   const [selected, setSelected] = useState<string | null>(null);
+  /** Subagent transcript shown in place of the step's: its agentId path, outermost first, in step `stepId`. */
+  const [agentNav, setAgentNav] = useState<{ stepId: string | null; path: string[] }>({ stepId: null, path: [] });
   const [submitted, setSubmitted] = useState<ReadonlySet<string>>(new Set());
   /** Session picked in an intervention step's chat (per step, so another gate starts from its own preselection). */
   const [pickedSession, setPickedSession] = useState<{ stepId: string; id: string } | null>(null);
@@ -123,22 +126,71 @@ function RunViewInner({ runId }: { runId: string }) {
     setSelected(stepId);
     setStepsOpen(false);
   };
+  // Another step is selected (by the user or by following the run): back to its own transcript.
+  if (agentNav.path.length > 0 && agentNav.stepId !== selectedId) setAgentNav({ stepId: selectedId, path: [] });
+  /** The open agent path, resolved; it stops at an id this step has no agent for. */
+  const agentPath: SubagentView[] = [];
+  for (const id of agentNav.stepId === selectedId ? agentNav.path : []) {
+    const agent = step.subagents.find((a) => a.agentId === id);
+    if (!agent) break;
+    agentPath.push(agent);
+  }
+  const focused = agentPath[agentPath.length - 1];
+  /** Identifies the transcript on screen: the step's own, or one of its agents'. */
+  const viewKey = [selectedId ?? "", ...agentPath.map((a) => a.agentId)].join("\u0000");
+  const shownCount = focused ? focused.items.length : step.items.length + step.subagents.length;
+  /** Where each transcript left was scrolled to, restored when the user comes back to it. */
+  const savedScroll = useRef(new Map<string, { top: number; atBottom: boolean }>());
+  const showAgents = (path: string[]) => {
+    const el = scrollRef.current;
+    if (el) savedScroll.current.set(viewKey, { top: el.scrollTop, atBottom: atBottom.current });
+    setAgentNav({ stepId: selectedId, path });
+  };
+  const openAgent = (agentId: string) => showAgents([...agentPath.map((a) => a.agentId), agentId]);
+  /** Depth 0: the step's transcript; n: the n-th agent of the open path. */
+  const navigateAgents = (depth: number) => showAgents(agentPath.slice(0, depth).map((a) => a.agentId));
 
+  // Esc goes back one agent level, unless something on top (dialog, popover, a field being edited) takes it.
+  // Popovers stop the event at the document (`useDismiss`), so it never reaches this window listener.
+  const agentDepth = agentPath.length;
+  useEffect(() => {
+    if (agentDepth === 0 || tab !== "transcript") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      if (e.target instanceof Element && e.target.closest(".modal, input, textarea, select, [contenteditable]")) return;
+      navigateAgents(agentDepth - 1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [agentDepth, viewKey, tab]);
+
+  const shownView = useRef({ stepId: selectedId, key: viewKey });
   useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-  }, [step, selectedId]);
+    const prev = shownView.current;
+    shownView.current = { stepId: selectedId, key: viewKey };
+    if (!el) return;
+    if (prev.key !== viewKey && prev.stepId === selectedId) {
+      // Opened an agent or went back: where this transcript was left (its end if the user was following it),
+      // else its top. Following resumes when that is the bottom.
+      const saved = savedScroll.current.get(viewKey);
+      savedScroll.current.delete(viewKey);
+      el.scrollTop = !saved ? 0 : saved.atBottom ? el.scrollHeight : saved.top;
+      atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      return;
+    }
+    if (atBottom.current) el.scrollTop = el.scrollHeight;
+  }, [step, viewKey]);
 
-  // Count items arriving in the selected step while the user has scrolled away from the bottom; "Jump to
-  // latest" consumes it. Keyed on the step: another step's longer transcript isn't new arrivals.
-  const prevItems = useRef({ stepId: selectedId, count: step.items.length + step.subagents.length });
+  // Count items arriving in the shown transcript while the user has scrolled away from the bottom; "Jump to
+  // latest" consumes it. Keyed on the view: another transcript's longer history isn't new arrivals.
+  const prevItems = useRef({ key: viewKey, count: shownCount });
   useEffect(() => {
-    const count = step.items.length + step.subagents.length;
     const prev = prevItems.current;
-    prevItems.current = { stepId: selectedId, count };
-    if (prev.stepId !== selectedId || count < prev.count) setMissedCount(0); // step switched, or a retry rewound
-    else if (count > prev.count && !atBottom.current) setMissedCount((m) => m + count - prev.count);
-  }, [step, selectedId]);
+    prevItems.current = { key: viewKey, count: shownCount };
+    if (prev.key !== viewKey || shownCount < prev.count) setMissedCount(0); // view switched, or a retry rewound
+    else if (shownCount > prev.count && !atBottom.current) setMissedCount((m) => m + shownCount - prev.count);
+  }, [shownCount, viewKey]);
   /** First unanswered request (permission > elicitation > intervention), regardless of selection. */
   const pending = pendingRequest(state, submitted);
   /** The docked panel carries its step's name whenever it does not belong to the selected step. */
@@ -514,51 +566,63 @@ function RunViewInner({ runId }: { runId: string }) {
                 atBottom.current = near;
               }}
             >
-              {selectedDef && (
-                <div className="step-header">
-                  <KindIcon kind={selectedDef.kind} size={18} label={KIND_LABEL[selectedDef.kind]} />
-                  <h3>{selectedDef.name}</h3>
-                  <span className="step-id">{selectedDef.id}</span>
-                  <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
-                  <span className="grow" />
-                  {(() => {
-                    // The loop step shows its own counter; body steps their enclosing loop's.
-                    const idx = steps.indexOf(selectedDef);
-                    const loop = selectedDef.kind === "loop" ? state.loops[selectedDef.id] : idx >= 0 ? loopOfStep(idx) : undefined;
-                    return loop ? (
-                      <span className="tag loop-iter" title="Current pass of the enclosing loop">
-                        {loop.iteration}/{loop.maxIterations}
-                      </span>
-                    ) : null;
-                  })()}
-                  {selectedRow?.startedAt && <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>}
-                  <StatusIcon status={state.steps[selectedDef.id]?.status ?? selectedRow?.status ?? "pending"} size={14} />
-                </div>
-              )}
-              {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && !gateRequest && (
-                <p className="muted">
-                  {step.status === "pending" ? "Step has not started." : step.status === "skipped" ? "Skipped: the run bypassed this step." : "Waiting for output…"}
-                </p>
-              )}
-              {gateStart?.message && <p className="intervention-note pre-wrap">{gateStart.message}</p>}
-              {startSession && <InterventionStart session={startSession} />}
-              <Transcript step={step} />
-              {selectedDef && (
-                <StepResult
+              {focused ? (
+                <SubagentTranscript
                   step={step}
-                  // Condition steps, like loops, produce no template value for later steps.
-                  stepId={selectedDef.kind === "loop" || selectedDef.kind === "condition" ? undefined : selectedDef.id}
-                  markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"}
-                  mono={selectedDef.kind === "shell"}
-                  // The latest request holds the pick (chat turns and earlier loop passes resolve earlier ones); only
-                  // a finished attempt shows it, so a gate reset by a loop repeat or retry shows no stale pick.
-                  gate={selectedDef.kind === "intervention" && step.status === "succeeded" ? state.interventions.findLast((i) => i.stepId === selectedDef.id) : undefined}
+                  stepName={selectedDef?.name ?? selectedId ?? "Step"}
+                  path={agentPath}
+                  onNavigate={navigateAgents}
+                  onOpenAgent={openAgent}
                 />
-              )}
-              {runLevel && runLevel.items.length > 0 && (
-                <Collapsible summary="Run-level updates" className="diagnostics">
-                  <Transcript step={runLevel} />
-                </Collapsible>
+              ) : (
+                <>
+                  {selectedDef && (
+                    <div className="step-header">
+                      <KindIcon kind={selectedDef.kind} size={18} label={KIND_LABEL[selectedDef.kind]} />
+                      <h3>{selectedDef.name}</h3>
+                      <span className="step-id">{selectedDef.id}</span>
+                      <span className="muted small">{KIND_LABEL[selectedDef.kind]}</span>
+                      <span className="grow" />
+                      {(() => {
+                        // The loop step shows its own counter; body steps their enclosing loop's.
+                        const idx = steps.indexOf(selectedDef);
+                        const loop = selectedDef.kind === "loop" ? state.loops[selectedDef.id] : idx >= 0 ? loopOfStep(idx) : undefined;
+                        return loop ? (
+                          <span className="tag loop-iter" title="Current pass of the enclosing loop">
+                            {loop.iteration}/{loop.maxIterations}
+                          </span>
+                        ) : null;
+                      })()}
+                      {selectedRow?.startedAt && <span className="muted small">{formatDuration(selectedRow.startedAt, selectedRow.finishedAt)}</span>}
+                      <StatusIcon status={state.steps[selectedDef.id]?.status ?? selectedRow?.status ?? "pending"} size={14} />
+                    </div>
+                  )}
+                  {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && !gateRequest && (
+                    <p className="muted">
+                      {step.status === "pending" ? "Step has not started." : step.status === "skipped" ? "Skipped: the run bypassed this step." : "Waiting for output…"}
+                    </p>
+                  )}
+                  {gateStart?.message && <p className="intervention-note pre-wrap">{gateStart.message}</p>}
+                  {startSession && <InterventionStart session={startSession} />}
+                  <Transcript step={step} onOpenAgent={openAgent} />
+                  {selectedDef && (
+                    <StepResult
+                      step={step}
+                      // Condition steps, like loops, produce no template value for later steps.
+                      stepId={selectedDef.kind === "loop" || selectedDef.kind === "condition" ? undefined : selectedDef.id}
+                      markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"}
+                      mono={selectedDef.kind === "shell"}
+                      // The latest request holds the pick (chat turns and earlier loop passes resolve earlier ones); only
+                      // a finished attempt shows it, so a gate reset by a loop repeat or retry shows no stale pick.
+                      gate={selectedDef.kind === "intervention" && step.status === "succeeded" ? state.interventions.findLast((i) => i.stepId === selectedDef.id) : undefined}
+                    />
+                  )}
+                  {runLevel && runLevel.items.length > 0 && (
+                    <Collapsible summary="Run-level updates" className="diagnostics">
+                      <Transcript step={runLevel} />
+                    </Collapsible>
+                  )}
+                </>
               )}
               {missedCount > 0 && (
                 <div className="jump-latest-wrap">
