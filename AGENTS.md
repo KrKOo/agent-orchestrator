@@ -48,8 +48,8 @@ flowchart LR
   - Re-validates trust runner-side (`rejectReason`), then loops over steps with a `TemplateContext` (`{{inputs.x}}`, `{{steps.<id>.output}}` via `renderTemplate`).
   - Agent steps run `omp acp` over ACP (`acp-session.ts`). Output and findings come back through the per-run MCP server (`mcp-output.ts`, `/mcp/<runId>`, bearer secret).
 - **Sandbox** (`runner/src/sandbox/docker.ts`), per run:
-  - Containers/networks: `--internal` network `orch-net-<runId>`, squid `orch-egress-<runId>` (`renderSquidConf` in `sandbox/egress.ts`), run container `orch-run-<runId>`.
-  - Hardening: `--cap-drop ALL`, no-new-privileges, tmpfs HOME, host uid.
+  - Containers/networks/volumes: `--internal` network `orch-net-<runId>`, squid `orch-egress-<runId>` (`renderSquidConf` in `sandbox/egress.ts`), run container `orch-run-<runId>`, home volume `orch-home-<runId>` (removed in `destroy()` and by `main.ts:reapDocker`).
+  - Hardening: `--cap-drop ALL`, no-new-privileges, host uid, no root inside; `$HOME` is the per-run volume (not tmpfs, which counts against `--memory`), `/tmp` tmpfs.
   - Secrets: passed via `-e NAME` (docker env), never in argv. The gateway bearer is the only secret inside the sandbox; GitHub credentials stay on the server.
 - **Retry**: reuses the same run id with a `resumeFrom` cursor. `resumeRunnerId` pins `local_path` runs to the runner that holds the worktree. ACP sessions do not resume; agent steps restart fresh.
 
@@ -62,7 +62,7 @@ flowchart LR
 | `packages/server/drizzle/` | Generated SQL migrations `0000_init.sql`…; applied automatically at startup |
 | `packages/runner/src` | `connection.ts` (WS + backoff + RPC), `outbox.ts` (durable seq'd events), `job.ts`, `acp-session.ts`, `harness/omp.ts`, `sandbox/`, `gateway.ts` (supervises `omp auth-broker`/`auth-gateway`), `mcp-output.ts`, `workspace.ts`, `git.ts`, `fs-rpc.ts`, `library.ts` (skills/commands scan) |
 | `packages/web/src` | `main.tsx` (router + QueryClient), `routes/` (Flows, FlowEditor, Runs, RunView, Runners), `components/`, `api.ts`, `ws.ts`, `runState.ts` |
-| `docker/sandbox-omp`, `docker/egress` | Sandbox image (debian + sha256-pinned `omp`) and squid egress image |
+| `docker/sandbox-omp`, `docker/egress` | Sandbox image (debian trixie, build tools, sha256-pinned `omp`/`mise`/`rustup`; runtimes pinned in `mise.toml`; `sandbox-guide.md` → `~/.omp/agent/AGENTS.md`) and squid egress image |
 | `deploy/` | `server.Dockerfile`, `compose.yml` + `Caddyfile`, `orch-runner.service` (systemd), `*.example.json` configs |
 | `scripts/build-images.ts` | Builds `orch/sandbox-omp:latest` and `orch/egress:latest` |
 

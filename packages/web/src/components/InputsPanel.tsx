@@ -6,6 +6,7 @@ import {
   type LocalPathWorkspace,
   type ModelEntry,
   MODEL_ROLE_LABELS,
+  NETWORK_PRESETS,
   PR_EVENTS,
   type PrEvent,
   pullRequestInputOf,
@@ -338,10 +339,28 @@ export function InputsPanel({
           </select>
         </label>
         {net.mode === "allowlist" && (
-          <label className="field">
-            <span>Allowed domains (one per line; leading “.” includes subdomains)</span>
-            <ListField multiline value={net.allow} onChange={(allow) => setNetwork({ allow })} />
-          </label>
+          <>
+            <label className="field">
+              <span>Allowed domains (one per line; leading “.” includes subdomains)</span>
+              <ListField multiline value={net.allow} onChange={(allow) => setNetwork({ allow })} />
+            </label>
+            <div className="field">
+              <span>Add registry domains{prInput ? " — PR build scripts get the same access" : ""}</span>
+              <div className="row gap">
+                {Object.entries(NETWORK_PRESETS).map(([key, preset]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className="btn small"
+                    title={preset.domains.join(", ")}
+                    onClick={() => setNetwork({ allow: [...new Set([...net.allow, ...preset.domains])] })}
+                  >
+                    + {preset.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </>
         )}
       </section>
 

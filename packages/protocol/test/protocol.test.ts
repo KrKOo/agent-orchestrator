@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DOMAIN_RE,
   type FlowDefinition,
   isActionStep,
   isAgentStep,
@@ -7,6 +8,7 @@ import {
   conditionHolds,
   isTruthyValue,
   loopRanges,
+  NETWORK_PRESETS,
   renderShellCommand,
   renderTemplate,
   RunEvent,
@@ -1045,5 +1047,14 @@ describe("RunEvent", () => {
     expect(RunEvent.safeParse({ ...base, type: "step.finished", payload: { status: "skipped" } }).success).toBe(true);
     expect(RunEvent.safeParse({ ...base, type: "step.started", payload: { iteration: 2 } }).success).toBe(true);
     expect(RunEvent.safeParse({ ...base, type: "step.started", payload: { iteration: 1 } }).success).toBe(false);
+  });
+});
+
+describe("NETWORK_PRESETS", () => {
+  // A preset entry the allowlist rejects would fail flow validation on save, and renderSquidConf at sandbox creation.
+  test("every preset domain is a valid allowlist entry", () => {
+    for (const [key, preset] of Object.entries(NETWORK_PRESETS)) {
+      for (const domain of preset.domains) expect({ key, domain, valid: DOMAIN_RE.test(domain) }).toEqual({ key, domain, valid: true });
+    }
   });
 });

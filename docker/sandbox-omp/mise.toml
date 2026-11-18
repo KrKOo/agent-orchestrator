@@ -1,0 +1,20 @@
+# System mise config (/etc/mise/config.toml): the preinstalled tools, installed with `mise install --system` into
+# /usr/local/share/mise/installs (read-only, usable by every uid). Exact versions, so the shims resolve them offline
+# and every bump is a reviewed image change. Rust is installed with rustup in the Dockerfile instead.
+# Tools the agent adds at runtime (`mise use -g …`) go to its own ~/.config/mise and ~/.local/share/mise.
+
+[settings]
+# Otherwise mise points GOBIN into the read-only Go install; `go install` must land in $GOPATH/bin.
+go_set_gobin = false
+
+[tools]
+node = "26.13.1"
+# Node 25+ no longer bundles corepack; its pnpm/yarn shims fetch the project's pinned package manager.
+"npm:corepack" = "0.36.0"
+bun = "1.4.4"
+python = "3.14.10"
+uv = "0.13.8"
+go = "1.27.4"
+yq = "4.54.3"
+shellcheck = "0.11.0"
+cargo-binstall = "1.27.0"

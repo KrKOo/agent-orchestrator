@@ -23,7 +23,7 @@ async function run(argv: string[]): Promise<{ code: number; stdout: string; stde
   return { code, stdout, stderr };
 }
 
-/** Removes containers and networks left behind by a previous runner process. */
+/** Removes containers, networks and home volumes left behind by a previous runner process. */
 async function reapDocker(runnerId: string): Promise<void> {
   const label = `label=orch.runner=${runnerId}`;
   try {
@@ -42,6 +42,13 @@ async function reapDocker(runnerId: string): Promise<void> {
     if (netIds.length) {
       console.log(`[main] removing ${netIds.length} leftover network(s)`);
       await run(["docker", "network", "rm", ...netIds]);
+    }
+    // Volumes last: they cannot be removed while a container still uses them.
+    const volumes = await run(["docker", "volume", "ls", "-q", "--filter", label]);
+    const volNames = volumes.stdout.split("\n").filter(Boolean);
+    if (volNames.length) {
+      console.log(`[main] removing ${volNames.length} leftover volume(s)`);
+      await run(["docker", "volume", "rm", ...volNames]);
     }
   } catch (err) {
     console.warn(`[main] docker unavailable, skipping cleanup: ${(err as Error).message}`);

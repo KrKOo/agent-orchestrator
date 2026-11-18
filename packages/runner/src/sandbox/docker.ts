@@ -52,13 +52,22 @@ export class DockerSandboxProvider implements SandboxProvider {
 
   async create(spec: CreateSandbox): Promise<Sandbox> {
     const { runId } = spec;
-    const names = { net: `orch-net-${runId}`, egress: `orch-egress-${runId}`, run: `orch-run-${runId}` };
+    // `home` is a per-run named volume rather than tmpfs: tmpfs pages count against `--memory`, so toolchains the
+    // agent installs into $HOME would eat the run's RAM. It lives exactly as long as the sandbox (`destroy()`, and
+    // the startup reaper finds leftovers by label).
+    const names = {
+      net: `orch-net-${runId}`,
+      egress: `orch-egress-${runId}`,
+      run: `orch-run-${runId}`,
+      home: `orch-home-${runId}`,
+    };
     const labels = ["--label", `orch.runner=${this.config.runnerId}`, "--label", `orch.run=${runId}`];
     const runDir = join(this.config.dataDir, "runs", runId);
     const configDir = join(runDir, "config");
     const sandbox = new DockerSandbox(names);
     try {
       await dockerOk(["network", "create", "--internal", ...labels, names.net]);
+      await dockerOk(["volume", "create", ...labels, names.home]);
 
       // Egress proxy: default bridge for the way out, plus the run's internal network.
       await mkdir(runDir, { recursive: true });
@@ -113,7 +122,8 @@ export class DockerSandboxProvider implements SandboxProvider {
           ...(this.config.dockerRuntime ? ["--runtime", this.config.dockerRuntime] : []),
           "--user", `${uid}:${gid}`,
           "-e", "HOME=/home/agent",
-          "--tmpfs", "/home/agent:rw,exec,size=2g,mode=1777",
+          // A fresh named volume copies the image's /home/agent (mode 1777), so any host uid can write to it.
+          "--mount", `type=volume,source=${names.home},target=/home/agent`,
           "--tmpfs", "/tmp:rw,exec,size=2g,mode=1777",
           "--mount", `type=bind,source=${configDir},target=/orch/config,readonly`,
           ...mountArgs,
@@ -129,10 +139,22 @@ export class DockerSandboxProvider implements SandboxProvider {
         if (/FATAL|Bungled/.test(logs.stderr)) throw new Error(`Egress proxy failed: ${logs.stderr.trim().slice(-500)}`);
         return logs.stderr.includes("Accepting HTTP Socket connections");
       });
-      // The image entrypoint prepares $HOME, then execs the CMD; wait until PID 1 is `sleep`.
+      // The image entrypoint prepares $HOME, then execs the CMD; wait until PID 1 is `sleep`. A container that
+      // exits instead fails the run right away, with the entrypoint's output.
       await waitFor(`sandbox ${names.run}`, async () => {
         const res = await docker(["exec", names.run, "cat", "/proc/1/cmdline"]);
-        return res.code === 0 && res.stdout.startsWith("sleep\0");
+        if (res.code === 0) return res.stdout.startsWith("sleep\0");
+        const state = await docker(["inspect", "-f", "{{.State.Status}} {{.State.ExitCode}}", names.run]);
+        const [status, exitCode] = state.stdout.trim().split(" ");
+        if (status !== "exited" && status !== "dead") return false;
+        const logs = await docker(["logs", "--tail", "20", names.run]);
+        const output = `${logs.stdout}${logs.stderr}`.trim();
+        // The home volume copies the image's /home/agent; without one it is root-owned and the host uid can't write.
+        throw new Error(
+          `Sandbox exited with code ${exitCode} before it was ready${output ? `: ${output.slice(-1000)}` : ""}. ` +
+            "If $HOME was not writable: the image needs a /home/agent writable by any uid; rebuild " +
+            "orch/sandbox-omp (`bun run images`) or build custom images FROM it.",
+        );
       });
       return sandbox;
     } catch (err) {
@@ -145,7 +167,7 @@ export class DockerSandboxProvider implements SandboxProvider {
 class DockerSandbox implements Sandbox {
   private destroyed: Promise<void> | null = null;
 
-  constructor(private readonly names: { net: string; egress: string; run: string }) {}
+  constructor(private readonly names: { net: string; egress: string; run: string; home: string }) {}
 
   exec(argv: string[], cwd: string): SandboxProcess {
     const proc = Bun.spawn(["docker", "exec", "-i", "-w", cwd, this.names.run, ...argv], {
@@ -171,6 +193,11 @@ class DockerSandbox implements Sandbox {
       const net = await docker(["network", "rm", this.names.net]);
       if (net.code !== 0 && !/No such network|not found/i.test(net.stderr)) {
         console.error(`[sandbox] docker network rm failed: ${net.stderr.trim()}`);
+      }
+      // After `rm -f`: a volume still attached to a container cannot be removed.
+      const vol = await docker(["volume", "rm", this.names.home]);
+      if (vol.code !== 0 && !/no such volume/i.test(vol.stderr)) {
+        console.error(`[sandbox] docker volume rm failed: ${vol.stderr.trim()}`);
       }
     })();
     return this.destroyed;

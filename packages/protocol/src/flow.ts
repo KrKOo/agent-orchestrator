@@ -46,6 +46,29 @@ export const NetworkPolicy = z.object({
 });
 export type NetworkPolicy = z.infer<typeof NetworkPolicy>;
 
+/** mise fetches Python, Bun and its `aqua:`/`github:` tools from GitHub releases, so its preset includes these. */
+const GITHUB_RELEASE_DOMAINS = [
+  "github.com",
+  "codeload.github.com",
+  "api.github.com",
+  "objects.githubusercontent.com",
+  "release-assets.githubusercontent.com",
+];
+
+/**
+ * Registry domain sets the flow editor can merge into `network.allow`. A helper only: the stored flow keeps the
+ * explicit domain list, and presets grant nothing an allowlist could not already contain. Each set covers the hosts
+ * the registry's downloads redirect to, not just its API host.
+ */
+export const NETWORK_PRESETS: Record<string, { label: string; domains: string[] }> = {
+  npm: { label: "npm", domains: ["registry.npmjs.org", ".yarnpkg.com"] },
+  pypi: { label: "PyPI", domains: ["pypi.org", "files.pythonhosted.org"] },
+  crates: { label: "crates.io", domains: ["crates.io", "index.crates.io", "static.crates.io", "static.rust-lang.org"] },
+  go: { label: "Go modules", domains: ["proxy.golang.org", "sum.golang.org", "go.dev", "dl.google.com"] },
+  github: { label: "GitHub releases", domains: GITHUB_RELEASE_DOMAINS },
+  mise: { label: "mise", domains: ["mise.jdx.dev", "mise-versions.jdx.dev", "nodejs.org", ...GITHUB_RELEASE_DOMAINS] },
+};
+
 export const SandboxSpec = z.object({
   provider: z.literal("docker").default("docker"),
   image: z.string().min(1).default("orch/sandbox-omp:latest"),
