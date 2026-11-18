@@ -266,8 +266,8 @@ A theme is one plain CSS file, `<name>.css`, that overrides the variables below 
 Names match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$` (letters, digits, `-`, `_`; no dots). Built-in themes `light` and `dark`
 (in `packages/web/themes/`) pin the default palette to one mode.
 
-**Adding one:** put the file in `ui.themesDir` and reload the page: it appears in the topbar's *Theme* picker, with no
-rebuild or restart. A custom theme replaces a built-in of the same name.
+**Adding one:** put the file in `ui.themesDir` and reload the page: it appears in the *Theme* picker (account menu at
+the bottom of the sidebar), with no rebuild or restart. A custom theme replaces a built-in of the same name.
 
 ```json
 { "ui": { "theme": "corporate", "themesDir": "/data/themes" } }
@@ -290,9 +290,10 @@ flow canvas maps xyflow's `--xy-*` variables onto these, so it follows the theme
 | Group | Variables |
 |---|---|
 | Color | `--bg` `--panel` `--panel-2` `--border` `--text` `--muted` `--accent` `--accent-text` `--danger` `--ok` `--warn` `--info` `--user-bubble` `--code-bg` `--overlay` (modal backdrop) `--on-danger` (text on danger badges) |
-| Effects | `--shadow` (a full `box-shadow` value) |
+| Effects | `--shadow` (a full `box-shadow` value, popovers and dialogs) `--shadow-sm` (subtle raise, cards) `--focus-ring` (a `box-shadow` value for keyboard focus) `--transition` (duration + easing for hover/press; `none` under `prefers-reduced-motion`) |
 | Type | `--font-sans` `--font-mono` `--font-size` (base, 14px) `--text-xs` (11px) `--text-sm` (12px) `--text-md` (13px) |
 | Shape | `--radius-xs` (3px) `--radius-sm` (4px) `--radius-md` (6px) `--radius-lg` (10px) |
+| Spacing | `--space-1` (4px) `--space-2` (8px) `--space-3` (12px) `--space-4` (16px) `--space-5` (24px) `--space-6` (32px) |
 
 These variables are the stable contract. Class names can be targeted for bigger changes, but may change between
 releases. Example `corporate.css`:
@@ -305,10 +306,13 @@ releases. Example `corporate.css`:
   --radius-md: 2px;
   --radius-lg: 4px;
 }
-.topbar {
-  border-bottom: 3px solid var(--accent);
+.sidebar {
+  border-right: 3px solid var(--accent);
 }
 ```
+
+The top bar was replaced by a left sidebar (`.sidebar`) in the UI refresh; themes that styled `.topbar` need to move
+those rules to `.sidebar`.
 
 Theme CSS is trusted admin content: it can load external fonts or images (there is no CSP), so only admins should be
 able to write `themesDir`.

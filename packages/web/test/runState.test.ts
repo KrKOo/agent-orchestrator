@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { RunEvent } from "@orch/protocol";
+import { pendingRequest } from "../src/runRequests";
 import { applyRunEvents, initialRunViewState } from "../src/runState";
 
 let seq = 0;
@@ -110,6 +111,25 @@ describe("applyRunEvents", () => {
 
     const restarted = applyRunEvents(failed, [ev({ type: "step.started", stepId: "c", payload: {} })]);
     expect(restarted.steps.c).toMatchObject({ status: "running", output: undefined, structured: undefined, error: undefined });
+  });
+
+  test("a terminal status settles requests left open, so a retry's new request is the pending one", () => {
+    seq = 0;
+    const lost = applyRunEvents(initialRunViewState, [
+      ev({ type: "acp.permission_request", stepId: "a", payload: { requestId: "p1", toolCall: {}, options: [] } }),
+      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i1", message: "review it", sessions: [] } }),
+      // runner_lost: the server terminates the run with run.status only, no *_resolved events.
+      ev({ type: "run.status", payload: { status: "failed", error: "runner lost" } }),
+    ]);
+    expect(lost.permissions.map((p) => p.resolved)).toEqual([true]);
+    expect(lost.interventions.map((i) => i.resolved)).toEqual([true]);
+    expect(pendingRequest(lost, new Set())).toBeUndefined();
+
+    const retried = applyRunEvents(lost, [
+      ev({ type: "run.status", payload: { status: "queued", resumeFromStepId: "gate" } }),
+      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i2", message: "review it", sessions: [] } }),
+    ]);
+    expect(pendingRequest(retried, new Set())).toMatchObject({ kind: "intervention", request: { requestId: "i2" } });
   });
 });
 

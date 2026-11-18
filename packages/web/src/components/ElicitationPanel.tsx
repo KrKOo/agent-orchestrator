@@ -1,8 +1,11 @@
+// Docked form for an ACP/MCP elicitation request (was a modal): only flat string/enum/boolean/number
+// schemas can be accepted; unsupported fields disable Submit, like before.
 import type { ElicitationAction } from "@orch/protocol";
 import { useState } from "react";
 import { api, errorMessage } from "../api";
 import type { ElicitationView } from "../runState";
-import { Modal, toJson } from "../ui";
+import { toJson } from "../ui";
+import { RequestPanel } from "./RequestPanel";
 
 interface PropSchema {
   type?: string;
@@ -38,13 +41,16 @@ function initialValue(p: PropSchema, kind: FieldKind): unknown {
 }
 
 /** Form for an ACP/MCP elicitation request; only flat string/enum/boolean/number schemas can be accepted. */
-export function ElicitationDialog({
+export function ElicitationPanel({
   runId,
   request,
+  stepName,
   onSubmitted,
 }: {
   runId: string;
   request: ElicitationView;
+  /** Name of the asking step, shown when it is not the one selected in the step list. */
+  stepName?: string;
   onSubmitted: (requestId: string) => void;
 }) {
   const schema = (request.requestedSchema ?? {}) as { properties?: Record<string, PropSchema>; required?: string[] };
@@ -82,48 +88,27 @@ export function ElicitationDialog({
   };
 
   return (
-    <Modal
-      title="Input requested"
-      footer={
-        <>
-          <button type="button" className="btn" disabled={busy} onClick={() => respond("decline")}>
-            Decline
-          </button>
-          {supported && (
-            <button
-              type="button"
-              className="btn primary"
-              disabled={busy || missing.length > 0}
-              onClick={() => respond("accept")}
-            >
-              Submit
-            </button>
-          )}
-        </>
-      }
-    >
-      <p className="pre-wrap">{request.message}</p>
+    <RequestPanel title="Input requested" stepName={stepName} error={error}>
+      <p className="request-panel-text pre-wrap">{request.message}</p>
       {props.map(([key, p]) => {
         const kind = kinds[key]!;
-        const label = (
-          <span>
-            {p.title ?? key}
-            {required.has(key) && <span className="muted"> *</span>}
-          </span>
-        );
         const set = (v: unknown) => setValues({ ...values, [key]: v });
         if (kind === "checkbox") {
           return (
             <label key={key} className="check">
               <input type="checkbox" checked={values[key] === true} onChange={(e) => set(e.target.checked)} />
               {p.title ?? key}
+              {required.has(key) && <span className="muted"> *</span>}
               {p.description && <small className="muted"> — {p.description}</small>}
             </label>
           );
         }
         return (
           <label key={key} className="field">
-            {label}
+            <span>
+              {p.title ?? key}
+              {required.has(key) && <span className="muted"> *</span>}
+            </span>
             {kind === "text" && <input value={String(values[key] ?? "")} onChange={(e) => set(e.target.value)} />}
             {kind === "number" && (
               <input
@@ -160,7 +145,16 @@ export function ElicitationDialog({
           </label>
         );
       })}
-      {error && <p className="error">{error}</p>}
-    </Modal>
+      <div className="row gap">
+        <button type="button" className="btn" disabled={busy} onClick={() => respond("decline")}>
+          Decline
+        </button>
+        {supported && (
+          <button type="button" className="btn primary" disabled={busy || missing.length > 0} onClick={() => respond("accept")}>
+            Submit
+          </button>
+        )}
+      </div>
+    </RequestPanel>
   );
 }

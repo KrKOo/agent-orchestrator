@@ -1,4 +1,5 @@
 import { contentText, type ToolCallView } from "../runState";
+import { StatusIcon } from "./icons";
 import { Collapsible, toJson } from "../ui";
 
 /** Text rendering of one ACP `ToolCallContent` entry. */
@@ -27,6 +28,7 @@ export function ToolCallCard({ call }: { call: ToolCallView }) {
         <span className="tool-title">{call.title}</span>
         {call.name && call.name !== call.title && <span className="muted small mono">{call.name}</span>}
         <span className="grow" />
+        <StatusIcon status={status === "pending" || status === "in_progress" ? "running" : status === "completed" ? "succeeded" : status === "failed" ? "failed" : "pending"} size={14} />
         <span className={`chip chip-tool-${status}`}>{status.replace("_", " ")}</span>
       </div>
       {call.locations.length > 0 && (

@@ -1,6 +1,7 @@
 // REST response shapes shared by the server (`/api/*`) and the web UI.
 // Timestamps are epoch milliseconds.
-import type { Finding, RunStatus, StepStatus } from "./events";
+import { z } from "zod";
+import { type Finding, RunStatus, type StepStatus } from "./events";
 import type { FlowDefinition } from "./flow";
 import type { CatalogEntry, ModelEntry, RunnerCapabilities } from "./wire";
 
@@ -53,6 +54,45 @@ export interface RunRow {
   /** Host workspace (worktree or direct path) the runner prepared, set once the run starts. */
   workspace: WorkspaceInfo | null;
 }
+
+/** `GET /api/runs` returns at most this many rows per page; a full page means there may be more. */
+export const RUNS_PAGE_SIZE = 200;
+
+/** Paging cursor for `GET /api/runs?before=`: the last row's sort key, `<createdAt>:<id>`. */
+export function runsCursor(row: Pick<RunRow, "createdAt" | "id">): string {
+  return `${row.createdAt}:${row.id}`;
+}
+
+/**
+ * `GET /api/runs` query: `flowId`, `status` (comma list of run statuses), `before` (a `runsCursor`), and `q`
+ * (case-insensitive substring of the run name or id). Empty values mean "no filter".
+ */
+export const RunsQuery = z.object({
+  flowId: z.string().optional(),
+  status: z
+    .string()
+    .optional()
+    .transform((s) => (s ? s.split(",").filter(Boolean) : []))
+    .pipe(z.array(RunStatus))
+    .transform((list) => (list.length ? list : undefined)),
+  before: z
+    .string()
+    .optional()
+    .transform((s, ctx) => {
+      if (!s) return undefined;
+      const m = /^(\d+):(.+)$/.exec(s);
+      if (!m) {
+        ctx.addIssue({ code: "custom", message: "expected <createdAt>:<id>" });
+        return z.NEVER;
+      }
+      return { createdAt: Number(m[1]), id: m[2]! };
+    }),
+  q: z
+    .string()
+    .optional()
+    .transform((s) => s?.trim() || undefined),
+});
+export type RunsQuery = z.infer<typeof RunsQuery>;
 
 export interface StepRow {
   runId: string;

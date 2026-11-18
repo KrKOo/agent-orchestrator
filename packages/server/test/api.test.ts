@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import type { Catalog, FlowRow, RunDetail, RunRow } from "@orch/protocol";
+import { type Catalog, type FlowRow, type RunDetail, type RunRow, RUNS_PAGE_SIZE, runsCursor } from "@orch/protocol";
 import { FS_LIST_TIMEOUT_MS } from "../src/api/runners";
 import { createApp } from "../src/app";
 import { schema } from "../src/db";
@@ -103,6 +103,47 @@ describe("runs API", () => {
     expect(detail.steps.map((s) => [s.stepId, s.status])).toEqual([["impl", "pending"]]);
     expect((await call("GET", `/api/runs?flowId=${flow.id}`)).json.map((r: RunRow) => r.id)).toEqual([run.id]);
     expect((await call("GET", "/api/runs?flowId=other")).json).toEqual([]);
+  });
+
+  test("run list filters by status and name/id substring, and rejects unknown statuses", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const asking = addRun(deps, { status: "awaiting_input", name: "Fix 100% CPU", createdAt: 3 });
+    const approval = addRun(deps, { status: "awaiting_approval", createdAt: 2 });
+    addRun(deps, { status: "failed", name: "Other", createdAt: 1 });
+    const accented = addRun(deps, { status: "failed", name: "Échec du build", createdAt: 0 });
+    const ids = async (query: string) => (await call("GET", `/api/runs?${query}`)).json.map((r: RunRow) => r.id);
+
+    expect(await ids("status=awaiting_input,awaiting_approval")).toEqual([asking, approval]);
+    expect(await ids("status=")).toHaveLength(4);
+    expect(await ids("q=100%25")).toEqual([asking]); // `%` matches literally, not as a LIKE wildcard
+    expect(await ids("q=fix%20100")).toEqual([asking]); // case-insensitive
+    expect(await ids(`q=${approval.slice(-6).toLowerCase()}`)).toEqual([approval]);
+    expect(await ids(`q=${encodeURIComponent("Échec")}`)).toEqual([accented]); // non-ASCII text matches itself
+    expect(await ids("status=failed&q=fix")).toEqual([]);
+
+    const bad = await call("GET", "/api/runs?status=running,bogus");
+    expect(bad.status).toBe(400);
+    expect(bad.json.errors[0]).toStartWith("status.1:");
+    expect((await call("GET", "/api/runs?before=nope")).status).toBe(400);
+  });
+
+  test("run list pages with a before cursor across rows sharing createdAt", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    // All rows share one createdAt, so only the id tiebreak orders them; a createdAt-only cursor would loop or skip.
+    const total = RUNS_PAGE_SIZE + 5;
+    for (let i = 0; i < total; i++) addRun(deps, { createdAt: 1000 });
+    addRun(deps, { createdAt: 999 });
+
+    const first = (await call("GET", "/api/runs")).json as RunRow[];
+    expect(first).toHaveLength(RUNS_PAGE_SIZE);
+    const second = (await call("GET", `/api/runs?before=${runsCursor(first.at(-1)!)}`)).json as RunRow[];
+    expect(second).toHaveLength(6);
+    expect(second.at(-1)!.createdAt).toBe(999);
+    const all = [...first, ...second].map((r) => r.id);
+    expect(new Set(all).size).toBe(total + 1);
+    expect((await call("GET", `/api/runs?before=${runsCursor(second.at(-1)!)}`)).json).toEqual([]);
   });
 
   test("runs accept a name or autoName at creation, never both, and expose both on the row", async () => {

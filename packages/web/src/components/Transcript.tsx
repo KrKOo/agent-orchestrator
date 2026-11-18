@@ -1,10 +1,11 @@
+import { Circle, CircleCheck, CircleDot } from "lucide-react";
 import type { StepView } from "../runState";
 import { Collapsible } from "../ui";
 import { LongText } from "./LongText";
 import { SubagentPanel } from "./SubagentPanel";
 import { ToolCallCard } from "./ToolCallCard";
 
-const PLAN_MARK: Record<string, string> = { completed: "☑", in_progress: "◐", pending: "☐" };
+const PLAN_MARK: Record<string, typeof Circle> = { completed: CircleCheck, in_progress: CircleDot, pending: Circle };
 
 /** Renders one step's ACP session updates and subagents. */
 export function Transcript({ step }: { step: StepView }) {
@@ -41,11 +42,16 @@ export function Transcript({ step }: { step: StepView }) {
               <div key={i} className="plan">
                 <strong className="small">Plan</strong>
                 <ul>
-                  {item.entries.map((e, n) => (
-                    <li key={n} className={`plan-${e.status}`}>
-                      <span className="plan-mark">{PLAN_MARK[e.status] ?? "☐"}</span> {e.content}
-                    </li>
-                  ))}
+                  {item.entries.map((e, n) => {
+                    const Mark = PLAN_MARK[e.status] ?? Circle;
+                    return (
+                      <li key={n} className={`plan-${e.status}`}>
+                        <span className="plan-mark">
+                          <Mark size={12} aria-hidden />
+                        </span> {e.content}
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             );
