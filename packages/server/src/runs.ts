@@ -259,6 +259,16 @@ export class RunService {
         tx.update(runs).set({ name: ev.payload.name }).where(and(eq(runs.id, ev.runId), isNull(runs.name))).run();
         return;
       }
+      case "run.models": {
+        // The runner's record of a switch it applied: the stored models follow even when the API call that asked for
+        // it timed out or lost the runner after sending. Replaces the whole set, so replays and duplicates are no-ops.
+        // A finished run keeps its models: a late or replayed event must not undo a switch saved for its retry.
+        const run = tx.select({ definition: runs.definition, status: runs.status }).from(runs).where(eq(runs.id, ev.runId)).get();
+        if (!run || isTerminal(run.status)) return;
+        const harness = { id: run.definition.harness.id, ...ev.payload.models };
+        tx.update(runs).set({ definition: { ...run.definition, harness } }).where(eq(runs.id, ev.runId)).run();
+        return;
+      }
       default:
         return;
     }

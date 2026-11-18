@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RunEvent } from "@orch/protocol";
 import { pendingRequest } from "../src/runRequests";
-import { applyRunEvents, initialRunViewState } from "../src/runState";
+import { applyRunEvents, initialRunViewState, modelsSwitchText } from "../src/runState";
 
 let seq = 0;
 const ev = (e: Omit<RunEvent, "seq" | "runId" | "ts">): RunEvent =>
@@ -140,6 +140,29 @@ describe("run.name", () => {
     expect(state.name).toBe("Boot fix");
     const again = applyRunEvents(state, [ev({ type: "run.name", payload: { name: "Better name" } })]);
     expect(again.name).toBe("Boot fix");
+  });
+});
+
+describe("run.models", () => {
+  test("a switch is a marker in its step's transcript, between that step's updates; replays fold once", () => {
+    seq = 0;
+    const models = { model: "x/opus", modelRoles: { task: "x/haiku" } };
+    const events = [
+      chunk("agent_message_chunk", "before"),
+      ev({ type: "run.models", stepId: "a", payload: { models, applied: "restart" } }),
+      chunk("agent_message_chunk", "after"),
+    ];
+    const state = applyRunEvents(initialRunViewState, events);
+    expect(state.steps.a!.items).toEqual([
+      { kind: "assistant", text: "before" },
+      { kind: "models", models, applied: "restart" },
+      { kind: "assistant", text: "after" },
+    ]);
+    expect(applyRunEvents(state, events)).toBe(state);
+    expect(modelsSwitchText(models, "restart")).toBe(
+      "Models switched: default → x/opus, smol → x/opus, task → x/haiku; applies from the next agent turn",
+    );
+    expect(modelsSwitchText({ model: "x/a", smolModel: "x/b" }, "live")).toBe("Models switched: default → x/a, smol → x/b");
   });
 });
 

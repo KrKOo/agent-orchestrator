@@ -1,14 +1,15 @@
 import { z } from "zod";
 import { RunEvent, RunStatus } from "./events";
-import { FlowDefinition, InterventionAction } from "./flow";
+import { FlowDefinition, HarnessModels, InterventionAction } from "./flow";
 
 /**
  * 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it.
  * 3: pull requests are flow inputs (`github_pull_request`), `github_comment` steps and the `github.createComment` RPC.
  * 4: loop steps, `loop.repeat`, skipped steps (and the `repeat` intervention action).
  * 5: condition steps, intervention choices (`intervention.respond.choice`).
+ * 6: server→runner RPCs are a union (`job.setModels` switches a live run's models), `run.models` events.
  */
-export const WIRE_PROTOCOL = 5;
+export const WIRE_PROTOCOL = 6;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
@@ -111,6 +112,21 @@ export interface FsListResult {
   entries: { name: string; path: string; isDir: true; isGitRepo: boolean }[];
 }
 
+/** Replaces the harness models of run `runId`, which the runner holds; resolves once the change is accepted. */
+export const JobSetModelsParams = z.object({ runId: z.string(), models: HarnessModels });
+export type JobSetModelsParams = z.infer<typeof JobSetModelsParams>;
+export interface JobSetModelsResult {
+  /** `restart`: the harness reloads before its next agent turn; `live`: in effect already. */
+  applied: "live" | "restart";
+}
+
+/** Server→runner RPC methods with their params and results. */
+export interface ServerRpcMethods {
+  "fs.list": { params: FsListParams; result: FsListResult };
+  "job.setModels": { params: JobSetModelsParams; result: JobSetModelsResult };
+}
+export type ServerRpcMethod = keyof ServerRpcMethods;
+
 const RpcResult = z.union([
   z.object({ t: z.literal("rpc.result"), rpcId: z.string(), ok: z.literal(true), result: z.unknown() }),
   z.object({ t: z.literal("rpc.result"), rpcId: z.string(), ok: z.literal(false), error: z.string() }),
@@ -157,12 +173,10 @@ export type RunnerMessage = z.infer<typeof RunnerMessage>;
 
 // ---- Server → runner -----------------------------------------------------------
 
-export const ServerRpcCall = z.object({
-  t: z.literal("rpc.call"),
-  rpcId: z.string(),
-  method: z.literal("fs.list"),
-  params: FsListParams,
-});
+export const ServerRpcCall = z.discriminatedUnion("method", [
+  z.object({ t: z.literal("rpc.call"), rpcId: z.string(), method: z.literal("fs.list"), params: FsListParams }),
+  z.object({ t: z.literal("rpc.call"), rpcId: z.string(), method: z.literal("job.setModels"), params: JobSetModelsParams }),
+]);
 export type ServerRpcCall = z.infer<typeof ServerRpcCall>;
 
 export const ElicitationAction = z.enum(["accept", "decline", "cancel"]);

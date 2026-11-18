@@ -2124,6 +2124,12 @@
     letter-spacing: 0.04em;
     color: var(--muted);
   }
+  .run-models {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    width: 100%;
+  }
   /* intervention chat: the reviewer note scrolls with the transcript; the composer is docked below the pane */
   .intervention-note {
     max-width: 980px;
@@ -2546,6 +2552,13 @@
     flex: 1;
     height: 1px;
     background: var(--border);
+  }
+
+  /* Mid-run model switches (#36): a marker line in the step transcript. */
+  .models-marker {
+    margin: var(--space-2) 0;
+    padding-left: var(--space-2);
+    border-left: 2px solid var(--border);
   }
   .loop-iter {
     flex: none;

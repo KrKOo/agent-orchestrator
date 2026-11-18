@@ -6,12 +6,14 @@ import {
   isAgentStep,
   conditionBranches,
   conditionHolds,
+  harnessModelErrors,
   isTruthyValue,
   loopRanges,
   NETWORK_PRESETS,
   renderShellCommand,
   renderTemplate,
   RunEvent,
+  ServerMessage,
   TemplateError,
   templateRefs,
   templateVariables,
@@ -393,6 +395,27 @@ describe("validateFlow", () => {
     expect(bad.errors.some((e) => e.includes("modelRoles.default: set harness.model instead"))).toBe(true);
     expect(bad.errors.some((e) => e.includes("modelRoles.smol: set harness.smolModel instead"))).toBe(true);
     expect(bad.errors.some((e) => e.includes("modelRoles.bad key: role must match"))).toBe(true);
+  });
+
+  test("harnessModelErrors checks a bare models object (the run models endpoint) with its own path prefix", () => {
+    expect(harnessModelErrors({ model: "x/y", modelRoles: { task: "x/z" } }, "")).toEqual([]);
+    expect(harnessModelErrors({ model: "x/y", modelRoles: { smol: "x/y", Task: "x/y" } }, "")).toEqual([
+      "modelRoles.smol: set smolModel instead",
+      "modelRoles.Task: role must match /^[a-z][a-z0-9_]*$/",
+    ]);
+  });
+
+  test("job.setModels calls and run.models events parse; the harness id stays out of both", () => {
+    const call = ServerMessage.parse({
+      t: "rpc.call",
+      rpcId: "r",
+      method: "job.setModels",
+      params: { runId: "run", models: { id: "omp", model: "x/y", modelRoles: { task: "x/z" } } },
+    });
+    expect(call).toEqual({ t: "rpc.call", rpcId: "r", method: "job.setModels", params: { runId: "run", models: { model: "x/y", modelRoles: { task: "x/z" } } } });
+    expect(ServerMessage.safeParse({ t: "rpc.call", rpcId: "r", method: "job.setModels", params: { runId: "run", models: {} } }).success).toBe(false);
+    const event = RunEvent.parse({ runId: "run", seq: 1, ts: 1, type: "run.models", payload: { models: { model: "x/y" }, applied: "restart" } });
+    expect(event).toMatchObject({ type: "run.models", payload: { models: { model: "x/y" }, applied: "restart" } });
   });
 
   test("accepts an intervention step with an optional timeout and templated message", () => {

@@ -1,5 +1,5 @@
-import { isAgentStep, loopRanges, RETRYABLE_STATUSES, TERMINAL_STATUSES, type Finding, type RunDetail, type WorkspaceInfo } from "@orch/protocol";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { type HarnessModels, isAgentStep, loopRanges, RETRYABLE_STATUSES, type RunStatus, TERMINAL_STATUSES, type Finding, type RunDetail, type WorkspaceInfo } from "@orch/protocol";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Ellipsis, ListOrdered, PanelRight, RotateCcw, X } from "lucide-react";
 import { type RefObject, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
@@ -7,6 +7,7 @@ import { api, errorMessage } from "../api";
 import { ElicitationPanel } from "../components/ElicitationPanel";
 import { chatSession, InterventionComposer, InterventionStart } from "../components/InterventionChat";
 import { KindIcon, StatusIcon } from "../components/icons";
+import { HarnessModelPickers } from "../components/ModelPickers";
 import { PermissionPanel } from "../components/PermissionPanel";
 import { KIND_LABEL } from "../components/StepPanel";
 import { StepResult, Transcript } from "../components/Transcript";
@@ -585,6 +586,7 @@ function RunViewInner({ runId }: { runId: string }) {
           dismissable={!wide}
           toggleRef={detailsToggleRef}
           run={run}
+          status={status ?? run.status}
           workspace={workspace}
           onClose={() => setDetailsOpen(false)}
         />
@@ -639,6 +641,7 @@ function RunDetails({
   dismissable,
   toggleRef,
   run,
+  status,
   workspace,
   onClose,
 }: {
@@ -647,6 +650,8 @@ function RunDetails({
   /** The button that toggles the panel; a pointer-down on it must not count as "outside". */
   toggleRef: RefObject<HTMLButtonElement | null>;
   run: RunDetail["run"];
+  /** Live status (the event stream's, else the fetched run's). */
+  status: RunStatus;
   workspace: WorkspaceInfo | undefined;
   onClose: () => void;
 }) {
@@ -667,6 +672,7 @@ function RunDetails({
           <span className="detail-label">Runner</span>
           {run.runnerId ? <span className="mono">{run.runnerId}</span> : <span className="muted">—</span>}
         </div>
+        <RunModels run={run} status={status} />
         <div className="detail-row">
           <span className="detail-label">Workspace</span>
           {workspace ? (
@@ -736,6 +742,73 @@ function RunDetails({
         </div>
       </div>
     </aside>
+  );
+}
+
+/**
+ * The run's harness models, switchable until it succeeds: a running run switches at once (or from its next agent
+ * turn when the harness must restart), a queued one starts with them, a failed or cancelled one retries with them.
+ */
+function RunModels({ run, status }: { run: RunDetail["run"]; status: RunStatus }) {
+  const { id: _, ...saved } = run.definition.harness;
+  /** Models being edited; null while showing the saved ones. */
+  const [draft, setDraft] = useState<HarnessModels | null>(null);
+  const catalog = useQuery({ queryKey: ["catalog"], queryFn: api.catalog, enabled: draft !== null });
+  const qc = useQueryClient();
+  const toast = useToast();
+  const save = useMutation({
+    mutationFn: (models: HarnessModels) => api.setRunModels(run.id, models),
+    onSuccess: () => {
+      setDraft(null);
+      void qc.invalidateQueries({ queryKey: ["run", run.id] });
+      toast("Models switched", { kind: "success" });
+    },
+    onError: (err) => toast(errorMessage(err), { kind: "error" }),
+  });
+  const roles: [string, string][] = [
+    ["default", saved.model],
+    ["smol", saved.smolModel ?? saved.model],
+    ...Object.entries(saved.modelRoles ?? {}),
+  ];
+  return (
+    <div className="detail-row">
+      <span className="detail-label">Models</span>
+      {draft === null ? (
+        <div className="run-models">
+          {roles.map(([role, model]) => (
+            <div key={role} className="row gap-tight">
+              <span className="muted">{role}</span>
+              <span className="mono">{model}</span>
+            </div>
+          ))}
+          {status !== "succeeded" && (
+            <div>
+              <button type="button" className="btn small" onClick={() => setDraft(saved)}>
+                Switch models
+              </button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <form
+          className="run-models"
+          onSubmit={(e) => {
+            e.preventDefault();
+            save.mutate(draft);
+          }}
+        >
+          <HarnessModelPickers value={draft} models={catalog.data?.models ?? []} onChange={setDraft} />
+          <div className="row gap">
+            <button type="submit" className="btn small primary" disabled={save.isPending || draft.model.trim() === ""}>
+              {save.isPending ? "Switching…" : "Switch"}
+            </button>
+            <button type="button" className="btn small" disabled={save.isPending} onClick={() => setDraft(null)}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      )}
+    </div>
   );
 }
 
