@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
-import { type Catalog, type FlowRow, type RunDetail, type RunRow, RUNS_PAGE_SIZE, runsCursor } from "@orch/protocol";
+import { type Catalog, type FlowRow, type RunDetail, type RunRow, RUNS_PAGE_SIZE, runsCursor, type ServerMessage } from "@orch/protocol";
 import { FS_LIST_TIMEOUT_MS, registerRunner } from "../src/api/runners";
 import { createApp } from "../src/app";
 import { schema } from "../src/db";
@@ -467,6 +467,117 @@ describe("runs API", () => {
 
 afterEach(() => {
   jest.useRealTimers();
+});
+
+describe("run models API", () => {
+  const models = { model: "anthropic/claude-opus-4-1", modelRoles: { task: "anthropic/claude-haiku-4-5" } };
+  const harnessOf = (deps: AppDeps, id: string) => deps.runs.get(id)!.definition.harness;
+  /** Resolves with the next `rpc.call` the server sends over `link`. */
+  function nextRpc(link: FakeLink): Promise<Extract<ServerMessage, { t: "rpc.call" }>> {
+    const { promise, resolve } = Promise.withResolvers<Extract<ServerMessage, { t: "rpc.call" }>>();
+    const send = link.send.bind(link);
+    link.send = (msg) => {
+      send(msg);
+      if (msg.t === "rpc.call") {
+        link.send = send;
+        resolve(msg);
+      }
+    };
+    return promise;
+  }
+
+  test("a queued run stores the models and its job.assign carries them", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const run = addRun(deps);
+    const res = await call("PUT", `/api/runs/${run}/models`, models);
+    expect(res.status).toBe(200);
+    expect((res.json as RunRow).definition.harness).toEqual({ id: "omp", ...models });
+    const link = connectRunner(deps, "r1", caps());
+    deps.scheduler.kick();
+    expect(link.of("rpc.call")).toEqual([]);
+    expect(link.of("job.assign")[0]!.run.definition.harness).toEqual({ id: "omp", ...models });
+  });
+
+  test("a running run switches on its runner first; the stored models follow only once it accepted", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const run = addRun(deps, { status: "running", runnerId: "r1" });
+    const before = harnessOf(deps, run);
+
+    const sent = nextRpc(link);
+    const accepted = call("PUT", `/api/runs/${run}/models`, models);
+    const rpc = await sent;
+    expect(rpc).toMatchObject({ method: "job.setModels", params: { runId: run, models } });
+    expect(harnessOf(deps, run)).toEqual(before);
+    deps.hub.resolveRpc("r1", rpc.rpcId, { ok: true, result: { applied: "restart" } });
+    expect((await accepted).status).toBe(200);
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", ...models });
+
+    // A runner error leaves the stored models as they were.
+    const sentAgain = nextRpc(link);
+    const rejected = call("PUT", `/api/runs/${run}/models`, { model: "x/y" });
+    deps.hub.resolveRpc("r1", (await sentAgain).rpcId, { ok: false, error: "Run is not running on this runner" });
+    const failed = await rejected;
+    expect(failed).toEqual({ status: 502, json: { error: "Runner did not switch models: Run is not running on this runner" } });
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", ...models });
+  });
+
+  test("the runner's run.models event stores the models even when the call that asked for them timed out", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const run = addRun(deps, { status: "running", runnerId: "r1" });
+    const sent = nextRpc(link);
+    const asked = call("PUT", `/api/runs/${run}/models`, models);
+    await sent;
+    // The runner applied the switch, but its answer is lost: the hub fails the call as if the runner went away.
+    deps.hub.detachRunner("r1", link);
+    expect((await asked).status).toBe(409);
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", model: "anthropic/claude-sonnet-4-5" });
+
+    const event = { runId: run, seq: 1, ts: 1, type: "run.models", stepId: "impl", payload: { models, applied: "restart" } } as const;
+    deps.runs.ingest(run, [event]);
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", ...models });
+    // A replayed duplicate changes nothing.
+    deps.runs.ingest(run, [event]);
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", ...models });
+  });
+
+  test("a late run.models event leaves a finished run's models alone (they were saved for its retry)", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const run = addRun(deps, { status: "failed", runnerId: "r1", error: "runner_lost" });
+    expect((await call("PUT", `/api/runs/${run}/models`, { model: "x/b" })).status).toBe(200);
+    // The lost runner reconnects and replays the switch it applied before the run failed.
+    deps.runs.ingest(run, [{ runId: run, seq: 1, ts: 1, type: "run.models", stepId: "impl", payload: { models, applied: "live" } }]);
+    expect(harnessOf(deps, run)).toEqual({ id: "omp", model: "x/b" });
+  });
+
+  test("offline runners and succeeded runs refuse; bad bodies are 400", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const offline = addRun(deps, { status: "running", runnerId: "gone" });
+    expect(await call("PUT", `/api/runs/${offline}/models`, models)).toEqual({ status: 409, json: { error: "Runner offline" } });
+    const done = addRun(deps, { status: "succeeded" });
+    expect((await call("PUT", `/api/runs/${done}/models`, models)).status).toBe(409);
+    expect((await call("PUT", "/api/runs/missing/models", models)).status).toBe(404);
+    expect((await call("PUT", `/api/runs/${done}/models`, {})).status).toBe(400);
+    const reserved = await call("PUT", `/api/runs/${done}/models`, { model: "x/y", modelRoles: { default: "x/z" } });
+    expect(reserved).toEqual({ status: 400, json: { errors: ["modelRoles.default: set model instead"] } });
+  });
+
+  test("a failed run stores the models and its retry runs with them", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const run = addRun(deps, { status: "failed", runnerId: "r1" });
+    expect((await call("PUT", `/api/runs/${run}/models`, models)).status).toBe(200);
+    expect(link.of("rpc.call")).toEqual([]);
+    expect((await call("POST", `/api/runs/${run}/retry`, {})).status).toBe(200);
+    expect(link.of("job.assign")[0]!.run.definition.harness).toEqual({ id: "omp", ...models });
+  });
 });
 
 describe("runners API", () => {

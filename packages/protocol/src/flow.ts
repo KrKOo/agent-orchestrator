@@ -90,6 +90,21 @@ export const HarnessSpec = z.object({
 });
 export type HarnessSpec = z.infer<typeof HarnessSpec>;
 
+/** The run-time switchable part of a `HarnessSpec`: every model role (`PUT /api/runs/:id/models` replaces it whole). */
+export const HarnessModels = HarnessSpec.omit({ id: true });
+export type HarnessModels = z.infer<typeof HarnessModels>;
+
+/** Model role errors zod cannot express; `prefix` is the path of the models object (`harness.` in a flow). */
+export function harnessModelErrors(models: HarnessModels, prefix = "harness."): string[] {
+  const errors: string[] = [];
+  for (const role of Object.keys(models.modelRoles ?? {})) {
+    if (role === "default") errors.push(`${prefix}modelRoles.default: set ${prefix}model instead`);
+    else if (role === "smol") errors.push(`${prefix}modelRoles.smol: set ${prefix}smolModel instead`);
+    else if (!ID_RE.test(role)) errors.push(`${prefix}modelRoles.${role}: role must match /^[a-z][a-z0-9_]*$/`);
+  }
+  return errors;
+}
+
 /**
  * Known omp chat model roles (checked against omp 18.10.3). `default`/`smol` have their own
  * `HarnessSpec` fields so they are excluded; anything off this list is still valid — omp
@@ -682,11 +697,7 @@ export function validateFlow(input: unknown): ValidateResult {
     if (!i.required) errors.push(`inputs.${i.key}: github_pull_request inputs must be required`);
   }
 
-  for (const [role, model] of Object.entries(flow.harness.modelRoles ?? {})) {
-    if (role === "default") errors.push(`harness.modelRoles.default: set harness.model instead`);
-    else if (role === "smol") errors.push(`harness.modelRoles.smol: set harness.smolModel instead`);
-    else if (!ID_RE.test(role)) errors.push(`harness.modelRoles.${role}: role must match /^[a-z][a-z0-9_]*$/`);
-  }
+  errors.push(...harnessModelErrors(flow.harness));
 
   // A pull request run executes untrusted code and text: read-only PR checkout, no host or open-network access.
   const prFlow = prInputs.length > 0;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { InterventionAction, InterventionChoice } from "./flow";
+import { HarnessModels, InterventionAction, InterventionChoice } from "./flow";
 
 /** `awaiting_input`: an intervention step is paused for the user (the runner still holds the run). */
 export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running", "awaiting_input", "succeeded", "failed", "cancelled"] as const;
@@ -82,6 +82,16 @@ export const RunEvent = z.discriminatedUnion("type", [
     ...base,
     type: z.literal("run.name"),
     payload: z.object({ name: z.string().min(1).max(RUN_NAME_MAX) }),
+  }),
+  /**
+   * The run's harness models were switched while it runs (`PUT /api/runs/:id/models`), emitted by the runner
+   * once it accepted them. `live`: in effect now; `restart`: the harness reloads (keeping its conversation)
+   * before its next agent turn, so an agent turn already running finishes on the previous models.
+   */
+  z.object({
+    ...base,
+    type: z.literal("run.models"),
+    payload: z.object({ models: HarnessModels, applied: z.enum(["live", "restart"]) }),
   }),
   z.object({
     ...base,

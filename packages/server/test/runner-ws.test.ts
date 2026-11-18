@@ -303,13 +303,13 @@ describe("RunnerSession", () => {
   test("rpc.result resolves a pending server RPC only for the runner it was sent to", async () => {
     const { deps, link, session } = setup();
     await session.handle(JSON.stringify(hello));
-    const pending = deps.hub.rpc<{ path: string }>("r1", "fs.list", { path: "/x" }, 1000);
+    const pending = deps.hub.rpc("r1", "fs.list", { path: "/x" }, 1000);
     const call = link.of("rpc.call")[0]!;
     expect(call).toMatchObject({ method: "fs.list", params: { path: "/x" } });
     const other = new RunnerSession(deps, "r2", new FakeLink());
-    await other.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "evil" } }));
-    await session.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "/x" } }));
-    expect(await pending).toEqual({ path: "/x" });
+    await other.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "evil", entries: [] } }));
+    await session.handle(JSON.stringify({ t: "rpc.result", rpcId: call.rpcId, ok: true, result: { path: "/x", entries: [] } }));
+    expect(await pending).toEqual({ path: "/x", entries: [] });
   });
 
   test("invalid frames are dropped without a reply", async () => {

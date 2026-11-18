@@ -67,8 +67,8 @@ export function modelsYml(gw: { url: string; providers: string[]; models: ModelE
 export const ompAdapter: HarnessAdapter = {
   id: "omp",
 
-  files(run, gw) {
-    const roles = harnessRoleModels(run.definition.harness);
+  files(run, harness, gw) {
+    const roles = harnessRoleModels(harness);
     const providers = new Set(gw.providers);
     for (const m of roles.values()) {
       const p = modelProvider(m);
@@ -87,6 +87,36 @@ export const ompAdapter: HarnessAdapter = {
       { path: "models.yml", content: `${modelsYmlText}\n` },
       { path: "omp-config.yml", content: `${configYml}\n` },
     ];
+  },
+
+  syncFilesArgv() {
+    // The sandbox entrypoint copies models.yml into omp's agent dir at start; omp reads it only from there.
+    return ["sh", "-c", 'cp /orch/config/models.yml "$HOME/.omp/agent/models.yml"'];
+  },
+
+  prepareLoadArgv(sessionId) {
+    // Verified on omp 18.22.2: `session/load` (and `session/list`) look sessions up only in omp's default
+    // per-cwd dir (`~/.omp/agent/sessions/<encoded cwd>/`), ignoring `--session-dir`. The runner calls
+    // `session/list {cwd}` first, which creates that dir; linking the session file there makes it loadable.
+    // omp keeps appending through the link, and the session's artifact dir (subagent sessions) is linked too,
+    // so everything still lands in /orch/sessions, where the subagent tail reads it.
+    const script = [
+      "set -e",
+      `f=$(ls ${OMP_SESSIONS_DIR}/*_"$1".jsonl 2>/dev/null | head -n 1)`,
+      '[ -n "$f" ] || { echo "no omp session file for $1" >&2; exit 1; }',
+      'b=$(basename "$f" .jsonl)',
+      `mkdir -p "${OMP_SESSIONS_DIR}/$b"`,
+      "linked=",
+      'for d in "$HOME"/.omp/agent/sessions/*/; do',
+      '  [ -d "$d" ] || continue',
+      '  ln -sfn "$f" "$d$b.jsonl"',
+      `  ln -sfn "${OMP_SESSIONS_DIR}/$b" "$d$b"`,
+      "  linked=1",
+      "done",
+      '[ -n "$linked" ] || { echo "omp session dir not found under $HOME/.omp/agent/sessions" >&2; exit 1; }',
+    ].join("\n");
+    // The id is a positional argument, never part of the script text.
+    return ["sh", "-c", script, "sh", sessionId];
   },
 
   env(gw) {

@@ -1,4 +1,4 @@
-import type { Catalog, CatalogItem, CreateRunnerTokenResponse, FsListResult, ModelEntry, RunnerRow } from "@orch/protocol";
+import type { Catalog, CatalogItem, CreateRunnerTokenResponse, ModelEntry, RunnerRow } from "@orch/protocol";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { randomBytes } from "node:crypto";
@@ -129,7 +129,7 @@ export function runnerRoutes(deps: AppDeps): { runners: Hono; catalog: Hono } {
       return c.json({ error: "Runner not found" }, 404);
     }
     try {
-      const result = await deps.hub.rpc<FsListResult>(id, "fs.list", { path: c.req.query("path") ?? "" }, FS_LIST_TIMEOUT_MS);
+      const result = await deps.hub.rpc(id, "fs.list", { path: c.req.query("path") ?? "" }, FS_LIST_TIMEOUT_MS);
       return c.json(result);
     } catch (err) {
       if (!(err instanceof RpcError)) throw err;

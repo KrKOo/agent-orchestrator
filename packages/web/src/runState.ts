@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import { TERMINAL_STATUSES, type Finding, type InterventionChoice, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
+import { TERMINAL_STATUSES, type Finding, type HarnessModels, type InterventionChoice, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -26,6 +26,8 @@ export type TranscriptItem =
   | { kind: "tool"; toolCallId: string }
   | { kind: "plan"; entries: PlanEntryView[] }
   | { kind: "iteration"; n: number }
+  /** A mid-run model switch (`run.models`); `restart`: in effect from the harness's next agent turn. */
+  | { kind: "models"; models: HarnessModels; applied: "live" | "restart" }
   | { kind: "other"; update: { sessionUpdate: string; [k: string]: unknown } };
 
 export interface SubagentMessageView {
@@ -138,6 +140,16 @@ export function contentText(block: unknown): string {
   if (b.type === "resource_link") return `[${b.uri ?? "resource"}]`;
   if (b.type === "resource") return b.resource?.text ?? `[${b.resource?.uri ?? "resource"}]`;
   return `[${b.type ?? "content"}]`;
+}
+
+/** Transcript line of a model switch: every role's model, main and small first. */
+export function modelsSwitchText(models: HarnessModels, applied: "live" | "restart"): string {
+  const roles = [
+    `default → ${models.model}`,
+    `smol → ${models.smolModel ?? models.model}`,
+    ...Object.entries(models.modelRoles ?? {}).map(([role, model]) => `${role} → ${model}`),
+  ];
+  return `Models switched: ${roles.join(", ")}${applied === "restart" ? "; applies from the next agent turn" : ""}`;
 }
 
 /** Fields of ACP `tool_call` / `tool_call_update` (all but the id optional and nullable on updates). */
@@ -292,6 +304,8 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
       );
     case "run.name":
       return { ...s, name: s.name ?? ev.payload.name };
+    case "run.models":
+      return withStep(s, ev.stepId, (st) => ({ ...st, items: [...st.items, { kind: "models", ...ev.payload }] }));
     case "step.finished":
       return withStep(s, ev.stepId, (st) => ({
         ...st,

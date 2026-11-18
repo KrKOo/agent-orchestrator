@@ -34,6 +34,11 @@ export interface SandboxProcess {
 
 export interface Sandbox {
   exec(argv: string[], cwd: string): SandboxProcess;
+  /**
+   * Replaces files in the config dir (`/orch/config`, read-only inside the sandbox) atomically: each file is
+   * written beside its target and renamed over it, so a process starting meanwhile reads the old or the new file.
+   */
+  writeFiles(files: SandboxFile[]): Promise<void>;
   /** Idempotent; removes every resource the sandbox created. */
   destroy(): Promise<void>;
 }

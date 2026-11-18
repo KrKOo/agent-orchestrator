@@ -8,6 +8,8 @@ import {
   type CreateCommentParams,
   type FlowDefinitionInput,
   type GitHubTokenParams,
+  type HarnessModels,
+  type JobSetModelsResult,
   type RunEventDraft,
   type RunnerMessage,
   UNTRUSTED_PREAMBLE,
@@ -18,11 +20,11 @@ import {
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
-import { JobManager, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
+import { JobManager, JobModels, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
 import { type McpOutputServer, startMcpServer } from "../src/mcp-output";
 import { TRUNCATED_MARK } from "../src/outbox";
-import type { CreateSandbox, Sandbox, SandboxProvider } from "../src/sandbox/types";
+import type { CreateSandbox, Sandbox, SandboxFile, SandboxProvider } from "../src/sandbox/types";
 import { sinkToWritable } from "../src/sandbox/types";
 
 const FAKE_AGENT = join(import.meta.dir, "fixtures", "fake-agent.ts");
@@ -53,12 +55,25 @@ class FakeSandboxProvider implements SandboxProvider {
   destroyed = 0;
   /** Called after each `exec` spawns its process (e.g. to cancel mid-call). */
   onExec?: (argv: string[]) => void;
+  /** Every `writeFiles` call (mid-run model switches), in order. */
+  writes: SandboxFile[][] = [];
+  /** `writeFiles` calls that fail (after being recorded) before the next one succeeds. */
+  failWrites = 0;
+  /** Awaited inside each `writeFiles` call before it completes (e.g. to land another switch mid-write). */
+  onWrite?: () => Promise<void>;
+  /** Where the fake agent persists sessions, so a restarted agent can `session/load` them. */
+  readonly agentState = mkdtempSync(join(root, "agent-state-"));
 
   async create(spec: CreateSandbox): Promise<Sandbox> {
     this.specs.push(spec);
     return {
       exec: (argv, cwd) => {
         this.argvs.push(argv);
+        // `sh -c <script>` (omp config sync, session-load prep): sandbox-side scripts, recorded but not run here.
+        if (argv[0] === "sh") {
+          const proc = Bun.spawn(["true"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+          return { stdin: sinkToWritable(proc.stdin), stdout: proc.stdout, stderr: proc.stderr, exited: proc.exited, kill: () => proc.kill() };
+        }
         // `bash -c <script>` (shell steps): run real bash on the host — the sandbox is faked anyway.
         if (argv[0] === "bash" && argv[1] === "-c") {
           const proc = Bun.spawn(["bash", "-c", argv[2] ?? ""], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
@@ -84,7 +99,13 @@ class FakeSandboxProvider implements SandboxProvider {
             kill: () => proc.kill(),
           };
         }
-        const proc = Bun.spawn(["bun", FAKE_AGENT], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+        const proc = Bun.spawn(["bun", FAKE_AGENT], {
+          cwd,
+          env: { ...process.env, FAKE_AGENT_STATE_DIR: this.agentState },
+          stdin: "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+        });
         return {
           stdin: sinkToWritable(proc.stdin),
           stdout: proc.stdout,
@@ -92,6 +113,14 @@ class FakeSandboxProvider implements SandboxProvider {
           exited: proc.exited,
           kill: () => proc.kill(),
         };
+      },
+      writeFiles: async (files) => {
+        this.writes.push(files);
+        await this.onWrite?.();
+        if (this.failWrites > 0) {
+          this.failWrites--;
+          throw new Error("disk full");
+        }
       },
       destroy: async () => {
         this.destroyed++;
@@ -2082,5 +2111,191 @@ describe("runJob: untrusted pull request runs", () => {
     const run = { ...prRun([{ kind: "prompt", id: "p", name: "P", prompt: "x" }]), github: { repo: "acme/widget", number: 7, headSha: "--upload-pack=x", baseSha } };
     await runJob(run, deps, new AbortController().signal);
     expect(sent).toEqual([{ t: "job.rejected", runId: run.runId, reason: "Invalid pull request metadata" }]);
+  });
+});
+
+describe("runJob: mid-run model switches", () => {
+  const SONNET = "anthropic/claude-sonnet-4-5";
+  const OPUS = "anthropic/claude-opus-4-1";
+  const acpStarts = (sandboxes: FakeSandboxProvider) => sandboxes.argvs.filter((a) => a[0] === "omp" && a[1] === "acp").length;
+  const configOf = (files: SandboxFile[]) => files.find((f) => f.path === "omp-config.yml")!.content;
+
+  /** Runs agent step → gate → agent step; `atGate` runs while the gate waits, then the gate continues. */
+  async function runWithGate(sandboxes: FakeSandboxProvider, atGate: (models: JobModels) => Promise<void>) {
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const run = assigned({
+      harness: { id: "omp", model: SONNET, smolModel: SONNET },
+      steps: [
+        { kind: "prompt", id: "first", name: "First", prompt: "hello" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+        { kind: "prompt", id: "after", name: "After", prompt: "show-model show-history" },
+      ],
+    });
+    const models = new JobModels(run.definition.harness);
+    const pending = new PendingRequests();
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") void atGate(models).then(() => pending.settle(draft.payload.requestId, { action: "continue" }));
+    };
+    await runJob(run, deps, new AbortController().signal, pending, models);
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    const after = ofType(events, "step.finished").find((e) => e.stepId === "after")!.payload.output;
+    return { events, after };
+  }
+
+  /** `runWithGate`, switching to `next` at the gate; `applied` is the switch's result or error. */
+  async function switchAtGate(next: HarnessModels, sandboxes = new FakeSandboxProvider()) {
+    let applied: JobSetModelsResult | Error | undefined;
+    const { events, after } = await runWithGate(sandboxes, async (models) => {
+      applied = await models.set(next).catch((err: Error) => err);
+    });
+    return { sandboxes, events, after, applied };
+  }
+
+  test("a main model switch applies live: the session switches, the config files follow, no restart", async () => {
+    const next = { model: OPUS, smolModel: SONNET };
+    const { sandboxes, events, after, applied } = await switchAtGate(next);
+
+    expect(applied).toEqual({ applied: "live" });
+    expect(ofType(events, "run.models").map((e) => [e.stepId, e.payload])).toEqual([["gate", { models: next, applied: "live" }]]);
+    expect(after).toContain(`model: ${OPUS}`);
+    expect(after).toContain("history: 1");
+    expect(acpStarts(sandboxes)).toBe(1);
+    // New `omp -p` processes read the rewritten files; models.yml is copied into omp's agent dir again.
+    expect(sandboxes.writes).toHaveLength(1);
+    expect(configOf(sandboxes.writes[0]!)).toContain(`default: "${OPUS}"`);
+    expect(sandboxes.argvs.some((a) => a[0] === "sh" && a[2]!.includes("models.yml"))).toBe(true);
+  });
+
+  test("a switch landing while another writes its files is applied after it, not lost", async () => {
+    const HAIKU = "anthropic/claude-haiku-4-5";
+    const first = { model: SONNET, smolModel: SONNET, modelRoles: { task: OPUS } };
+    const second = { model: SONNET, smolModel: SONNET, modelRoles: { task: HAIKU } };
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const run = assigned({
+      harness: { id: "omp", model: SONNET, smolModel: SONNET },
+      steps: [
+        { kind: "prompt", id: "first", name: "First", prompt: "hello" },
+        { kind: "intervention", id: "gate", name: "Gate" },
+        { kind: "prompt", id: "after", name: "After", prompt: "show-history" },
+      ],
+    });
+    const models = new JobModels(run.definition.harness);
+    const pending = new PendingRequests();
+    let secondSwitch: Promise<JobSetModelsResult> | undefined;
+    // The second switch arrives while the first one's files are being written.
+    sandboxes.onWrite = async () => {
+      sandboxes.onWrite = undefined;
+      secondSwitch = models.set(second);
+    };
+    deps.emit = (draft) => {
+      events.push(draft);
+      if (draft.type === "intervention.request") {
+        void models
+          .set(first)
+          .then(() => secondSwitch)
+          .then(() => pending.settle(draft.payload.requestId, { action: "continue" }));
+      }
+    };
+    await runJob(run, deps, new AbortController().signal, pending, models);
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    expect(sandboxes.writes.map((files) => /task: "(.*)"/.exec(configOf(files))?.[1])).toEqual([OPUS, HAIKU]);
+    expect(ofType(events, "run.models").map((e) => e.payload)).toEqual([
+      { models: first, applied: "restart" },
+      { models: second, applied: "restart" },
+    ]);
+    // One restart, before the next agent turn, from the second switch's files.
+    expect(acpStarts(sandboxes)).toBe(2);
+    expect(ofType(events, "step.finished").find((e) => e.stepId === "after")!.payload.output).toContain("history: 1");
+  });
+
+  test("a switch whose files cannot be written fails and is undone: the run goes on with its models", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    sandboxes.failWrites = 1;
+    const { events, after, applied } = await switchAtGate({ model: SONNET, smolModel: SONNET, modelRoles: { task: OPUS } }, sandboxes);
+
+    expect(applied).toBeInstanceOf(Error);
+    expect((applied as Error).message).toBe("disk full");
+    expect(ofType(events, "run.models")).toEqual([]);
+    expect(acpStarts(sandboxes)).toBe(1);
+    // The next turn rewrote the part-written files with the run's own models.
+    expect(sandboxes.writes).toHaveLength(2);
+    expect(configOf(sandboxes.writes[1]!)).not.toContain("task:");
+    expect(after).toContain("history: 1");
+  });
+
+  test("two failing switches fall back to the reported models, not to the first switch that never applied", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    sandboxes.failWrites = 2;
+    const first = { model: SONNET, smolModel: SONNET, modelRoles: { task: OPUS } };
+    const second = { model: SONNET, smolModel: SONNET, modelRoles: { task: "anthropic/claude-haiku-4-5" } };
+    let results: (JobSetModelsResult | Error)[] = [];
+    const { events } = await runWithGate(sandboxes, async (models) => {
+      results = await Promise.all([first, second].map((m) => models.set(m).catch((err: Error) => err)));
+    });
+
+    expect(results.map((r) => r instanceof Error)).toEqual([true, true]);
+    expect(ofType(events, "run.models")).toEqual([]);
+    // The next turn rewrote the files with the run's own models: no task role, so no restart either.
+    expect(sandboxes.writes).toHaveLength(3);
+    expect(configOf(sandboxes.writes[2]!)).not.toContain("task:");
+    expect(acpStarts(sandboxes)).toBe(1);
+  });
+
+  test("models.yml keeps every model a switch wrote, so a session still on one can be reloaded", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    await runWithGate(sandboxes, async (models) => {
+      await models.set({ model: "custom/x" });
+      await models.set({ model: "custom/y" });
+    });
+    const modelsYml = sandboxes.writes[1]!.find((f) => f.path === "models.yml")!.content;
+    expect(modelsYml).toContain('- id: "x"');
+    expect(modelsYml).toContain('- id: "y"');
+    expect(modelsYml).toContain('- id: "claude-sonnet-4-5"');
+  });
+
+  test("another role restarts the harness before the next agent turn and reloads its session", async () => {
+    const next = { model: SONNET, smolModel: SONNET, modelRoles: { task: OPUS } };
+    const { sandboxes, events, after, applied } = await switchAtGate(next);
+
+    expect(applied).toEqual({ applied: "restart" });
+    expect(ofType(events, "run.models").map((e) => e.payload)).toEqual([{ models: next, applied: "restart" }]);
+    expect(acpStarts(sandboxes)).toBe(2);
+    expect(configOf(sandboxes.writes[0]!)).toContain(`task: "${OPUS}"`);
+    // The restarted agent loaded the first agent's session: the conversation carries on.
+    const loads = readFileSync(join(sandboxes.agentState, "loads.log"), "utf8").trim().split("\n");
+    expect(loads).toHaveLength(1);
+    expect(after).toContain("history: 1");
+    expect(after).toContain(`model: ${SONNET}`);
+    // The harness did not list the session, so the load was prepared for it first.
+    expect(sandboxes.argvs.some((a) => a[0] === "sh" && a.at(-1) === loads[0])).toBe(true);
+    // History replayed by `session/load` never reaches the transcript.
+    const texts = ofType(events, "acp.update").map((e) => JSON.stringify(e.payload.update));
+    expect(texts.some((t) => t.includes("REPLAY"))).toBe(false);
+  });
+
+  test("a switch before the sandbox starts lands in its initial files and is reported once", async () => {
+    const sandboxes = new FakeSandboxProvider();
+    const { deps, events, sent } = harnessDeps(sandboxes);
+    const finished = Promise.withResolvers<void>();
+    deps.send = (msg) => {
+      sent.push(msg);
+      if (msg.t === "job.finished") finished.resolve();
+    };
+    const manager = new JobManager(deps);
+    const run = assigned({ steps: [{ kind: "prompt", id: "p", name: "P", prompt: "show-model" }] });
+    manager.assign(run);
+    expect(await manager.setModels(run.runId, { model: OPUS })).toEqual({ applied: "live" });
+    await finished.promise;
+
+    expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+    expect(configOf(sandboxes.specs[0]!.files)).toContain(`default: "${OPUS}"`);
+    expect(sandboxes.writes).toEqual([]);
+    expect(ofType(events, "run.models").map((e) => e.payload)).toEqual([{ models: { model: OPUS }, applied: "live" }]);
+    expect(ofType(events, "step.finished")[0]!.payload.output).toContain(`model: ${OPUS}`);
+    await manager.shutdown();
+    await expect(manager.setModels(run.runId, { model: OPUS })).rejects.toThrow("not running on this runner");
   });
 });

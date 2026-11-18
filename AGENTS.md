@@ -37,16 +37,18 @@ flowchart LR
   4. The runner streams `job.events`.
   5. `RunService.ingest` (`runs.ts`) persists into `run_events` and projects into `runs`/`run_steps`/`findings`.
   6. `Hub` (`hub.ts`) fans out to browser subscribers.
-- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 5`):
+  - `runs.definition` is the run's own copy of the flow; `PUT /api/runs/:id/models` rewrites its `harness` models even while the run is live. For a live run the holding runner switches first (`job.setModels`); its `run.models` event is projected into `runs.definition` too, so the stored models follow the runner even when the API call timed out.
+- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 6`):
   - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`).
   - Events are at-least-once, deduped by `(runId, seq)`, and acked via `job.ack`.
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).
 - **RPC**:
   - runner→server: `github.token`, `github.createPullRequest`, `github.createComment`. Authorization lives in `server/src/ws/runner.ts:handleRunnerRpc`. Comment targets are resolved server-side, never taken from the runner.
-  - server→runner: only `fs.list` (`Hub.rpc`). `DELETE /api/runners/:id` sends `job.cancel` for held runs, deletes the row (revoking the token) and closes the link with 4401 (`Hub.disconnectRunner`).
+  - server→runner: `fs.list` and `job.setModels` (`Hub.rpc`, typed by `ServerRpcMethods`). `DELETE /api/runners/:id` sends `job.cancel` for held runs, deletes the row (revoking the token) and closes the link with 4401 (`Hub.disconnectRunner`).
 - **Runner job** (`runner/src/job.ts:runJob`):
   - Re-validates trust runner-side (`rejectReason`), then loops over steps with a `TemplateContext` (`{{inputs.x}}`, `{{steps.<id>.output}}` via `renderTemplate`).
   - Agent steps run `omp acp` over ACP (`acp-session.ts`). Output and findings come back through the per-run MCP server (`mcp-output.ts`, `/mcp/<runId>`, bearer secret).
+  - Model switches (`model-switch.ts` `HarnessModelState`, `applyModels` in `job.ts`): config files are rewritten at once, the main model switches live via `session/set_config_option`; other roles restart `omp acp` before the next agent turn and `session/load` the same session (omp 18.22.2 only finds it after `prepareLoadArgv` links it into its default session dir).
 - **Sandbox** (`runner/src/sandbox/docker.ts`), per run:
   - Containers/networks/volumes: `--internal` network `orch-net-<runId>`, squid `orch-egress-<runId>` (`renderSquidConf` in `sandbox/egress.ts`), run container `orch-run-<runId>`, home volume `orch-home-<runId>` (removed in `destroy()` and by `main.ts:reapDocker`).
   - Hardening: `--cap-drop ALL`, no-new-privileges, host uid, no root inside; `$HOME` is the per-run volume (not tmpfs, which counts against `--memory`), `/tmp` tmpfs.

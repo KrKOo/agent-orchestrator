@@ -1,5 +1,5 @@
 import { Circle, CircleCheck, CircleDot } from "lucide-react";
-import type { StepView } from "../runState";
+import { modelsSwitchText, type StepView } from "../runState";
 import { Collapsible } from "../ui";
 import { LongText } from "./LongText";
 import { SubagentPanel } from "./SubagentPanel";
@@ -35,6 +35,12 @@ export function Transcript({ step }: { step: StepView }) {
             return (
               <div key={i} className="iteration-divider">
                 <span className="iteration-label">Iteration {item.n}</span>
+              </div>
+            );
+          case "models":
+            return (
+              <div key={i} className="models-marker small muted" role="note">
+                {modelsSwitchText(item.models, item.applied)}
               </div>
             );
           case "plan":

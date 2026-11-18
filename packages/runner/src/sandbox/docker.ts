@@ -1,8 +1,8 @@
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, normalize } from "node:path";
 import type { RunnerConfig } from "../config";
 import { renderSquidConf } from "./egress";
-import { type CreateSandbox, type Sandbox, type SandboxProcess, type SandboxProvider, sinkToWritable, sortMountsByDepth } from "./types";
+import { type CreateSandbox, type Sandbox, type SandboxFile, type SandboxProcess, type SandboxProvider, sinkToWritable, sortMountsByDepth } from "./types";
 
 export const EGRESS_IMAGE = "orch/egress:latest";
 const READY_TIMEOUT_MS = 20_000;
@@ -35,6 +35,24 @@ function assertMountPath(p: string): void {
   if (/[,"\n]/.test(p) || !p.startsWith("/")) throw new Error(`Unsupported mount path: ${p}`);
 }
 
+/**
+ * Writes `files` under `configDir` (the sandbox's `/orch/config`). Each file goes to a temp name beside its target
+ * and is renamed over it: the dir is bind-mounted, so a process in the sandbox opening the file mid-update reads
+ * either version, never a truncated one.
+ */
+async function writeConfigFiles(configDir: string, files: SandboxFile[]): Promise<void> {
+  await mkdir(configDir, { recursive: true });
+  for (const file of files) {
+    const target = normalize(join(configDir, file.path));
+    if (!target.startsWith(`${configDir}/`)) throw new Error(`Sandbox file escapes config dir: ${file.path}`);
+    await mkdir(dirname(target), { recursive: true });
+    const tmp = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await writeFile(tmp, file.content);
+    await chmod(tmp, 0o644);
+    await rename(tmp, target);
+  }
+}
+
 /** Polls `check` until it returns true or the timeout elapses. */
 async function waitFor(what: string, check: () => Promise<boolean>): Promise<void> {
   const deadline = Date.now() + READY_TIMEOUT_MS;
@@ -64,7 +82,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     const labels = ["--label", `orch.runner=${this.config.runnerId}`, "--label", `orch.run=${runId}`];
     const runDir = join(this.config.dataDir, "runs", runId);
     const configDir = join(runDir, "config");
-    const sandbox = new DockerSandbox(names);
+    const sandbox = new DockerSandbox(names, configDir);
     try {
       await dockerOk(["network", "create", "--internal", ...labels, names.net]);
       await dockerOk(["volume", "create", ...labels, names.home]);
@@ -85,14 +103,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       ]);
       await dockerOk(["network", "connect", names.net, names.egress]);
 
-      await mkdir(configDir, { recursive: true });
-      for (const file of spec.files) {
-        const target = normalize(join(configDir, file.path));
-        if (!target.startsWith(`${configDir}/`)) throw new Error(`Sandbox file escapes config dir: ${file.path}`);
-        await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, file.content);
-        await chmod(target, 0o644);
-      }
+      await writeConfigFiles(configDir, spec.files);
 
       const mountArgs: string[] = [];
       for (const m of sortMountsByDepth(spec.mounts)) {
@@ -167,7 +178,10 @@ export class DockerSandboxProvider implements SandboxProvider {
 class DockerSandbox implements Sandbox {
   private destroyed: Promise<void> | null = null;
 
-  constructor(private readonly names: { net: string; egress: string; run: string; home: string }) {}
+  constructor(
+    private readonly names: { net: string; egress: string; run: string; home: string },
+    private readonly configDir: string,
+  ) {}
 
   exec(argv: string[], cwd: string): SandboxProcess {
     const proc = Bun.spawn(["docker", "exec", "-i", "-w", cwd, this.names.run, ...argv], {
@@ -182,6 +196,10 @@ class DockerSandbox implements Sandbox {
       exited: proc.exited,
       kill: () => proc.kill(),
     };
+  }
+
+  writeFiles(files: SandboxFile[]): Promise<void> {
+    return writeConfigFiles(this.configDir, files);
   }
 
   destroy(): Promise<void> {

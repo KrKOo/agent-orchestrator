@@ -2,7 +2,7 @@
 // Timestamps are epoch milliseconds.
 import { z } from "zod";
 import { type Finding, RunStatus, type StepStatus } from "./events";
-import type { FlowDefinition } from "./flow";
+import { type FlowDefinition, HarnessModels } from "./flow";
 import type { CatalogEntry, ModelEntry, RunnerCapabilities } from "./wire";
 
 export interface FlowRow {
@@ -93,6 +93,10 @@ export const RunsQuery = z.object({
     .transform((s) => s?.trim() || undefined),
 });
 export type RunsQuery = z.infer<typeof RunsQuery>;
+
+/** `PUT /api/runs/:id/models`: the run's new harness models (all roles; replaces the previous set). */
+export const SetRunModelsBody = HarnessModels;
+export type SetRunModelsBody = z.infer<typeof SetRunModelsBody>;
 
 export interface StepRow {
   runId: string;

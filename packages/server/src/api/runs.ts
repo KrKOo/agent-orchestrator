@@ -2,12 +2,14 @@ import {
   ElicitationAction,
   InterventionAction,
   type GitHubIssueInput,
+  harnessModelErrors,
   type InputDef,
   type PullRequestInput,
   type RunDetail,
   RUN_NAME_MAX,
   RUNS_PAGE_SIZE,
   RunsQuery,
+  SetRunModelsBody,
 } from "@orch/protocol";
 import { and, asc, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
@@ -16,6 +18,7 @@ import { schema } from "../db";
 import type { AppDeps } from "../deps";
 import { initialPullRunStatus, insertRun, pullRequestInput } from "../createRun";
 import { GitHubError, parseIssueUrl, parsePullUrl } from "../github/api";
+import { RpcError } from "../hub";
 import { findingRow, runRow, stepRow } from "../rows";
 import { isTerminal } from "../runs";
 import { eventsAfter } from "../ws/browser";
@@ -49,6 +52,9 @@ const InterventionBody = z
     message: "message: pick a session and write a message",
     path: ["text"],
   });
+
+/** Time the runner gets to take a model switch (it may queue behind a harness restart for an earlier one). */
+const SET_MODELS_TIMEOUT_MS = 30_000;
 
 export type InputResolution =
   | { ok: true; inputs: Record<string, unknown>; untrustedPullSource: boolean }
@@ -290,6 +296,45 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     if (!run.runnerId || !hub.isConnected(run.runnerId)) return { error: "Runner offline", status: 409 };
     return { runnerId: run.runnerId };
   }
+
+  /**
+   * Replaces the run's harness models (every role). A run its runner holds switches first, over the `job.setModels`
+   * RPC: the stored definition is written here once the runner took it, and in any case by the projection of the
+   * runner's `run.models` event (so a call that timed out or lost the runner after sending still ends up stored).
+   * Queued runs pick the stored models up with `job.assign`, failed and cancelled ones on retry.
+   */
+  app.put("/:id/models", async (c) => {
+    const id = c.req.param("id");
+    const body = await readJson(c);
+    if (!body.ok) return body.response;
+    const parsed = SetRunModelsBody.safeParse(body.value);
+    if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
+    const models = parsed.data;
+    const errors = harnessModelErrors(models, "");
+    if (errors.length) return c.json({ errors }, 400);
+    const run = deps.runs.get(id);
+    if (!run) return c.json({ error: "Run not found" }, 404);
+    if (run.status === "succeeded") return c.json({ error: "Run already finished" }, 409);
+    if (run.status === "assigned" || run.status === "running" || run.status === "awaiting_input") {
+      const h = holder(id);
+      if ("error" in h) return c.json({ error: h.error }, h.status);
+      try {
+        await hub.rpc(h.runnerId, "job.setModels", { runId: id, models }, SET_MODELS_TIMEOUT_MS);
+      } catch (err) {
+        if (!(err instanceof RpcError)) throw err;
+        if (err.kind === "offline") return c.json({ error: "Runner offline" }, 409);
+        return c.json({ error: `Runner did not switch models: ${err.message}` }, 502);
+      }
+    }
+    // Fast path for live runs (the `run.models` projection writes the same set); the only write for the others.
+    const definition = deps.runs.get(id)!.definition;
+    db.update(runs)
+      .set({ definition: { ...definition, harness: { id: definition.harness.id, ...models } } })
+      .where(eq(runs.id, id))
+      .run();
+    console.log(`[runs] run ${id} models switched to ${models.model}`);
+    return c.json(runRow(deps.runs.get(id)!));
+  });
 
   app.post("/:id/permissions/:requestId", async (c) => {
     const { id, requestId } = c.req.param();

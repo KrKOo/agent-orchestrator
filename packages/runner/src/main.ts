@@ -161,12 +161,15 @@ async function main(): Promise<void> {
       case "intervention.respond":
         jobs.respondIntervention(msg.runId, msg.requestId, msg);
         return;
-      case "rpc.call":
-        fsList(msg.params.path, config.allowedRoots).then(
-          (result) => send({ t: "rpc.result", rpcId: msg.rpcId, ok: true, result }),
+      case "rpc.call": {
+        const result: Promise<unknown> =
+          msg.method === "fs.list" ? fsList(msg.params.path, config.allowedRoots) : jobs.setModels(msg.params.runId, msg.params.models);
+        result.then(
+          (value) => send({ t: "rpc.result", rpcId: msg.rpcId, ok: true, result: value }),
           (err) => send({ t: "rpc.result", rpcId: msg.rpcId, ok: false, error: (err as Error).message }),
         );
         return;
+      }
       default:
         return;
     }

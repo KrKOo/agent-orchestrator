@@ -13,6 +13,7 @@ import type {
   RunnerRow,
   RunRow,
   RunStatus,
+  SetRunModelsBody,
   ThemesResponse,
 } from "@orch/protocol";
 
@@ -91,6 +92,7 @@ export const api = {
   retryRun: (id: string, fromStepId?: string) =>
     request<{ ok: true }>("POST", `/api/runs/${enc(id)}/retry`, fromStepId === undefined ? {} : { fromStepId }),
   approveRun: (id: string) => request<{ ok: true }>("POST", `/api/runs/${enc(id)}/approve`),
+  setRunModels: (id: string, models: SetRunModelsBody) => request<RunRow>("PUT", `/api/runs/${enc(id)}/models`, models),
   respondPermission: (runId: string, requestId: string, optionId: string | null) =>
     request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/permissions/${enc(requestId)}`, { optionId }),
   respondElicitation: (

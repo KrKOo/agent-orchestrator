@@ -36,6 +36,10 @@ import {
   unwrapUntrustedText,
   type StructuredOutput,
   validateFlow,
+  type HarnessModels,
+  harnessModelErrors,
+  type JobSetModelsResult,
+  type ModelEntry,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import { AcpHarness } from "./acp-session";
@@ -47,6 +51,7 @@ import { harnessRoleModels, harnesses } from "./harness/omp";
 import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
+import { HarnessModelState, sameModels } from "./model-switch";
 import { OmpJsonTranslator } from "./omp-json";
 import { TRUNCATED_MARK } from "./outbox";
 import type { Mount, Sandbox, SandboxProcess, SandboxProvider } from "./sandbox/types";
@@ -150,6 +155,41 @@ export class PendingRequests {
 
   cancelAll(): void {
     for (const id of [...this.waiters.keys()]) this.settle(id, null);
+  }
+}
+
+/**
+ * A job's harness models: `set` (a `job.setModels` RPC) records the wanted models and, once `runJob` bound
+ * `apply`, brings the sandbox in line. Before that (the job still waits for a superseded attempt) the change
+ * only lands in `state`, which the sandbox and harness start from.
+ */
+export class JobModels {
+  readonly state: HarnessModelState;
+  apply: (() => Promise<JobSetModelsResult["applied"]>) | null = null;
+  /**
+   * Models of the last `run.models` event, the ones the server stores: the run's own at first, so a switch made
+   * before `apply` was bound is reported too.
+   */
+  reported: HarnessModels;
+
+  constructor(harness: HarnessModels & { id?: string }) {
+    const { id: _, ...models } = harness;
+    this.state = new HarnessModelState(models);
+    this.reported = models;
+  }
+
+  /**
+   * A failed switch goes back to the last reported models (the server keeps those), unless a newer switch came in
+   * meanwhile; not to the models seen on arrival, which may be an earlier switch that never got applied.
+   */
+  async set(models: HarnessModels): Promise<JobSetModelsResult> {
+    this.state.current = models;
+    try {
+      return { applied: this.apply ? await this.apply() : "live" };
+    } catch (err) {
+      if (this.state.current === models) this.state.current = this.reported;
+      throw err;
+    }
   }
 }
 
@@ -313,7 +353,13 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
  * Executes one assigned run end to end. Sends `job.accepted`/`job.rejected` and `job.finished`;
  * every run event goes through `deps.emit`. `signal` aborts the run (cancel).
  */
-export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSignal, pending = new PendingRequests()): Promise<void> {
+export async function runJob(
+  run: AssignedRun,
+  deps: JobDeps,
+  signal: AbortSignal,
+  pending = new PendingRequests(),
+  models = new JobModels(run.definition.harness),
+): Promise<void> {
   const { runId, definition: def } = run;
   const emit = (body: EventBody, stepId?: string) =>
     // `body` is one correlated {type, payload} member; adding envelope fields keeps it a RunEventDraft.
@@ -419,6 +465,83 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     if (signal.aborted) throw new Error("Cancelled");
   };
 
+  /** Runs `argv` in the sandbox at the workspace; throws with its stderr tail unless it exits 0. */
+  const execChecked = async (argv: string[]): Promise<void> => {
+    const proc = sandbox!.exec(argv, workspace!.hostPath);
+    void proc.stdin.close();
+    const [, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    if (code !== 0) throw new Error(`${argv[0]} exited with code ${code}: ${stderr.trim().slice(-500)}`);
+  };
+  /** Gateway providers and models the config files are rendered with, listed once before the sandbox starts. */
+  let gatewayModels: { url: string; providers: string[]; models: ModelEntry[] } | null = null;
+  /**
+   * Keeps the role models of `written` listed in every later config rewrite: a session can still run on a replaced
+   * model (a main model it could not switch to live), and omp cannot `session/load` it into a restarted process
+   * (`Could not restore model`) once `models.yml` no longer lists it.
+   */
+  const keepRoutable = (written: HarnessModels) => {
+    for (const id of harnessRoleModels(written).values()) {
+      if (!gatewayModels!.models.some((m) => m.id === id)) gatewayModels!.models.push({ id, name: id });
+    }
+  };
+  let modelsChain: Promise<unknown> = Promise.resolve();
+  /** Runs `fn` after every model change and harness (re)start queued before it, so none of them interleave. */
+  const serialized = <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = modelsChain.then(fn);
+    modelsChain = next.catch(() => {});
+    return next;
+  };
+  /**
+   * Brings the sandbox in line with the wanted models: rewrites the config files (every new harness process reads
+   * them) and switches the ACP session's main model live. A restart of the ACP process (another role changed, or
+   * a main model its session does not offer) waits for `phase: "turn"`, the start of its next agent turn: a turn in
+   * flight is never interrupted. `now` reports models not reported yet as a `run.models` event.
+   */
+  const applyModels = (phase: "now" | "turn") =>
+    serialized(async (): Promise<JobSetModelsResult["applied"]> => {
+      const state = models.state;
+      // Read once: a switch arriving while this one awaits moves `state.current`, and queues its own apply.
+      const target = state.current;
+      const offered = (id: string) => harness?.offersModel(id) ?? false;
+      if (state.plan(offered, target).files && sandbox && gatewayModels) {
+        try {
+          await sandbox.writeFiles(adapter.files(run, target, gatewayModels));
+          const sync = adapter.syncFilesArgv();
+          if (sync) await execChecked(sync);
+        } catch (err) {
+          state.filesFailed();
+          throw err;
+        }
+        state.filesWritten(target);
+        keepRoutable(target);
+      }
+      // Also records the main model for sessions the harness starts later (fresh-session steps, restarts).
+      if (harness && (await harness.setModel(target.model))) state.defaultSwitched(target.model);
+      let restart = state.plan(offered, target).restart;
+      if (phase === "turn" && restart && harness) {
+        const prepare = (sessionId: string) => {
+          const argv = adapter.prepareLoadArgv(sessionId);
+          return argv ? execChecked(argv) : Promise.resolve();
+        };
+        try {
+          await harness.restart(prepare);
+        } catch (err) {
+          throw new Error(`Harness restart for model switch failed: ${errorText(err)}`);
+        }
+        // The restart applied `target`: the new process read its files and the loaded session got its main model when
+        // offered (a model it does not offer even now runs as the files' default, which another restart cannot change).
+        state.processStarted(target.model);
+        restart = false;
+      }
+      const applied = restart ? "restart" : "live";
+      if (phase === "now" && !sameModels(target, models.reported)) {
+        models.reported = target;
+        emit({ type: "run.models", payload: { models: target, applied } }, currentStepId);
+      }
+      return applied;
+    });
+  models.apply = () => applyModels("now");
+
   const sink: McpRunSink = {
     submitOutput(value) {
       if (!activeStep) return "No active step";
@@ -509,6 +632,8 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /** One prompt turn in the current ACP session; updates stream under `eventStepId`, MCP output goes to `outputStepId`. */
   const agentTurn = async (text: string, eventStepId: string, outputStepId: string, abort: AbortSignal, spec?: StructuredOutput): Promise<StepOutcome> => {
     const h = harness!;
+    // A model switch that needs a fresh harness process takes effect here, between turns.
+    await rejectWhenAborted(applyModels("turn"), abort);
     activeStep = { id: outputStepId, ...(spec ? { spec } : {}) };
     let output = "";
     let afterToolCall = false;
@@ -680,6 +805,8 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
    * steps). The final assistant text is the output; the `session` header gives the id to resume.
    */
   const slashRun = async (prompt: string, eventStepId: string, abort: AbortSignal, resume?: string): Promise<StepOutcome & { sessionId?: string }> => {
+    // Config files in line with the wanted models first (a switch in flight finishes, a failed one is undone).
+    await rejectWhenAborted(applyModels("now"), abort);
     // `--` stops omp flag parsing so args cannot inject launch flags; the text stays one argv element.
     const proc = sandbox!.exec([...adapter.printArgv(resume), "--", prompt], workspace!.hostPath);
     // Nothing is written to stdin; closing it ends omp's piped-input read so startup can proceed.
@@ -958,16 +1085,18 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
       const sessionsDir = join(runDir, "sessions");
       await mkdir(sessionsDir, { recursive: true });
-      const roles = harnessRoleModels(def.harness);
+      const roles = harnessRoleModels(models.state.current);
       const providerFallback = [...new Set([...roles.values()].map((m) => modelProvider(m)).filter((p): p is string => p !== null))];
       const modelFallback = [...new Set(roles.values())].map((id) => {
         const i = id.indexOf("/");
         return { id, name: i > 0 ? id.slice(i + 1) : id };
       });
-      const [providers, models] = await Promise.all([
+      const [providers, gwModels] = await Promise.all([
         deps.gateway.listGatewayProviders(providerFallback),
         deps.gateway.listGatewayModels(modelFallback),
       ]);
+      // A copy: switches append the models they wrote (`keepRoutable`).
+      gatewayModels = { url: `http://host.docker.internal:${deps.config.ports.gateway}`, providers, models: [...gwModels] };
       const skillMounts: Mount[] = [];
       for (const step of def.steps) {
         if (step.kind !== "skill") continue;
@@ -977,17 +1106,22 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           skillMounts.push({ hostPath: skill.dir, containerPath, readonly: true });
         }
       }
+      // Models switched while the sandbox starts land in `models.state.current`; `applyModels` below catches up.
+      const initialModels = models.state.current;
       sandbox = await deps.sandboxes.create({
         runId,
         image: def.sandbox.image,
         mounts: [...workspace.mounts, ...adapter.mounts(run, runDir), ...skillMounts],
-        files: adapter.files(run, { url: `http://host.docker.internal:${deps.config.ports.gateway}`, providers, models }),
+        files: adapter.files(run, initialModels, gatewayModels),
         env: adapter.env({ token: deps.gateway.token }),
         network: def.sandbox.network,
         cpus: def.sandbox.cpus,
         memoryMb: def.sandbox.memoryMb,
       });
+      models.state.filesWritten(initialModels);
+      keepRoutable(initialModels);
       checkCancelled();
+      await rejectWhenAborted(applyModels("now"), signal);
 
       // Agent naming: the assigned runner owns the model gateway, so it names the run before step 1.
       // Failure or timeout only skips the name; the run proceeds (and may be named on a later retry).
@@ -1005,15 +1139,22 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
       mcpRegistered = true;
       // Slash-only flows never prompt the ACP harness; `omp -p` runs handle them inside the sandbox.
       if (def.steps.some(isAgentStep)) {
-        harness = new AcpHarness({
+        const h = new AcpHarness({
           approval: def.approval,
           mcpServer: { type: "http", name: "orchestrator", url: mcp.url, headers: [{ name: "Authorization", value: `Bearer ${mcp.secret}` }] },
           onPermission,
           onElicitation,
           onLog: (stream, text) => emit({ type: "sandbox.log", payload: { stream, text } }, currentStepId),
         });
-        await rejectWhenAborted(harness.start(sandbox!, adapter.acpArgv(run), workspace!.hostPath), signal);
-        await rejectWhenAborted(harness.newSession(), signal);
+        harness = h;
+        // Serialized with model switches: the process must read config files no switch is rewriting.
+        const started = serialized(async () => {
+          await h.setModel(models.state.current.model);
+          await h.start(sandbox!, adapter.acpArgv(run), workspace!.hostPath);
+          await h.newSession();
+          models.state.processStarted(h.sessionModel);
+        });
+        await rejectWhenAborted(started, signal);
       }
 
       /** Loop step indexes whose body `[start, end)` contains `idx`, innermost first (nested bodies end earlier). */
@@ -1170,6 +1311,8 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     deps.send({ t: "job.finished", runId, status, ...(error !== undefined ? { error } : {}) });
   } finally {
     signal.removeEventListener("abort", onCancel);
+    // The sandbox is going away: later switches only record the models (the server stores them for a retry).
+    models.apply = null;
     pending.cancelAll();
     await (harness as AcpHarness | null)?.close().catch(() => {});
     await sandbox?.destroy().catch((err) => console.error(`[job ${runId}] sandbox destroy: ${errorText(err)}`));
@@ -1184,7 +1327,10 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
 
 export class JobManager {
   /** `superseded`: a retry of the same run took over; the job's emits, messages and rpcs are dropped. */
-  private readonly jobs = new Map<string, { abort: AbortController; pending: PendingRequests; superseded: boolean; done: Promise<void> }>();
+  private readonly jobs = new Map<
+    string,
+    { abort: AbortController; pending: PendingRequests; models: JobModels; superseded: boolean; done: Promise<void> }
+  >();
 
   constructor(private readonly deps: JobDeps) {}
 
@@ -1206,7 +1352,8 @@ export class JobManager {
     }
     const abort = new AbortController();
     const pending = new PendingRequests();
-    const job = { abort, pending, superseded: false, done: Promise.resolve() };
+    const models = new JobModels(run.definition.harness);
+    const job = { abort, pending, models, superseded: false, done: Promise.resolve() };
     const deps: JobDeps = {
       ...this.deps,
       emit: (draft) => {
@@ -1226,7 +1373,7 @@ export class JobManager {
         return;
       }
       if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
-      await runJob(run, deps, abort.signal, pending);
+      await runJob(run, deps, abort.signal, pending, models);
     };
     job.done = start()
       .catch((err) => console.error(`[job ${run.runId}] crashed: ${errorText(err)}`))
@@ -1244,6 +1391,18 @@ export class JobManager {
     }
     // Not running here (e.g. runner restarted): let the server close the run.
     this.deps.send({ t: "job.finished", runId, status: "cancelled" });
+  }
+
+  /**
+   * `job.setModels`: switches the models of run `runId`, which must be running here. Resolves once the change is
+   * in effect or, for a harness restart, scheduled for the next agent turn (see `runJob`'s `applyModels`).
+   */
+  async setModels(runId: string, models: HarnessModels): Promise<JobSetModelsResult> {
+    const job = this.jobs.get(runId);
+    if (!job || job.superseded) throw new Error(`Run ${runId} is not running on this runner`);
+    const errors = harnessModelErrors(models, "");
+    if (errors.length) throw new Error(errors.join("; "));
+    return job.models.set(models);
   }
 
   respondPermission(runId: string, requestId: string, optionId: string | null): void {

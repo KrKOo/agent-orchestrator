@@ -1,4 +1,4 @@
-import type { RunEvent, ServerMessage } from "@orch/protocol";
+import type { RunEvent, ServerMessage, ServerRpcCall, ServerRpcMethod, ServerRpcMethods } from "@orch/protocol";
 import { ulid } from "ulid";
 
 /** A live runner WebSocket as seen by the rest of the server. */
@@ -113,19 +113,25 @@ export class Hub {
     return true;
   }
 
-  rpc<T>(runnerId: string, method: "fs.list", params: { path: string }, timeoutMs: number): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const rpcId = ulid();
-      if (!this.sendToRunner(runnerId, { t: "rpc.call", rpcId, method, params })) {
-        reject(new RpcError("offline", "runner offline"));
-        return;
-      }
-      const timer = setTimeout(() => {
-        this.rpcs.delete(rpcId);
-        reject(new RpcError("timeout", `runner did not answer ${method} within ${timeoutMs / 1000}s`));
-      }, timeoutMs);
-      this.rpcs.set(rpcId, { runnerId, resolve: resolve as (v: unknown) => void, reject, timer });
-    });
+  rpc<M extends ServerRpcMethod>(
+    runnerId: string,
+    method: M,
+    params: ServerRpcMethods[M]["params"],
+    timeoutMs: number,
+  ): Promise<ServerRpcMethods[M]["result"]> {
+    const { promise, resolve, reject } = Promise.withResolvers<ServerRpcMethods[M]["result"]>();
+    const rpcId = ulid();
+    // `M` ties `params` to `method`, which TS cannot see through the call union.
+    if (!this.sendToRunner(runnerId, { t: "rpc.call", rpcId, method, params } as ServerRpcCall)) {
+      reject(new RpcError("offline", "runner offline"));
+      return promise;
+    }
+    const timer = setTimeout(() => {
+      this.rpcs.delete(rpcId);
+      reject(new RpcError("timeout", `runner did not answer ${method} within ${timeoutMs / 1000}s`));
+    }, timeoutMs);
+    this.rpcs.set(rpcId, { runnerId, resolve: resolve as (v: unknown) => void, reject, timer });
+    return promise;
   }
 
   /** Completes a server-initiated RPC; results from a runner that did not receive the call are ignored. */

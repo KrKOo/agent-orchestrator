@@ -13,13 +13,41 @@
  * - `probe`: first calls `tools/list` on the orchestrator MCP server and streams the raw JSON result
  *   as an extra chunk (prefixed `probe: `); used to assert the per-step tool schema.
  * - `submit-array <json>` / `submit-null`: call `submit_output` with an array / null and stream the result.
+ * - `show-model`: streams the session's current main model as an extra chunk (`model: <id>`).
+ * - `show-history`: streams how many prompts the session had before this one (`history: <n>`).
+ *
+ * Sessions offer the `model` config option (`MODELS`); `session/set_config_option` switches it (and sends a
+ * `config_option_update`). With `FAKE_AGENT_STATE_DIR` set, sessions persist there, so a restarted agent can
+ * `session/load` them: the load replays the history (`REPLAY: <prompt>` chunks) and appends the id to `loads.log`.
+ * Like omp 18.22.2, `session/list` never lists them.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 
-const sessions = new Map<string, { cwd: string; cancel: PromiseWithResolvers<void>; mcpUrl?: string; mcpSecret?: string }>();
+const MODELS = ["anthropic/claude-sonnet-4-5", "anthropic/claude-opus-4-1", "anthropic/claude-haiku-4-5"];
+const STATE_DIR = process.env.FAKE_AGENT_STATE_DIR;
+
+interface FakeSession {
+  cwd: string;
+  cancel: PromiseWithResolvers<void>;
+  mcpUrl?: string;
+  mcpSecret?: string;
+  history: string[];
+  model: string;
+}
+const sessions = new Map<string, FakeSession>();
 let nextId = 0;
+
+const configOptions = (model: string): acp.SessionConfigOption[] => [
+  { id: "model", name: "Model", category: "model", type: "select", currentValue: model, options: MODELS.map((value) => ({ value, name: value })) },
+];
+
+function persist(sessionId: string): void {
+  if (!STATE_DIR) return;
+  const { cancel: _, ...state } = sessions.get(sessionId)!;
+  writeFileSync(join(STATE_DIR, `${sessionId}.json`), JSON.stringify(state));
+}
 
 /** Calls a tool on the orchestrator MCP server; returns the raw JSON-RPC result. */
 async function callTool(
@@ -59,7 +87,8 @@ const app = acp
     agentCapabilities: { mcpCapabilities: { http: true, sse: false } },
   }))
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
-    const sessionId = `fake-${++nextId}`;
+    // Unique across agent processes: a restarted agent must not reuse a persisted id.
+    const sessionId = `fake-${process.pid}-${++nextId}`;
     const http = params.mcpServers?.find((s): s is Extract<acp.McpServer, { type: "http" }> => "type" in s && s.type === "http");
     const auth = http?.headers.find((h) => h.name.toLowerCase() === "authorization")?.value;
     sessions.set(sessionId, {
@@ -67,8 +96,40 @@ const app = acp
       cancel: Promise.withResolvers<void>(),
       ...(http?.url ? { mcpUrl: http.url } : {}),
       ...(auth?.startsWith("Bearer ") ? { mcpSecret: auth.slice("Bearer ".length) } : {}),
+      history: [],
+      model: MODELS[0]!,
     });
-    return { sessionId };
+    persist(sessionId);
+    return { sessionId, configOptions: configOptions(MODELS[0]!) };
+  })
+  .onRequest(acp.methods.agent.session.list, () => ({ sessions: [] }))
+  .onRequest(acp.methods.agent.session.load, async ({ params, client }) => {
+    const file = STATE_DIR ? join(STATE_DIR, `${params.sessionId}.json`) : "";
+    if (!file || !existsSync(file)) throw new Error(`Unknown session ${params.sessionId}`);
+    const state = JSON.parse(readFileSync(file, "utf8")) as Omit<FakeSession, "cancel">;
+    sessions.set(params.sessionId, { ...state, cancel: Promise.withResolvers<void>() });
+    appendFileSync(join(STATE_DIR!, "loads.log"), `${params.sessionId}\n`);
+    for (const text of state.history) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `REPLAY: ${text}` } },
+      });
+    }
+    return { configOptions: configOptions(state.model) };
+  })
+  .onRequest(acp.methods.agent.session.setConfigOption, async ({ params, client }) => {
+    const session = sessions.get(params.sessionId);
+    if (!session) throw new Error(`Unknown session ${params.sessionId}`);
+    if (params.configId !== "model" || typeof params.value !== "string" || !MODELS.includes(params.value)) {
+      throw new Error(`Unsupported config value ${String(params.value)}`);
+    }
+    session.model = params.value;
+    persist(params.sessionId);
+    await client.notify(acp.methods.client.session.update, {
+      sessionId: params.sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: configOptions(session.model) },
+    });
+    return { configOptions: configOptions(session.model) };
   })
   .onNotification(acp.methods.agent.session.cancel, ({ params }) => {
     sessions.get(params.sessionId)?.cancel.resolve();
@@ -77,6 +138,9 @@ const app = acp
     const session = sessions.get(params.sessionId);
     if (!session) throw new Error(`Unknown session ${params.sessionId}`);
     const text = params.prompt.map((b) => (b.type === "text" ? b.text : "")).join("");
+    const prior = session.history.length;
+    session.history.push(text);
+    persist(params.sessionId);
     const chunk = (t: string) =>
       client.notify(acp.methods.client.session.update, {
         sessionId: params.sessionId,
@@ -140,6 +204,8 @@ const app = acp
     if (text.includes("submit-null") && session.mcpUrl && session.mcpSecret) {
       await chunk(`\n${await submitOutput(session.mcpUrl, session.mcpSecret, null)}`);
     }
+    if (text.includes("show-model")) await chunk(`\nmodel: ${session.model}`);
+    if (text.includes("show-history")) await chunk(`\nhistory: ${prior}`);
     return { stopReason: "end_turn" };
   });
 
