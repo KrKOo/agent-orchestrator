@@ -275,6 +275,35 @@ describe("runs API", () => {
     expect(deps.runs.get(cancelled)).toMatchObject({ status: "queued", resumeFrom: 1 });
   });
 
+  test("run from here inside a branch the run skipped: only the branch's first step", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const definition = flowDef({
+      steps: [
+        { id: "a", name: "A", kind: "prompt", prompt: "a" },
+        { id: "pick", name: "Pick", kind: "condition", ref: "steps.a.output", op: "truthy", thenEnd: "t2", elseEnd: "e1" },
+        { id: "t1", name: "T1", kind: "prompt", prompt: "t1" },
+        { id: "t2", name: "T2", kind: "prompt", prompt: "{{steps.t1.output}}" },
+        { id: "e1", name: "E1", kind: "prompt", prompt: "e1" },
+      ],
+    });
+    const run = addRun(deps, { definition, status: "failed" });
+    const set = (stepId: string, fields: Partial<typeof schema.runSteps.$inferInsert>) =>
+      deps.db.update(schema.runSteps).set(fields).where(and(eq(schema.runSteps.runId, run), eq(schema.runSteps.stepId, stepId))).run();
+    // The condition took else: the then-block was skipped, the else step failed.
+    set("a", { status: "succeeded", output: "" });
+    set("pick", { status: "succeeded", output: "", structured: { branch: "else" } });
+    set("t1", { status: "skipped" });
+    set("t2", { status: "skipped" });
+    set("e1", { status: "failed" });
+
+    const mid = await call("POST", `/api/runs/${run}/retry`, { fromStepId: "t2" });
+    expect(mid.status).toBe(409);
+    expect(mid.json.error).toContain("branch the run did not take");
+    // The taken branch can be resumed anywhere; the skipped one from its first step.
+    expect((await call("POST", `/api/runs/${run}/retry`, { fromStepId: "t1" })).status).toBe(200);
+  });
+
   test("intervention answers are validated and relayed to the runner holding the run", async () => {
     const deps = testDeps();
     const link = connectRunner(deps, "r1", caps());
@@ -363,6 +392,34 @@ describe("runs API", () => {
     expect(
       (await call("POST", `/api/runs/${maxing}/interventions/req8`, { stepId: "spin", action: "continue" })).status,
     ).toBe(400);
+  });
+
+  test("a gate with choices needs a valid choice on continue, and only there", async () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const call = client(deps);
+    const definition = flowDef({
+      steps: [
+        { id: "impl", name: "Implement", kind: "prompt", prompt: "go" },
+        { id: "gate", name: "Gate", kind: "intervention", choices: [{ id: "approve", label: "Approve" }, { id: "fix", label: "Fix" }] },
+        { id: "plain", name: "Plain", kind: "intervention" },
+      ],
+    });
+    const running = addRun(deps, { status: "running", runnerId: "r1", definition });
+    const post = (body: Record<string, unknown>) => call("POST", `/api/runs/${running}/interventions/req`, body);
+
+    const missing = await post({ stepId: "gate", action: "continue" });
+    expect(missing.status).toBe(400);
+    expect(missing.json.error).toBe(`Step "gate" requires a choice (approve, fix)`);
+    expect((await post({ stepId: "gate", action: "continue", choice: "redo" })).status).toBe(400);
+    expect((await post({ stepId: "plain", action: "continue", choice: "fix" })).status).toBe(400);
+    expect((await post({ stepId: "gate", action: "message", session: "agent", text: "why?", choice: "fix" })).status).toBe(400);
+    expect(link.of("intervention.respond")).toHaveLength(0);
+
+    // Chat and cancel need no choice; a valid pick is forwarded.
+    expect((await post({ stepId: "gate", action: "message", session: "agent", text: "why?" })).json).toEqual({ ok: true });
+    expect((await post({ stepId: "gate", action: "continue", choice: "fix" })).json).toEqual({ ok: true });
+    expect(link.of("intervention.respond").at(-1)).toEqual({ t: "intervention.respond", runId: running, requestId: "req", action: "continue", choice: "fix" });
   });
 });
 

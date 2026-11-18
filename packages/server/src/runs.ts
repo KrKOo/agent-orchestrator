@@ -1,4 +1,4 @@
-import { RETRYABLE_STATUSES, TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
+import { branchBlocks, conditionBranches, RETRYABLE_STATUSES, TERMINAL_STATUSES, type RunEvent, type RunStatus } from "@orch/protocol";
 import { and, eq, gte, isNull, lt, max, type ExtractTablesWithRelations } from "drizzle-orm";
 import type { SQLiteBunTransaction } from "drizzle-orm/bun-sqlite/session";
 import { schema, type Db } from "./db";
@@ -18,7 +18,7 @@ export const CANCEL_GRACE_MS = 30_000;
 
 export type RetryOutcome =
   | { ok: true; error?: undefined }
-  | { ok: false; error: "not_found" | "not_retryable" | "bad_step" | "unfinished_steps" };
+  | { ok: false; error: "not_found" | "not_retryable" | "bad_step" | "unfinished_steps" | "mid_skipped_branch" };
 
 /** Persistence + projection of run events, and server-side run state changes. */
 export class RunService {
@@ -102,12 +102,20 @@ export class RunService {
     if (!RETRYABLE_STATUSES.includes(run.status)) return { ok: false, error: "not_retryable" };
     if (fromStepIdx < 0 || fromStepIdx >= run.definition.steps.length) return { ok: false, error: "bad_step" };
     const prior = this.db
-      .select({ idx: runSteps.idx, status: runSteps.status })
+      .select({ idx: runSteps.idx, status: runSteps.status, structured: runSteps.structured })
       .from(runSteps)
       .where(eq(runSteps.runId, runId))
       .all();
     if (prior.some((s) => s.idx < fromStepIdx && s.status !== "succeeded" && s.status !== "skipped"))
       return { ok: false, error: "unfinished_steps" };
+    // A branch the previous attempt did not take never ran: starting past its first step would run the rest
+    // of it without the earlier branch steps' outputs (templates would silently read empty values).
+    const midSkipped = branchBlocks(conditionBranches(run.definition)).some((b) => {
+      if (fromStepIdx <= b.start || fromStepIdx > b.end) return false;
+      const taken = (prior.find((s) => s.idx === b.cond)?.structured as { branch?: unknown } | null | undefined)?.branch;
+      return taken !== b.branch;
+    });
+    if (midSkipped) return { ok: false, error: "mid_skipped_branch" };
     const ev: RunEvent = {
       runId,
       seq: this.maxSeq(runId) + 1,

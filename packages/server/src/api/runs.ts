@@ -40,6 +40,8 @@ const InterventionBody = z
     action: InterventionAction,
     session: z.string().min(1).optional(),
     text: z.string().optional(),
+    /** `continue` on a gate with choices: the picked choice id. */
+    choice: z.string().min(1).optional(),
   })
   .refine((b) => b.action !== "message" || (b.session !== undefined && (b.text ?? "").trim() !== ""), {
     message: "message: pick a session and write a message",
@@ -203,8 +205,8 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       fromStepIdx = run.definition.steps.findIndex((s) => s.id === parsed.data.fromStepId);
       if (fromStepIdx < 0) return c.json({ error: `Unknown step "${parsed.data.fromStepId}"` }, 400);
     } else {
-      // Default: the first step (definition order) that is neither succeeded nor skipped (`skipped`
-      // bodies were bypassed by a loop stop and count as done); the last step when all are done.
+      // Default: the first step (definition order) that is neither succeeded nor skipped (`skipped` steps
+      // were bypassed by a loop stop or sit in a condition branch not taken, and count as done); the last step when all are done.
       const done = new Set(
         db
           .select({ stepId: runSteps.stepId, status: runSteps.status })
@@ -226,6 +228,8 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
           return c.json({ error: `Run is ${run.status}; only failed or cancelled runs can be retried` }, 409);
         case "unfinished_steps":
           return c.json({ error: "Cannot skip unfinished steps" }, 409);
+        case "mid_skipped_branch":
+          return c.json({ error: "This step is in a branch the run did not take; run from the first step of that branch" }, 409);
         case "bad_step":
           return c.json({ error: "Invalid step index" }, 400);
       }
@@ -295,7 +299,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     return c.json({ ok: true });
   });
 
-  /** Answers an intervention gate: chat with a session, continue, repeat (ask loop), or cancel. */
+  /** Answers an intervention gate: chat with a session, continue (with the pick on gates with choices), repeat (ask loop), or cancel. */
   app.post("/:id/interventions/:requestId", async (c) => {
     const { id, requestId } = c.req.param();
     const body = await readJson(c);
@@ -311,7 +315,13 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       return c.json({ error: `Step "${parsed.data.stepId}" is not an intervention step` }, 400);
     if (parsed.data.action === "repeat" && !isAskLoop)
       return c.json({ error: `Step "${parsed.data.stepId}" cannot be repeated` }, 400);
-    const { action, session, text } = parsed.data;
+    const { action, session, text, choice } = parsed.data;
+    const choices = step?.kind === "intervention" ? step.choices : undefined;
+    if (choice !== undefined && !choices) return c.json({ error: `Step "${parsed.data.stepId}" has no choices` }, 400);
+    if (choice !== undefined && action !== "continue") return c.json({ error: `A choice goes with "continue", not "${action}"` }, 400);
+    if (choices && action === "continue" && !choices.some((ch) => ch.id === choice)) {
+      return c.json({ error: `Step "${parsed.data.stepId}" requires a choice (${choices.map((ch) => ch.id).join(", ")})` }, 400);
+    }
     hub.sendToRunner(h.runnerId, {
       t: "intervention.respond",
       runId: id,
@@ -319,6 +329,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
       action,
       ...(session === undefined ? {} : { session }),
       ...(text === undefined ? {} : { text }),
+      ...(choice === undefined ? {} : { choice }),
     });
     return c.json({ ok: true });
   });

@@ -18,7 +18,8 @@ export function templateRefs(tpl: string): string[] {
 /** Matches one `{{ path }}` reference; capture 1 is the trimmed path between the braces. */
 export const TEMPLATE_RE = /\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/g;
 
-function lookup(ctx: TemplateContext, path: string): unknown {
+/** Raw value at a template path (`inputs.x`, `steps.<id>.structured.<field>`); throws `TemplateError` when absent. */
+export function resolveRef(ctx: TemplateContext, path: string): unknown {
   let cur: unknown = ctx;
   for (const part of path.split(".")) {
     if (cur === null || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, part)) {
@@ -32,7 +33,7 @@ function lookup(ctx: TemplateContext, path: string): unknown {
 
 export function renderTemplate(tpl: string, ctx: TemplateContext): string {
   return tpl.replace(TEMPLATE_RE, (_m, path: string) => {
-    const value = lookup(ctx, path);
+    const value = resolveRef(ctx, path);
     if (typeof value === "string") return value;
     if (value !== null && typeof value === "object") return JSON.stringify(value);
     return String(value);
@@ -52,7 +53,7 @@ export function renderShellCommand(tpl: string, ctx: TemplateContext): string {
   const script = tpl.replace(TEMPLATE_RE, (_m, path: string) => {
     let name = names.get(path);
     if (name === undefined) {
-      const resolved = lookup(ctx, path);
+      const resolved = resolveRef(ctx, path);
       const value = typeof resolved === "string" ? resolved : resolved !== null && typeof resolved === "object" ? JSON.stringify(resolved) : String(resolved);
       name = `ORCH_REF_${names.size}`;
       names.set(path, name);

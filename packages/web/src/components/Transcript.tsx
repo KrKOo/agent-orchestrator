@@ -68,14 +68,20 @@ export function Transcript({ step }: { step: StepView }) {
 
 /**
  * A finished step's error and outputs, always expanded, labelled with the template reference later steps use.
- * `stepId` is omitted for steps later steps cannot reference (loop steps), which then show no reference.
+ * `stepId` is omitted for steps later steps cannot reference (loop and condition steps), which then show no reference.
+ * `gate`: the request of an intervention step, whose pick shows as `Chose: <label>`.
  */
-export function StepResult({ step, stepId, markdown, mono }: { step: StepView; stepId?: string; markdown: boolean; mono?: boolean }) {
+export function StepResult({ step, stepId, markdown, mono, gate }: { step: StepView; stepId?: string; markdown: boolean; mono?: boolean; gate?: { resolved: boolean; choice?: string; choices?: { id: string; label: string }[] } }) {
   const hasOutput = step.output !== undefined && step.output !== "";
-  if (!step.error && !hasOutput && step.structured === undefined) return null;
+  if (!step.error && !hasOutput && step.structured === undefined && !(gate?.resolved && gate.choice)) return null;
   return (
     <div className="step-result">
       {step.error && <div className="step-error">{step.error}</div>}
+      {gate?.resolved && gate.choice && (
+        <div className="gate-choice small">
+          Chose: <strong>{gate.choices?.find((c) => c.id === gate.choice)?.label ?? gate.choice}</strong>
+        </div>
+      )}
       {hasOutput && (
         <section className="output-card">
           <div className="output-card-head">
@@ -89,7 +95,8 @@ export function StepResult({ step, stepId, markdown, mono }: { step: StepView; s
         <section className="output-card">
           <div className="output-card-head">
             <strong>Structured output</strong>
-            {stepId !== undefined && <code className="small">{`{{steps.${stepId}.structured}}`}</code>}
+            {/* A gate's only structured value is its pick. */}
+            {stepId !== undefined && <code className="small">{gate ? `{{steps.${stepId}.structured.choice}}` : `{{steps.${stepId}.structured}}`}</code>}
           </div>
           <pre className="output-card-body">{JSON.stringify(step.structured, null, 2)}</pre>
         </section>

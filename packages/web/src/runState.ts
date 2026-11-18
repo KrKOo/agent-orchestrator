@@ -1,5 +1,5 @@
 // Pure reducer turning a run's event log into the view model rendered by RunView.
-import { TERMINAL_STATUSES, type Finding, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
+import { TERMINAL_STATUSES, type Finding, type InterventionChoice, type InterventionSession, type RunEvent, type RunStatus, type StepStatus, type SubagentBlock, type WorkspaceInfo } from "@orch/protocol";
 
 export interface ToolCallView {
   toolCallId: string;
@@ -78,8 +78,12 @@ export interface InterventionView {
   session?: string;
   /** Why the last chat turn failed. */
   error?: string;
+  /** Set on gates with choices: one button per option replaces "Continue" while the request is open. */
+  choices?: InterventionChoice[];
   /** Set on `ask` loop gates that can still repeat: repeat from `toStepId`, starting iteration `iteration` of `maxIterations`. */
   repeat?: { toStepId: string; iteration: number; maxIterations: number };
+  /** Set on gates with choices: the id the user picked on `continue`. */
+  choice?: string;
   resolved: boolean;
 }
 
@@ -323,7 +327,9 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
     case "intervention.resolved":
       return {
         ...s,
-        interventions: s.interventions.map((i) => (i.requestId === ev.payload.requestId ? { ...i, resolved: true } : i)),
+        interventions: s.interventions.map((i) =>
+          i.requestId === ev.payload.requestId ? { ...i, resolved: true, choice: ev.payload.choice } : i,
+        ),
       };
     case "sandbox.log":
       return { ...s, logs: [...s.logs, { seq: ev.seq, stepId: ev.stepId, ...ev.payload }] };

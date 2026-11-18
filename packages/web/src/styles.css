@@ -1303,4 +1303,29 @@
   .loop-iter {
     flex: none;
   }
+
+  /* Conditions: then/else tag on canvas nodes inside a branch block. */
+  .branch-tag {
+    margin: 0;
+    padding: 0 5px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+  }
+
+  /* Choice gates: the option the user picked when a resolved gate shows in the step pane. */
+  .gate-choice {
+    margin: 6px 0;
+  }
+  /* Choice editor rows of an intervention: id, label, remove button on one line. */
+  .choice-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 6px;
+  }
 }

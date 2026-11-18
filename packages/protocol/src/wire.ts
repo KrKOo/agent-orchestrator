@@ -6,8 +6,9 @@ import { FlowDefinition, InterventionAction } from "./flow";
  * 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it.
  * 3: pull requests are flow inputs (`github_pull_request`), `github_comment` steps and the `github.createComment` RPC.
  * 4: loop steps, `loop.repeat`, skipped steps (and the `repeat` intervention action).
+ * 5: condition steps, intervention choices (`intervention.respond.choice`).
  */
-export const WIRE_PROTOCOL = 4;
+export const WIRE_PROTOCOL = 5;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
@@ -196,6 +197,8 @@ export const ServerMessage = z.union([
     session: z.string().optional(),
     /** `message`: text sent verbatim to the session (slash commands included). */
     text: z.string().optional(),
+    /** `continue` on a gate with choices: the picked choice id. */
+    choice: z.string().optional(),
   }),
   z.object({ t: z.literal("pong") }),
 ]);

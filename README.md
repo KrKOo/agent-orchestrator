@@ -1,6 +1,6 @@
 # Agent Orchestrator
 
-Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → shell command → git commit → push → PR, or pull request review → GitHub review — with loops such as review → fix until approved) inside hardened Docker sandboxes, driven from a web UI with live token streaming.
+Runs multi-step AI-agent **flows** (prompt → skill → command → slash command → shell command → git commit → push → PR, or pull request review → GitHub review — with loops such as review → fix until approved, and branches such as "fix only when the review asks for it") inside hardened Docker sandboxes, driven from a web UI with live token streaming.
 
 - `packages/protocol` — flow schema + validation, templates, run events, runner wire protocol, REST types.
 - `packages/server` — Hono API, SQLite (drizzle), scheduler, runner/browser WebSockets, GitHub (PAT or App: login, webhooks, Checks, reviews).
@@ -68,7 +68,7 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   run view also identify runs by their GitHub inputs — issue and PR links are derived from the resolved inputs,
   so a queued issue run is recognizable before it even starts.
 - **Retrying a failed or cancelled run** picks up where it stopped — same run, same transcript, same step outputs. **Retry**
-  (header button) re-runs the first step that did not succeed or get skipped by a loop (the last step if all did) and continues to the end;
+  (header button) re-runs the first step that did not succeed or get skipped by a loop or condition (the last step if all did) and continues to the end;
   **Run from here** (per step) resets that step and everything after it, keeping earlier outputs — use it to recover
   from bad upstream output without rerunning what worked. Retrying from a later step of a local-path flow runs on
   the runner that ran the previous attempt and adopts its worktree as left; if that runner stays offline, the run
@@ -160,6 +160,61 @@ steps:
 - The run view shows `n/max` badges on the body and an *Iteration n* divider in re-run steps' transcripts (both follow
   the innermost loop that has repeated, so a body step re-run by an outer pass is marked too). **Retrying** a run from
   inside a loop restarts that loop's counter at 1 (each attempt stays bounded).
+
+## Conditions
+
+A **`condition` step** ("If…") branches the run on a value. Its `ref` is a template path without braces
+(`inputs.<key>[.<field>]`, `steps.<id>.output`, `steps.<id>.structured.<field>`), compared with `op`:
+`equals` / `not_equals` (trimmed text), `contains` / `not_contains` (case-sensitive) — these take a `value` —
+or `truthy` / `falsy` (same rules as loop stops). The **then-block** runs from the next step through `thenEnd`; the
+optional **else-block** runs from the step after `thenEnd` through `elseEnd`. The branch not taken is marked `skipped`.
+
+```yaml
+steps:
+  - id: review
+    kind: prompt
+    name: Review
+    prompt: "Review the change"
+    structured: { fields: [{ name: verdict, description: "approve or fix" }] }
+  - { id: needs_fix, kind: condition, name: Needs a fix?, ref: steps.review.structured.verdict, op: equals, value: fix, thenEnd: fix, elseEnd: note }
+  - { id: fix, kind: prompt, name: Fix, prompt: "Fix what the review found" }
+  - { id: note, kind: shell, name: Note, command: "echo approved" }
+  - { id: commit, kind: git_commit, name: Commit, messageFrom: review }
+```
+
+- An absent value (an optional input left out, a structured field never submitted) compares as empty text and is falsy;
+  it does not fail the step. The condition's own output names the test, the branch it took and the value it saw.
+- A condition step has no output for templates. Steps outside a branch cannot reference steps inside it (they may have
+  been skipped), and `github_pr` needs a `git_push` that always runs before it.
+- Branches nest inside one branch of another condition (a chain of if / else-if puts the next condition in the
+  else-block), and branches and loop bodies nest or are disjoint. A condition inside a loop body decides again on every pass.
+- **Retrying** from the condition step evaluates it again. Retrying from a step inside a branch runs that branch
+  (from that step on) and skips the other one. In a branch the previous attempt skipped, only its first step can be
+  run from (`409` otherwise): its later steps would miss the outputs of the branch steps before them.
+
+### Manual branches
+
+An intervention step can offer **`choices`** (2–8 `{id, label}`): at the gate one button per choice replaces
+**Continue**, and the pick becomes the step's structured output `{{steps.<gate>.structured.choice}}`. A condition on
+that ref compares with `equals` / `not_equals` against one of the gate's choice ids. The gate's output is still the
+selected session's latest reply, and you can chat with the run's sessions before picking.
+
+```yaml
+steps:
+  - { id: implement, kind: prompt, name: Implement, prompt: "Implement {{inputs.task}}" }
+  - id: review
+    kind: intervention
+    name: Review
+    message: "Approve the change or send it back for a fix"
+    choices: [{ id: approve, label: Approve }, { id: fix, label: Fix }]
+  - { id: wants_fix, kind: condition, name: Fix?, ref: steps.review.structured.choice, op: equals, value: fix, thenEnd: fix, elseEnd: commit }
+  - { id: fix, kind: prompt, name: Fix, prompt: "Fix the change as discussed" }
+  - { id: commit, kind: git_commit, name: Commit, messageFrom: implement }
+```
+
+One pick can drive several conditions. A gate inside a loop asks on every pass, so each pass branches on a fresh pick.
+`continue` without a valid choice is rejected (`400`), and the run view shows `Chose: <label>` on the resolved gate.
+
 
 ## Structured output
 

@@ -60,7 +60,7 @@ export function InterventionComposer({
   const enabled = awaiting && !busy;
   const canSend = enabled && session !== undefined && text.trim() !== "";
 
-  const respond = async (action: InterventionAction) => {
+  const respond = async (action: InterventionAction, choice?: string) => {
     setBusy(true);
     setError(null);
     try {
@@ -69,6 +69,8 @@ export function InterventionComposer({
         action,
         ...(action !== "cancel" && session ? { session: session.id } : {}),
         ...(action === "message" ? { text } : {}),
+        // Only a gate with choices takes a choice; the server rejects it elsewhere.
+        ...(action === "continue" && choice ? { choice } : {}),
       });
       if (action === "message") setText("");
       onSubmitted(request.requestId);
@@ -84,7 +86,7 @@ export function InterventionComposer({
       {request.error && <p className="error">{request.error}</p>}
       {error && <p className="error">{error}</p>}
       {request.sessions.length === 0 ? (
-        <p className="muted">No agent session has run yet; continue or cancel.</p>
+        <p className="muted">No agent session has run yet; {request.choices ? "pick an option" : "continue"} or cancel.</p>
       ) : (
         <>
           <div className="row gap">
@@ -120,8 +122,17 @@ export function InterventionComposer({
           className="intervention-result"
           summary={
             <span className="intervention-result-summary">
-              <span className="muted">Continue passes on the latest reply of</span> <strong>{session.label}</strong>
-              <span className="muted">:</span>{" "}
+              {request.choices ? (
+                <>
+                  <span className="muted">The chosen option and the latest reply of</span> <strong>{session.label}</strong>
+                  <span className="muted">pass on:</span>{" "}
+                </>
+              ) : (
+                <>
+                  <span className="muted">Continue passes on the latest reply of</span> <strong>{session.label}</strong>
+                  <span className="muted">:</span>{" "}
+                </>
+              )}
               <span className="intervention-result-preview">
                 {/* First non-blank line, found without splitting a possibly huge output. */}
                 {/\S.*/.exec(session.output)?.[0].replace(/^#+\s*/, "") || "(no text yet)"}
@@ -160,9 +171,25 @@ export function InterventionComposer({
             Repeat from {repeatTarget(steps, request.repeat.toStepId)} ({request.repeat.iteration}/{request.repeat.maxIterations})
           </button>
         )}
-        <button type="button" className="btn primary" disabled={!enabled} onClick={() => respond("continue")}>
-          Continue run
-        </button>
+        {request.choices ? (
+          // One primary button per choice replaces "Continue": the picked id branches the run.
+          request.choices.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              className="btn primary"
+              disabled={!enabled}
+              title={`Pick "${c.label}"; the run branches on this choice`}
+              onClick={() => respond("continue", c.id)}
+            >
+              {c.label}
+            </button>
+          ))
+        ) : (
+          <button type="button" className="btn primary" disabled={!enabled} onClick={() => respond("continue")}>
+            Continue run
+          </button>
+        )}
       </div>
     </div>
   );

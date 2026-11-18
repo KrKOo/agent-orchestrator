@@ -3,6 +3,8 @@ import {
   type FlowDefinition,
   isActionStep,
   isAgentStep,
+  conditionBranches,
+  conditionHolds,
   isTruthyValue,
   loopRanges,
   renderShellCommand,
@@ -869,6 +871,161 @@ describe("loop steps", () => {
   test("isTruthyValue", () => {
     for (const v of [false, null, undefined, 0, "", "  ", "false", " FALSE ", "No", "0", [], {}]) expect(isTruthyValue(v)).toBe(false);
     for (const v of [true, 1, -1, "yes", "true", "approved", "00", [0], { a: 1 }]) expect(isTruthyValue(v)).toBe(true);
+  });
+});
+
+describe("condition steps", () => {
+  const plan = { id: "plan", name: "Plan", kind: "prompt", prompt: "plan" };
+  const a = { id: "a", name: "A", kind: "prompt", prompt: "a" };
+  const b = { id: "b", name: "B", kind: "prompt", prompt: "b" };
+  const c = { id: "c", name: "C", kind: "prompt", prompt: "c" };
+  const cond = (extra: Record<string, unknown> = {}) => ({ id: "if1", name: "If", kind: "condition", ref: "steps.plan.output", op: "contains", value: "risky", thenEnd: "a", ...extra });
+  const errorsOf = (steps: unknown[]) => {
+    const res = validateFlow({ ...baseFlow, steps });
+    return res.ok ? [] : res.errors;
+  };
+
+  test("maps then/else blocks and accepts nesting inside one branch", () => {
+    const res = validateFlow({ ...baseFlow, steps: [plan, cond({ elseEnd: "b" }), a, b, c] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(conditionBranches(res.flow)).toEqual(new Map([[1, { thenEnd: 2, elseEnd: 3 }]]));
+    const inner = { id: "if2", name: "If 2", kind: "condition", ref: "inputs.issue.title", op: "truthy", thenEnd: "b" };
+    expect(errorsOf([plan, cond({ thenEnd: "b" }), inner, a, b, c])).toEqual([]);
+  });
+
+  test("thenEnd must be a later step, elseEnd a step after it", () => {
+    expect(errorsOf([plan, a, cond()])).toContain(`steps.2 (if1).thenEnd: "a" must be a later step`);
+    expect(errorsOf([plan, cond({ thenEnd: "b", elseEnd: "a" }), a, b])).toContain(`steps.1 (if1).elseEnd: "a" must be a step after "b"`);
+  });
+
+  test("value goes with the comparing ops only", () => {
+    expect(errorsOf([plan, cond({ value: undefined }), a])).toContain(`steps.1 (if1).value: "contains" needs a value to compare with`);
+    expect(errorsOf([plan, cond({ op: "truthy" }), a])).toContain(`steps.1 (if1).value: "truthy" takes no value`);
+  });
+
+  test("ref must be an earlier value; conditions themselves have none", () => {
+    expect(errorsOf([plan, cond({ ref: "steps.a.output" }), a])[0]).toContain("which is not an earlier step");
+    expect(errorsOf([plan, cond({ ref: "{{steps.plan.output}}" }), a])[0]).toContain("must be a template path");
+    const later = { id: "later", name: "Later", kind: "prompt", prompt: "{{steps.if1.output}}" };
+    expect(errorsOf([plan, cond(), a, later])[0]).toContain(`references condition step "if1", which has no output to use`);
+  });
+
+  test("branches must nest inside one branch of an enclosing condition", () => {
+    const inner = { id: "if2", name: "If 2", kind: "condition", ref: "inputs.issue.title", op: "truthy", thenEnd: "b" };
+    expect(errorsOf([plan, cond(), inner, a, b])).toContain(
+      `steps.2 (if2): its branches run past the then branch of condition "if1" it starts in; nest them inside one branch`,
+    );
+  });
+
+  test("branches and loop bodies must nest or be disjoint", () => {
+    const loopTo = (to: string) => ({ id: "again", name: "Again", kind: "loop", to, maxIterations: 2 });
+    // Loop inside the then-block; condition inside a loop body.
+    expect(errorsOf([plan, cond({ thenEnd: "again" }), a, loopTo("a"), b])).toEqual([]);
+    expect(errorsOf([plan, cond(), a, loopTo("plan")])).toEqual([]);
+    expect(errorsOf([plan, cond({ thenEnd: "b" }), a, b, loopTo("b")])).toContain(
+      `steps.1 (if1): its branches cross the body of loop "again"; branches and loop bodies must nest or be disjoint`,
+    );
+  });
+
+  test("steps outside a branch cannot read steps inside it", () => {
+    const after = { id: "after", name: "After", kind: "prompt", prompt: "{{steps.a.output}}" };
+    expect(errorsOf([plan, cond(), a, after])[0]).toContain(`references step "a" inside a branch of condition "if1" that does not contain this step`);
+    const inElse = { id: "b", name: "B", kind: "prompt", prompt: "{{steps.a.output}}" };
+    expect(errorsOf([plan, cond({ elseEnd: "b" }), a, inElse]).length).toBeGreaterThan(0);
+    const inThen = { id: "a2", name: "A2", kind: "prompt", prompt: "{{steps.a.output}}" };
+    expect(errorsOf([plan, cond({ thenEnd: "a2" }), a, inThen])).toEqual([]);
+    const def = validateFlow({ ...baseFlow, steps: [plan, cond(), a, c] });
+    if (!def.ok) throw new Error(def.errors.join("\n"));
+    expect(templateVariables(def.flow, 3).map((v) => v.path)).not.toContain("steps.a.output");
+  });
+
+  test("github_pr needs a push that always runs before it", () => {
+    const steps = (pushInBranch: boolean) => [
+      plan,
+      { id: "commit", name: "Commit", kind: "git_commit", messageFrom: "plan" },
+      cond({ thenEnd: "push" }),
+      ...(pushInBranch ? [] : [a]),
+      { id: "push", name: "Push", kind: "git_push" },
+      { id: "pr", name: "PR", kind: "github_pr", titleFrom: "plan", bodyFrom: "plan" },
+    ];
+    expect(errorsOf(steps(true))).toContain(
+      "steps.4 (pr): github_pr requires a git_push that always runs before it, not one inside a condition branch that does not contain it",
+    );
+  });
+
+  test("conditionHolds compares trimmed text, searches it, or tests truthiness", () => {
+    expect(conditionHolds("equals", " fix\n", "fix")).toBe(true);
+    expect(conditionHolds("not_equals", "fix", "fix")).toBe(false);
+    expect(conditionHolds("contains", { files: ["a.ts"] }, "a.ts")).toBe(true);
+    expect(conditionHolds("not_contains", "abc", "B")).toBe(true);
+    expect(conditionHolds("truthy", "no")).toBe(false);
+    expect(conditionHolds("falsy", undefined)).toBe(true);
+    expect(conditionHolds("equals", undefined, "")).toBe(true);
+    expect(conditionHolds("equals", 3, "3")).toBe(true);
+  });
+});
+
+describe("intervention choices", () => {
+  const choices = [
+    { id: "approve", label: "Approve" },
+    { id: "fix", label: "Fix" },
+  ];
+  const gate = (extra: Record<string, unknown> = {}) => ({ id: "gate", name: "Review", kind: "intervention", choices, ...extra });
+  const fix = { id: "fix", name: "Fix", kind: "prompt", prompt: "fix" };
+  const cond = (extra: Record<string, unknown> = {}) => ({ id: "if1", name: "If", kind: "condition", ref: "steps.gate.structured.choice", op: "equals", value: "fix", thenEnd: "fix", ...extra });
+  const errorsOf = (steps: unknown[]) => {
+    const res = validateFlow({ ...baseFlow, steps });
+    return res.ok ? [] : res.errors;
+  };
+
+  test("accepts a condition comparing the pick with equals / not_equals", () => {
+    expect(errorsOf([gate(), cond(), fix])).toEqual([]);
+    expect(errorsOf([gate(), cond({ op: "not_equals", value: "approve" }), fix])).toEqual([]);
+  });
+
+  test("choice ids are unique and there are 2 to 8 choices", () => {
+    expect(errorsOf([gate({ choices: [choices[0], { id: "approve", label: "Again" }] })])).toContain(`steps.0 (gate).choices[1]: duplicate choice id "approve"`);
+    expect(errorsOf([gate({ choices: [choices[0]] })]).some((e) => e.includes("list at least two choices"))).toBe(true);
+    const many = Array.from({ length: 9 }, (_, i) => ({ id: `c${i}`, label: `C${i}` }));
+    expect(errorsOf([gate({ choices: many })]).some((e) => e.includes("at most 8 choices"))).toBe(true);
+    expect(errorsOf([gate({ choices: [choices[0], { id: "Fix!", label: "Fix" }] })]).length).toBeGreaterThan(0);
+  });
+
+  test("a gate exposes only structured.choice, and only with choices", () => {
+    expect(errorsOf([gate(), cond({ ref: "steps.gate.structured.other", op: "truthy", value: undefined }), fix])[0]).toContain(
+      `intervention "gate" exposes only steps.gate.structured.choice`,
+    );
+    expect(errorsOf([gate({ choices: undefined }), cond({ op: "truthy", value: undefined }), fix])[0]).toContain(`intervention "gate" has no structured output`);
+    const prompt = { id: "after", name: "After", kind: "prompt", prompt: "{{steps.gate.structured}}" };
+    expect(errorsOf([gate(), prompt])[0]).toContain(`intervention "gate" exposes only steps.gate.structured.choice`);
+    expect(errorsOf([gate(), { ...prompt, prompt: "Picked {{steps.gate.structured.choice}}" }])).toEqual([]);
+  });
+
+  test("a condition on the pick compares with a declared choice using equals / not_equals", () => {
+    expect(errorsOf([gate(), cond({ value: "redo" }), fix])).toContain(`steps.1 (if1).value: value "redo" is not a choice of "gate" (approve, fix)`);
+    expect(errorsOf([gate(), cond({ op: "contains" }), fix])).toContain(`steps.1 (if1).op: a choice of "gate" can only be compared with equals or not_equals`);
+  });
+
+  test("a condition cannot read a gate inside a branch that does not contain it", () => {
+    const outer = { id: "if0", name: "If 0", kind: "condition", ref: "inputs.issue.title", op: "truthy", thenEnd: "gate" };
+    const errors = errorsOf([outer, gate(), cond(), fix]);
+    expect(errors[0]).toContain(`references step "gate" inside a branch of condition "if0" that does not contain this step`);
+  });
+
+  test("templateVariables lists the pick of gates with choices", () => {
+    const res = validateFlow({ ...baseFlow, steps: [gate(), { id: "plain", name: "Plain", kind: "intervention" }, fix] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const vars = templateVariables(res.flow, 2);
+    expect(vars).toContainEqual({ path: "steps.gate.structured.choice", description: `Choice picked at "Review" (approve | fix)` });
+    expect(vars.some((v) => v.path.startsWith("steps.plain.structured"))).toBe(false);
+  });
+
+  test("events carry the offered choices and the pick", () => {
+    const base = { runId: "r1", seq: 1, ts: 1, stepId: "gate" };
+    const request = { ...base, type: "intervention.request", payload: { requestId: "q", message: "", sessions: [], choices } };
+    expect(RunEvent.parse(request)).toEqual(request as never);
+    const resolved = { ...base, type: "intervention.resolved", payload: { requestId: "q", action: "continue", choice: "fix" } };
+    expect(RunEvent.parse(resolved)).toEqual(resolved as never);
   });
 });
 

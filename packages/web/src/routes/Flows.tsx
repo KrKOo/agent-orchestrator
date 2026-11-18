@@ -41,7 +41,11 @@ export function Flows() {
                 <td>
                   <Link to={`/flows/${f.id}`}>{f.name}</Link>
                 </td>
-                <td>{f.definition.steps.map((s) => (s.kind === "loop" ? `loop→${s.to}` : s.kind)).join(" → ")}</td>
+                <td>
+                  {f.definition.steps
+                    .map((s) => (s.kind === "loop" ? `loop→${s.to}` : s.kind === "condition" ? `if→${s.thenEnd}` : s.kind))
+                    .join(" → ")}
+                </td>
                 <td className="small">
                   {f.definition.trigger.kind === "github_pull_request"
                     ? `PRs · ${f.definition.trigger.repos.join(", ")}`

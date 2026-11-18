@@ -12,6 +12,10 @@ import {
   type GitHubTokenParams,
   type GitHubTokenResult,
   InterventionAction,
+  type ConditionStep,
+  branchBlocks,
+  conditionBranches,
+  conditionHolds,
   type RunEventDraft,
   type SessionUpdate,
   type RunnerMessage,
@@ -27,6 +31,9 @@ import {
   type LoopStep,
   loopRanges,
   renderTemplate,
+  resolveRef,
+  TemplateError,
+  unwrapUntrustedText,
   type StructuredOutput,
   validateFlow,
 } from "@orch/protocol";
@@ -84,7 +91,8 @@ type StepOutcome = {
   error?: string;
 };
 
-type InterventionAnswer = { action: InterventionAction; session?: string; text?: string };
+/** `choice`: the id picked on a gate with choices (with `continue`). */
+type InterventionAnswer = { action: InterventionAction; session?: string; text?: string; choice?: string };
 
 /** Id of the shared ACP session in an intervention's session list. */
 const AGENT_SESSION = "agent";
@@ -340,8 +348,29 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   // Loop bodies may reference later body steps (`{{steps.<later>.output}}`, the previous pass's value):
   // empty on the first pass.
   for (const [end, start] of ranges) {
-    for (const s of def.steps.slice(start, end)) if (s.kind !== "loop") ctx.steps[s.id] ??= { output: "" };
+    for (const s of def.steps.slice(start, end)) if (s.kind !== "loop" && s.kind !== "condition") ctx.steps[s.id] ??= { output: "" };
   }
+  /** Condition step index → its then/else block ends. */
+  const branches = conditionBranches(def);
+  /** Index of the first step of each else-block → its condition step index. */
+  const elseStarts = new Map<number, number>();
+  for (const [cond, b] of branches) if (b.elseEnd !== undefined) elseStarts.set(b.thenEnd + 1, cond);
+  /** Branch each condition before the cursor took in the prior attempt, from its `structured.branch`. */
+  const recorded = new Map<number, "then" | "else">();
+  for (const prior of resume?.prior ?? []) {
+    const idx = def.steps.findIndex((s) => s.id === prior.stepId);
+    const branch = def.steps[idx]?.kind === "condition" ? (prior.structured as { branch?: unknown } | undefined)?.branch : undefined;
+    if (branch === "then" || branch === "else") recorded.set(idx, branch);
+  }
+  const blocks = branchBlocks(branches);
+  /**
+   * Branch each condition took on its latest evaluation (condition step index → branch). A retry whose cursor
+   * sits past a condition takes the recorded branch, except that a cursor inside a branch ("Run from here" on the
+   * first step of a branch the prior attempt skipped; `RunService.retry` rejects later steps of such a branch)
+   * takes the branch it sits in, so exactly one branch runs.
+   */
+  const taken = new Map(recorded);
+  for (const b of blocks) if (b.start <= fromStepIdx && fromStepIdx <= b.end) taken.set(b.cond, b.branch);
   let status: StepOutcome["status"] = "succeeded";
   let error: string | undefined;
   let workspace: PreparedWorkspace | null = null;
@@ -357,8 +386,13 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /** Whether the current ACP session has been prompted; its first prompt carries the untrusted preamble.
    * A resumed run starts a fresh ACP session (ACP has no conversation resume), so this starts false. */
   let sessionPrompted = false;
-  // `github_pr` requires an earlier `git_push`; on resume a skipped succeeded push counts.
-  let pushed = resume?.prior.some((p) => def.steps.find((step) => step.id === p.stepId)?.kind === "git_push") ?? false;
+  // `github_pr` requires an earlier `git_push`; on resume a done push counts, but not one the prior attempt
+  // skipped because it sits in a condition branch that was not taken (it never ran).
+  let pushed =
+    resume?.prior.some((p) => {
+      const idx = def.steps.findIndex((step) => step.id === p.stepId);
+      return def.steps[idx]?.kind === "git_push" && blocks.every((b) => idx < b.start || idx > b.end || recorded.get(b.cond) === b.branch);
+    }) ?? false;
   /** Sessions an intervention can chat with: `agent` (the ACP session) and `slash:<stepId>` (resumable `omp -p` runs). */
   const sessions = new Map<string, ChatSession>();
   // Chat sessions as of the cursor (the snapshot after the step before it), for interventions past it.
@@ -535,8 +569,10 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   /**
    * Lets the user chat with the run's sessions: each `message` answer sends its text verbatim to the
    * chosen session (replies stream under the gate), then the gate asks again. `continue` passes the
-   * chosen session's latest result on as the gate output. `ask` loop gates also offer `repeat`
-   * (when `repeat` is set): the outcome then carries `repeat: true` and the loop jumps back.
+   * chosen session's latest result on as the gate output. On a gate with `choices`, `continue` must name
+   * one of them: the pick becomes the structured output `{ choice }` that condition steps branch on (a
+   * gate inside a loop asks on every pass). `ask` loop gates also offer `repeat` (when `repeat` is set):
+   * the outcome then carries `repeat: true` and the loop jumps back.
    */
   const runInterventionStep = async (
     step: Extract<Step, { kind: "intervention" }> | LoopStep,
@@ -546,6 +582,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   ): Promise<StepOutcome & { repeat?: true }> => {
     const template = step.kind === "intervention" ? step.message : step.stop.when === "ask" ? step.stop.message : undefined;
     const message = template ? renderTemplate(template, ctx) : "";
+    const choices = step.kind === "intervention" ? step.choices : undefined;
     // Preselect the session that produced the previous step's result.
     const previousSession = previous && isAgentStep(previous) ? AGENT_SESSION : previous?.kind === "slash" ? `slash:${previous.id}` : undefined;
     let selected = previousSession !== undefined && sessions.has(previousSession) ? previousSession : undefined;
@@ -562,6 +599,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
             ...(selected !== undefined ? { session: selected } : {}),
             ...(error !== undefined ? { error } : {}),
             ...(repeat !== undefined ? { repeat } : {}),
+            ...(choices !== undefined ? { choices } : {}),
           },
         },
         step.id,
@@ -574,12 +612,18 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
         // A null answer without a run cancel is the per-wait timeout.
         return !answer && !abort.aborted && waitMs !== undefined ? { status: "failed", error: `No answer within ${step.timeoutSec}s` } : { status: "cancelled" };
       }
-      const { action, session: id = selected, text } = answer as InterventionAnswer;
-      emit({ type: "intervention.resolved", payload: { requestId, action } }, step.id);
+      const { action, session: id = selected, text, choice } = answer as InterventionAnswer;
+      // A `choice` on a gate without choices (or with another action) is ignored; the server rejects it anyway.
+      const picked = action === "continue" ? choices?.find((c) => c.id === choice) : undefined;
+      emit({ type: "intervention.resolved", payload: { requestId, action, ...(picked ? { choice: picked.id } : {}) } }, step.id);
       const chat = id === undefined ? undefined : sessions.get(id);
       if (action === "continue") {
+        if (choices && !picked) {
+          error = `Pick one of: ${choices.map((c) => c.label).join(", ")}.`;
+          continue;
+        }
         emit({ type: "run.status", payload: { status: "running" } });
-        return { status: "succeeded", output: chat?.output ?? "" };
+        return { status: "succeeded", output: chat?.output ?? "", ...(picked ? { structured: { choice: picked.id } } : {}) };
       }
       if (action === "repeat") {
         if (repeat === undefined) {
@@ -761,7 +805,7 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
   };
 
   const runActionStep = async (
-    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" } | { kind: "loop" }>,
+    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" } | { kind: "loop" } | { kind: "condition" }>,
     abort: AbortSignal,
   ): Promise<StepOutcome> => {
     const ws = workspace!;
@@ -823,15 +867,38 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
     return answer.repeat ? repeat : { status: "succeeded", output: `Stopped: continued at iteration ${k} of ${max}` };
   };
 
-  /** `previous` is the last non-loop step that ran before `step` (an intervention gate reviews it). */
-  const runStep = async (step: Step, previous: Step | undefined): Promise<StepOutcome & { repeat?: true }> => {
+  /**
+   * Evaluates condition step `step`: the branch it takes is the outcome's `branch` and its structured
+   * `{ branch }` (a retry past the condition reads it back). An absent value (an optional input left out,
+   * a structured field never submitted) counts as empty / falsy instead of failing the step.
+   */
+  const runConditionStep = (step: ConditionStep): StepOutcome & { branch: "then" | "else" } => {
+    let actual: unknown;
+    try {
+      // PR/issue title and body arrive wrapped in `<untrusted_pr_text>`: compare the text itself. The value
+      // only decides the branch and never reaches a prompt.
+      const value = resolveRef(ctx, step.ref);
+      actual = typeof value === "string" ? unwrapUntrustedText(value) : value;
+    } catch (err) {
+      if (!(err instanceof TemplateError)) throw err;
+    }
+    const branch = conditionHolds(step.op, actual, step.value) ? "then" : "else";
+    const test = `${step.ref} ${step.op}${step.value !== undefined ? ` ${JSON.stringify(step.value)}` : ""}`;
+    const result = branch === "then" ? "true → then branch" : step.elseEnd !== undefined ? "false → else branch" : "false → then branch skipped";
+    const shown = actual === undefined ? "(absent)" : JSON.stringify(actual);
+    const value = shown.length > 200 ? `${shown.slice(0, 200)}…` : shown;
+    return { status: "succeeded", output: `${test}: ${result}\nValue: ${value}`, structured: { branch }, branch };
+  };
+
+  /** `previous` is the last step that ran before `step`, not counting loop and condition steps (an intervention gate reviews it). */
+  const runStep = async (step: Step, previous: Step | undefined): Promise<StepOutcome & { repeat?: true; branch?: "then" | "else" }> => {
     const abort = new AbortController();
     stepAbort = abort;
     let timedOut = false;
     // Gates cap each wait for an answer themselves (revisions run under the reviewed step's timeout);
-    // loop steps decide at once or wait on an `ask` gate; `timeoutSec: 0` runs without a cap.
+    // loop steps decide at once or wait on an `ask` gate, conditions decide at once; `timeoutSec: 0` runs without a cap.
     const timer =
-      step.kind === "intervention" || step.kind === "loop" || step.timeoutSec === 0
+      step.kind === "intervention" || step.kind === "loop" || step.kind === "condition" || step.timeoutSec === 0
         ? undefined
         : setTimeout(() => {
             timedOut = true;
@@ -853,9 +920,11 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
               ? await runInterventionStep(step, previous, abort.signal)
               : step.kind === "loop"
                 ? await runLoopStep(step, previous, abort.signal)
-                : step.kind === "github_comment"
-                  ? await runCommentStep(step, abort.signal)
-                  : await runActionStep(step, abort.signal);
+                : step.kind === "condition"
+                  ? runConditionStep(step)
+                  : step.kind === "github_comment"
+                    ? await runCommentStep(step, abort.signal)
+                    : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };
@@ -985,9 +1054,16 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
         );
       };
-      // The step an intervention gate reviews: the last non-loop step that ran (a gate after a loop
-      // still preselects the session that produced the loop's last result).
-      let lastRan = def.steps.slice(0, fromStepIdx).findLast((s) => s.kind !== "loop");
+      /** Marks the steps `[from, to]` of a branch not taken `skipped`; loops inside it start over when next reached. */
+      const skipBranch = async (from: number, to: number) => {
+        const skipped = def.steps.slice(from, to + 1);
+        for (const s of skipped) emit({ type: "step.finished", payload: { status: "skipped" } }, s.id);
+        resetLoopsIn(from, to + 1);
+        await snapshotSessions(skipped.map((s) => s.id));
+      };
+      // The step an intervention gate reviews: the last step that ran, not counting loop and condition steps
+      // (a gate after a loop still preselects the session that produced the loop's last result).
+      let lastRan = def.steps.slice(0, fromStepIdx).findLast((s) => s.kind !== "loop" && s.kind !== "condition");
 
       let i = fromStepIdx;
       while (i < def.steps.length) {
@@ -996,9 +1072,17 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           status = "cancelled";
           break;
         }
+        // Reaching an else-block whose condition took the then branch: the then-block just ended, skip past the else.
+        const elseOf = elseStarts.get(i);
+        if (elseOf !== undefined && taken.get(elseOf) === "then") {
+          const end = branches.get(elseOf)!.elseEnd!;
+          await skipBranch(i, end);
+          i = end + 1;
+          continue;
+        }
         started(i);
-        const { repeat, ...outcome } = await runStep(step, lastRan);
-        if (step.kind !== "loop") {
+        const { repeat, branch, ...outcome } = await runStep(step, lastRan);
+        if (step.kind !== "loop" && step.kind !== "condition") {
           lastRan = step;
           ctx.steps[step.id] = { output: outcome.output ?? "", ...(outcome.structured !== undefined ? { structured: outcome.structured } : {}) };
         }
@@ -1008,6 +1092,19 @@ export async function runJob(run: AssignedRun, deps: JobDeps, signal: AbortSigna
           status = outcome.status;
           error = outcome.error;
           break;
+        }
+
+        if (step.kind === "condition") {
+          // `rejectReason` validated the flow, so every condition step has its branches.
+          const thenEnd = branches.get(i)!.thenEnd;
+          taken.set(i, branch!);
+          if (branch === "else") {
+            await skipBranch(i + 1, thenEnd);
+            i = thenEnd + 1;
+          } else {
+            i++;
+          }
+          continue;
         }
 
         if (step.kind === "loop") {
@@ -1162,6 +1259,7 @@ export class JobManager {
       action: msg.action,
       ...(msg.session !== undefined ? { session: msg.session } : {}),
       ...(msg.text !== undefined ? { text: msg.text } : {}),
+      ...(msg.choice !== undefined ? { choice: msg.choice } : {}),
     });
   }
 
