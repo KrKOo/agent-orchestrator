@@ -37,7 +37,9 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
 ### Sandbox guarantees
 
 - Per run: `--internal` Docker network; the only route out is a per-run squid proxy (`gateway_only` | `allowlist` | `open`).
-- Run container: `--cap-drop ALL`, `no-new-privileges`, host uid, tmpfs HOME. `.git/hooks` and `.git/config` are mounted read-only over the repo.
+- Run container: `--cap-drop ALL`, `no-new-privileges`, host uid. `$HOME` is a per-run Docker volume
+  (`orch-home-<runId>`, removed with the sandbox and by the runner's startup cleanup); `/tmp` is tmpfs.
+  `.git/hooks` and `.git/config` are mounted read-only over the repo.
 - Model access goes through the host `omp auth-gateway`; the gateway bearer is the only secret in the sandbox.
 - Flow models are picked from the gateway's model list (`/api/catalog`, advertised by online runners) in the
   flow editor; `harness.modelRoles` maps extra omp roles (`slow`, `plan`, `task`, …) to models, with `smol`
@@ -76,10 +78,49 @@ Server config (`ORCH_SERVER_CONFIG`, default `./orch.server.json`; `bun run dev`
   ref; PR-checkout runs always start from a fresh checkout of the PR head. Outputs of skipped steps come back as
   `{{steps.…}}`, and the event transcript continues in one view with continuous sequence numbers even across runner
   restarts. Agent steps resume in a fresh session (ACP has no conversation resume); the sandbox is recreated per
-  attempt, so tmpfs state (`$HOME`, `/tmp`) is not carried over. A retried intervention lists the run's sessions
+  attempt, so `$HOME` and `/tmp` are not carried over. A retried intervention lists the run's sessions
   again: slash sessions continue their earlier conversation, the agent session is a new one that starts from its
   last result.
   Runs that publish a check run get a fresh one for the new attempt.
+
+### Sandbox tooling
+
+`orch/sandbox-omp` (Debian trixie) ships most of what agents need offline:
+
+- Build tools (gcc/g++, make, cmake, autotools, pkg-config, OpenSSL/zlib/libffi/SQLite headers), git + git-lfs,
+  curl/wget, archive tools, ripgrep, fd, jq, yq, sqlite3, shellcheck.
+- Runtimes pinned in `docker/sandbox-omp/mise.toml` and installed with `mise install --system` (read-only, any
+  uid): Node.js LTS + corepack (pnpm/yarn), Bun, Python + uv, Go, cargo-binstall. Rust comes from rustup
+  (minimal profile + clippy, rustfmt) in the read-only `/usr/local/rustup`. Bump a version by editing the pin and
+  running `bun run images`; the build runs every tool as a non-root uid, behind the real entrypoint, and fails on
+  a broken pin.
+
+The agent adds tools into `$HOME` without root (`mise use -g <tool>@<ver>`, `uv tool install`, `npm i -g`,
+`cargo binstall`, `go install`); their bin directories come first on `PATH`. rustup works unchanged: the entrypoint
+seeds a writable `$RUSTUP_HOME` (`~/.rustup`) whose preinstalled toolchain symlinks the image's files, so a
+`rust-toolchain.toml` channel, `rustup toolchain install`, `rustup target add` and `rustup component add` all land
+in `$HOME` (downloads from `static.rust-lang.org`, part of the crates.io preset). The image puts a short guide saying so
+in `~/.omp/agent/AGENTS.md`. `$HOME` is disk-backed so installs don't count against the run's memory limit; the
+volume has no size quota, but it lives only as long as the run's sandbox.
+
+Installing needs network: with the default `gateway_only` nothing outside the model gateway is reachable. In
+`allowlist` mode the flow editor's registry buttons (npm, PyPI, crates.io, Go modules, GitHub releases, mise) add
+the domains each registry downloads from (`NETWORK_PRESETS` in `packages/protocol/src/flow.ts`); the flow still
+stores the plain domain list. In pull request flows that access extends to the PR's build and install scripts. The
+mise `aqua:`/`github:` backends call `api.github.com` unauthenticated (60 requests/hour per IP).
+
+There is no `apt` at runtime. For system packages, build a custom image and set it as the flow's `sandbox.image`:
+
+```dockerfile
+FROM orch/sandbox-omp:latest
+RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev && rm -rf /var/lib/apt/lists/*
+```
+
+The run's `$HOME` volume starts as a copy of the image's `/home/agent`, so every sandbox image needs a
+`/home/agent` that any uid can write (`orch/sandbox-omp` creates it with mode 1777, and images built `FROM` it
+inherit it). After updating a runner to this version, rebuild the images with `bun run images`: older
+`orch/sandbox-omp` builds have no `/home/agent` and fail at sandbox start, with the entrypoint's error in the run.
+Custom images not built from `orch/sandbox-omp` need `RUN mkdir -m 1777 /home/agent`.
 
 ## Public control plane (M2)
 
