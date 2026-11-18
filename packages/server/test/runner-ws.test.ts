@@ -52,6 +52,15 @@ describe("RunnerSession", () => {
     expect(deps.hub.isConnected("r1")).toBe(false);
   });
 
+  test("hello from a runner deleted after authenticating closes the link 4401 without attaching", async () => {
+    const { deps, link, session } = setup();
+    deps.db.delete(schema.runners).where(eq(schema.runners.id, "r1")).run();
+    await session.handle(JSON.stringify(hello));
+    expect(link.closed?.code).toBe(4401);
+    expect(deps.hub.isConnected("r1")).toBe(false);
+    expect(link.of("welcome")).toEqual([]);
+  });
+
   test("ping answers pong and refreshes last_seen_at", async () => {
     const { deps, link, session } = setup();
     deps.db.update(schema.runners).set({ lastSeenAt: 1 }).where(eq(schema.runners.id, "r1")).run();

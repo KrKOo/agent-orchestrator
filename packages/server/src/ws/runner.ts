@@ -137,11 +137,18 @@ export class RunnerSession {
         if (msg.runnerId !== this.runnerId) {
           console.warn(`[runner ${this.runnerId}] hello.runnerId "${msg.runnerId}" differs from the token's runner id`);
         }
-        deps.db
+        const row = deps.db
           .update(runners)
           .set({ capabilities: msg.capabilities, lastSeenAt: Date.now() })
           .where(eq(runners.id, this.runnerId))
-          .run();
+          .returning({ id: runners.id })
+          .all();
+        // The runner was deleted after this socket authenticated: don't let the stale link sit in the hub.
+        if (row.length === 0) {
+          this.close();
+          this.link.close(4401, "unauthorized");
+          return;
+        }
         if (!this.attached) {
           deps.hub.attachRunner(this.runnerId, this.link);
           this.attached = true;
