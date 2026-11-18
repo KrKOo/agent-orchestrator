@@ -18,6 +18,8 @@ import {
   templateVariables,
 } from "@orch/protocol";
 import { useId, useRef } from "react";
+import { ArrowDown, ArrowUp, Plus, TriangleAlert, X } from "lucide-react";
+import { KindIcon } from "./icons";
 
 export const KIND_LABEL: Record<Step["kind"], string> = {
   prompt: "Prompt",
@@ -34,20 +36,6 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   condition: "If…",
 };
 
-export const KIND_ICON: Record<Step["kind"], string> = {
-  prompt: "✉️",
-  skill: "🧠",
-  command: "⌨️",
-  slash: "💬",
-  shell: "🖥️",
-  git_commit: "✅",
-  git_push: "⏫",
-  github_pr: "🚀",
-  intervention: "⏸",
-  github_comment: "📝",
-  loop: "↺",
-  condition: "⑂",
-};
 
 /** Subtitle for a loop stop condition, shared by the step panel and the canvas node. */
 export function loopStopSubtitle(stop: Extract<Step, { kind: "loop" }>["stop"], maxIterations: number): string {
@@ -395,7 +383,9 @@ export function StepPanel({
   return (
     <div className="panel-body">
       <div className="panel-title">
-        <span className="kind-icon">{KIND_ICON[step.kind]}</span>
+        <span className="kind-icon">
+          <KindIcon kind={step.kind} size={15} />
+        </span>
         <div className="panel-title-text">
           <h3>{step.name || "(unnamed step)"}</h3>
           <div className="small muted">
@@ -403,17 +393,18 @@ export function StepPanel({
           </div>
         </div>
         <span className="grow" />
-        <button type="button" className="btn small" disabled={index === 0} onClick={() => onMove(-1)} title="Move up">
-          ↑
+        <button type="button" className="icon-btn" disabled={index === 0} onClick={() => onMove(-1)} title="Move up" aria-label="Move step up">
+          <ArrowUp size={16} aria-hidden />
         </button>
         <button
           type="button"
-          className="btn small"
+          className="icon-btn"
           disabled={index === def.steps.length - 1}
           onClick={() => onMove(1)}
           title="Move down"
+          aria-label="Move step down"
         >
-          ↓
+          <ArrowDown size={16} aria-hidden />
         </button>
         <button type="button" className="btn small danger" disabled={def.steps.length === 1} onClick={onDelete}>
           Delete
@@ -540,10 +531,10 @@ export function StepPanel({
           </p>
           {pullRequestInputOf(def) && (
             <p className="warn-box">
-              ⚠️ This flow runs on untrusted pull requests. The command runs in the PR author's checkout, so
-              anything it executes there (build scripts, tests, package installs, repo binaries) is code they
-              control, with the sandbox's network and gateway access. Template values reach bash as data, but
-              never <code>eval</code> them or pass them to tools that interpret them as code.
+              <TriangleAlert size={14} aria-hidden /> This flow runs on untrusted pull requests. The command runs in
+              the PR author's checkout, so anything it executes there (build scripts, tests, package installs, repo
+              binaries) is code they control, with the sandbox's network and gateway access. Template values reach
+              bash as data, but never <code>eval</code> them or pass them to tools that interpret them as code.
             </p>
           )}
         </>
@@ -587,13 +578,14 @@ export function StepPanel({
                 />
                 <button
                   type="button"
-                  className="btn small danger"
+                  className="icon-btn"
+                  aria-label={`Remove field ${f.name || i + 1}`}
                   onClick={() => {
                     const fields = (step.structured?.fields ?? []).filter((_, j) => j !== i);
                     set({ structured: fields.length ? { fields } : undefined } as Partial<Step>);
                   }}
                 >
-                  ✕
+                  <X size={14} aria-hidden />
                 </button>
               </div>
             ))}
@@ -602,7 +594,7 @@ export function StepPanel({
               className="btn small"
               onClick={() => set({ structured: { fields: [...(step.structured?.fields ?? []), { name: "", description: "" }] } } as Partial<Step>)}
             >
-              + Add field
+              <Plus size={14} aria-hidden /> Add field
             </button>
           </div>
         </>

@@ -6,8 +6,10 @@ import {
   type PullRequestInput,
   type RunDetail,
   RUN_NAME_MAX,
+  RUNS_PAGE_SIZE,
+  RunsQuery,
 } from "@orch/protocol";
-import { and, asc, desc, eq } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import { schema } from "../db";
@@ -149,14 +151,35 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
 
   const app = new Hono();
 
+  /** Newest first, at most `RUNS_PAGE_SIZE` rows; `before` pages on the same `(createdAt, id)` order. */
   app.get("/", (c) => {
-    const flowId = c.req.query("flowId");
+    const parsed = RunsQuery.safeParse(c.req.query());
+    if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
+    const { flowId, status, before, q } = parsed.data;
+    // instr() rather than LIKE: the search text is matched literally, with no `%`/`_` escaping to get wrong.
+    // Both sides go through SQLite's lower() (ASCII-only folding): lowercasing the needle in JS would fold
+    // non-ASCII letters the column side keeps, so e.g. "Échec" could never match itself.
+    const needle = q || undefined;
     const rows = db
       .select()
       .from(runs)
-      .where(flowId ? eq(runs.flowId, flowId) : undefined)
+      .where(
+        and(
+          flowId ? eq(runs.flowId, flowId) : undefined,
+          status ? inArray(runs.status, status) : undefined,
+          before
+            ? or(lt(runs.createdAt, before.createdAt), and(eq(runs.createdAt, before.createdAt), lt(runs.id, before.id)))
+            : undefined,
+          needle
+            ? or(
+                sql`instr(lower(${runs.id}), lower(${needle})) > 0`,
+                sql`instr(lower(coalesce(${runs.name}, '')), lower(${needle})) > 0`,
+              )
+            : undefined,
+        ),
+      )
       .orderBy(desc(runs.createdAt), desc(runs.id))
-      .limit(200)
+      .limit(RUNS_PAGE_SIZE)
       .all();
     return c.json(rows.map(runRow));
   });

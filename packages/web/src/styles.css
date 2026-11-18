@@ -26,6 +26,9 @@
     --user-bubble: light-dark(#e6eefc, #23334d);
     --code-bg: light-dark(#f0f1f3, #262a2f);
     --shadow: 0 8px 30px light-dark(rgba(0, 0, 0, 0.18), rgba(0, 0, 0, 0.5));
+    --shadow-sm: 0 1px 3px light-dark(rgba(0, 0, 0, 0.08), rgba(0, 0, 0, 0.35));
+    --focus-ring: 0 0 0 2px var(--panel), 0 0 0 4px color-mix(in srgb, var(--accent) 70%, transparent);
+    --transition: 120ms ease;
     --overlay: rgba(0, 0, 0, 0.4);
     --on-danger: #ffffff;
     --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -38,11 +41,22 @@
     --radius-sm: 4px;
     --radius-md: 6px;
     --radius-lg: 10px;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
     font-family: var(--font-sans);
     font-size: var(--font-size);
     line-height: 1.45;
     color: var(--text);
     background: var(--bg);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :root {
+      --transition: none;
+    }
   }
 
   /* Flow canvas: xyflow's theme hooks mapped onto ours, so the canvas follows the page theme (no `colorMode`). */
@@ -149,6 +163,22 @@
     outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
     border-color: var(--accent);
   }
+  /* One keyboard focus indicator for every interactive element that isn't a text field. */
+  :is(a, button, [role="tab"], [tabindex], summary):focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+  }
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
 
   /* utilities */
   .muted {
@@ -200,7 +230,7 @@
     font: inherit;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: var(--space-1);
     padding: 5px 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -208,10 +238,17 @@
     color: var(--text);
     cursor: pointer;
     white-space: nowrap;
+    transition:
+      background-color var(--transition),
+      border-color var(--transition),
+      color var(--transition);
   }
   .btn:hover:not(:disabled) {
     border-color: var(--accent);
     text-decoration: none;
+  }
+  .btn:active:not(:disabled) {
+    background: var(--panel-2);
   }
   .btn:disabled,
   .tabs button:disabled {
@@ -223,9 +260,33 @@
     border-color: var(--accent);
     color: var(--accent-text);
   }
+  .btn.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 88%, var(--text));
+  }
+  .btn.primary:active:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 78%, var(--text));
+  }
   .btn.danger {
     color: var(--danger);
     border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+  }
+  .btn.danger:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+  }
+  /* Destructive confirmation (e.g. the confirm dialog's Delete). */
+  .btn.danger.solid {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: var(--on-danger);
+  }
+  .btn.ghost {
+    background: transparent;
+    border-color: transparent;
+  }
+  .btn.ghost:hover:not(:disabled) {
+    background: var(--panel-2);
+    border-color: transparent;
   }
   .btn.small {
     padding: 2px 8px;
@@ -240,9 +301,26 @@
     cursor: pointer;
     padding: 2px 6px;
   }
+  /* Icon-only control: square hit area, always paired with an aria-label. */
   .icon-btn {
-    font-size: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 28px;
+    min-height: 28px;
+    padding: var(--space-1);
+    border-radius: var(--radius-sm);
     line-height: 1;
+    transition:
+      background-color var(--transition),
+      color var(--transition);
+  }
+  .icon-btn:hover:not(:disabled) {
+    background: var(--panel-2);
+  }
+  .icon-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
   .link-btn {
     color: var(--accent);
@@ -253,8 +331,208 @@
     color: var(--text);
   }
 
-  /* chips & tags */
+  /* segmented tabs (ui.tsx Tabs; also plain `.tabs > button` groups) */
+  .tabs {
+    display: flex;
+  }
+  .tabs button {
+    border-radius: 0;
+    padding: 3px 12px;
+  }
+  .tabs button + button {
+    border-left: none;
+  }
+  .tabs button:first-child {
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  }
+  .tabs button:last-child {
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+  .tabs button:only-child {
+    border-radius: var(--radius-sm);
+  }
+  .tabs button.active,
+  .tabs button[aria-selected="true"] {
+    background: var(--panel-2);
+    font-weight: 600;
+    opacity: 1;
+  }
+
+  /* popovers & menus (ui.tsx Popover) */
+  .popover-root {
+    position: relative;
+    display: inline-flex;
+  }
+  .popover {
+    position: absolute;
+    z-index: 50;
+    min-width: 180px;
+    max-width: min(360px, 90vw);
+    padding: var(--space-1);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow);
+  }
+  .popover-below {
+    top: calc(100% + var(--space-1));
+  }
+  .popover-above {
+    bottom: calc(100% + var(--space-1));
+  }
+  .popover-end {
+    right: 0;
+  }
+  .popover-start {
+    left: 0;
+  }
+  .menu-item {
+    font: inherit;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    padding: 6px var(--space-2);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text);
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .menu-item:hover:not(:disabled) {
+    background: var(--panel-2);
+    text-decoration: none;
+  }
+  .menu-item:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .menu-item.danger {
+    color: var(--danger);
+  }
+  .menu-sep {
+    height: 1px;
+    margin: var(--space-1) 0;
+    background: var(--border);
+  }
+
+  /* status glyphs (components/icons.tsx StatusIcon), colored like their chips */
+  .status-icon {
+    flex: none;
+    color: var(--muted);
+  }
+  .status-icon.s-running,
+  .status-icon.s-assigned,
+  .status-icon.s-queued {
+    color: var(--info);
+  }
+  .status-icon.s-succeeded {
+    color: var(--ok);
+  }
+  .status-icon.s-failed {
+    color: var(--danger);
+  }
+  .status-icon.s-awaiting_input,
+  .status-icon.s-awaiting_approval {
+    color: var(--warn);
+  }
+  .spin {
+    animation: orch-spin 1.2s linear infinite;
+  }
+  @keyframes orch-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spin,
+    .skeleton-row {
+      animation: none;
+    }
+  }
+
+  /* empty states & loading skeletons */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-6) var(--space-4);
+    text-align: center;
+    background: var(--panel);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-md);
+  }
+  .empty-state p {
+    margin: 0;
+    max-width: 420px;
+  }
+  .empty-state-icon {
+    color: var(--muted);
+  }
+  .skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) 0;
+  }
+  .skeleton-row {
+    height: 34px;
+    border-radius: var(--radius-sm);
+    background: linear-gradient(90deg, var(--panel-2) 25%, var(--panel) 50%, var(--panel-2) 75%);
+    background-size: 200% 100%;
+    animation: orch-shimmer 1.4s ease-in-out infinite;
+  }
+  @keyframes orch-shimmer {
+    from {
+      background-position: 200% 0;
+    }
+    to {
+      background-position: -200% 0;
+    }
+  }
+
+  /* toasts (components/Toast.tsx) */
+  .toasts {
+    position: fixed;
+    right: var(--space-4);
+    bottom: var(--space-4);
+    z-index: 200;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    width: min(380px, calc(100vw - 2 * var(--space-4)));
+    pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-2) var(--space-2) var(--space-3);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--info);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow);
+    font-size: var(--text-md);
+  }
+  .toast-success {
+    border-left-color: var(--ok);
+  }
+  .toast-error {
+    border-left-color: var(--danger);
+  }
+
+  /*
+   * chips & tags. Text is the tone mixed 70% (tags 75%) toward --text so it clears WCAG AA (4.5:1) on both its
+   * tinted background and --panel/--panel-2 in light and dark; the plain status colors (e.g. light --warn)
+   * are only ~3:1 there. Mix percentages, not tokens, carry the fix so themes keep their palette.
+   */
   .chip {
+    --tone: var(--muted);
     display: inline-block;
     padding: 1px 8px;
     border-radius: var(--radius-lg);
@@ -263,42 +541,39 @@
     text-transform: uppercase;
     letter-spacing: 0.03em;
     background: var(--panel-2);
-    color: var(--muted);
+    color: color-mix(in srgb, var(--tone) 70%, var(--text));
     white-space: nowrap;
   }
   .chip-running,
   .chip-assigned,
-  .chip-tool-in_progress {
-    background: color-mix(in srgb, var(--info) 18%, transparent);
-    color: var(--info);
+  .chip-tool-in_progress,
+  .sev-info {
+    --tone: var(--info);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
   .chip-succeeded,
   .chip-tool-completed {
-    background: color-mix(in srgb, var(--ok) 18%, transparent);
-    color: var(--ok);
+    --tone: var(--ok);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
   .chip-failed,
   .chip-tool-failed,
   .sev-error {
-    background: color-mix(in srgb, var(--danger) 18%, transparent);
-    color: var(--danger);
+    --tone: var(--danger);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
   .chip-awaiting_approval,
   .chip-awaiting_input,
   .sev-warning {
-    background: color-mix(in srgb, var(--warn) 18%, transparent);
-    color: var(--warn);
-  }
-  .sev-info {
-    background: color-mix(in srgb, var(--info) 18%, transparent);
-    color: var(--info);
+    --tone: var(--warn);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
   /* Loops in flows (#29): skipped body step (a value stop fired mid-iteration) — done, but not successful. */
   .chip-skipped {
-    background: color-mix(in srgb, var(--muted) 14%, transparent);
-    color: var(--muted);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
   .tag {
+    --tone: var(--muted);
     display: inline-block;
     margin: 0 4px 0 0;
     padding: 0 6px;
@@ -306,15 +581,15 @@
     font-size: var(--text-xs);
     background: var(--panel-2);
     border: 1px solid var(--border);
-    color: var(--muted);
+    color: color-mix(in srgb, var(--tone) 75%, var(--text));
   }
   .tag.warn {
-    color: var(--warn);
+    --tone: var(--warn);
   }
   .error-tag {
-    color: var(--danger);
-    border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
-    cursor: help;
+    --tone: var(--danger);
+    color: color-mix(in srgb, var(--tone) 75%, var(--text));
+    border-color: color-mix(in srgb, var(--tone) 40%, var(--border));
   }
   .dot {
     display: inline-block;
@@ -329,37 +604,154 @@
     background: var(--muted);
   }
 
-  /* layout */
+  /* app shell: sidebar (full ≥1024px, icon rail 640–1023px, drawer <640px) + scrolling content */
   .app {
     display: flex;
-    flex-direction: column;
-    height: 100vh;
+    height: 100dvh;
   }
-  .topbar {
-    display: flex;
-    align-items: center;
-    gap: 24px;
-    padding: 0 16px;
-    height: 44px;
+  .sidebar {
     flex: none;
+    width: 208px;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-2);
     background: var(--panel);
-    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
   }
   .brand {
-    font-weight: 700;
-  }
-  .topbar nav {
     display: flex;
-    gap: 4px;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-2) var(--space-3);
+    font-weight: 700;
+    color: var(--text);
+    white-space: nowrap;
   }
-  .topbar nav a {
-    padding: 4px 10px;
+  .brand:hover {
+    text-decoration: none;
+  }
+  .brand svg {
+    flex: none;
+    color: var(--accent);
+  }
+  .sidebar-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .nav-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .nav-link {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: 6px var(--space-2);
     border-radius: var(--radius-sm);
     color: var(--muted);
+    transition:
+      background-color var(--transition),
+      color var(--transition);
   }
-  .topbar nav a.active {
+  .nav-link:hover {
     color: var(--text);
     background: var(--panel-2);
+    text-decoration: none;
+  }
+  .nav-link.active {
+    color: var(--text);
+    background: var(--panel-2);
+    font-weight: 600;
+  }
+  .nav-link svg {
+    flex: none;
+  }
+  /* "Needs attention" count beside Runs: its own link (to the filtered list), not nested in the nav link. */
+  .attention-badge {
+    position: absolute;
+    right: var(--space-2);
+    min-width: 20px;
+    padding: 0 6px;
+    border-radius: var(--radius-lg);
+    /* Darkened in light mode so the text clears WCAG AA (plain --warn on white is ~3:1). */
+    background: light-dark(color-mix(in srgb, var(--warn) 70%, black), var(--warn));
+    color: var(--panel);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    line-height: 18px;
+    text-align: center;
+  }
+  .attention-badge:hover {
+    text-decoration: none;
+    filter: brightness(1.1);
+  }
+  .sidebar-foot {
+    margin-top: auto;
+    padding-top: var(--space-2);
+    border-top: 1px solid var(--border);
+  }
+  .sidebar-foot .popover-root {
+    display: flex;
+  }
+  .user-button {
+    font: inherit;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+    padding: 6px var(--space-2);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+    text-align: left;
+  }
+  .user-button:hover {
+    background: var(--panel-2);
+    color: var(--text);
+  }
+  .user-button svg {
+    flex: none;
+  }
+  .user-button .nav-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .user-menu {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    font-size: var(--text-md);
+  }
+  .user-menu-head {
+    padding: var(--space-1) var(--space-2);
+  }
+  .theme-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--space-1) var(--space-2);
+  }
+  .main-col {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  /* Only shown below 640px, where the sidebar becomes a drawer. */
+  .mobile-bar {
+    display: none;
+  }
+  .drawer-backdrop {
+    display: none;
   }
   .content {
     flex: 1;
@@ -367,16 +759,126 @@
     overflow: auto;
   }
   .page {
-    padding: 16px 20px;
+    padding: var(--space-4) var(--space-5);
   }
   .page-header {
     display: flex;
     align-items: center;
-    gap: 12px;
-    margin-bottom: 12px;
+    flex-wrap: wrap;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
   }
-  .page-header h2 {
+  .page-header-text {
     flex: 1;
+    min-width: 0;
+  }
+  .page-subtitle {
+    margin-top: 2px;
+    font-size: var(--text-md);
+  }
+  .page-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+  }
+
+  @media (max-width: 1023px) {
+    .sidebar {
+      width: 56px;
+      align-items: center;
+    }
+    .sidebar .nav-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+    .brand {
+      padding: var(--space-1) 0 var(--space-3);
+    }
+    .nav-link,
+    .user-button {
+      justify-content: center;
+      padding: var(--space-2);
+    }
+    .attention-badge {
+      top: -4px;
+      right: -6px;
+      min-width: 16px;
+      padding: 0 4px;
+      line-height: 16px;
+    }
+    .sidebar-foot .popover {
+      left: 0;
+      right: auto;
+    }
+  }
+
+  @media (max-width: 639px) {
+    .sidebar {
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 90;
+      width: min(260px, 80vw);
+      align-items: stretch;
+      box-shadow: var(--shadow);
+      transform: translateX(-100%);
+      visibility: hidden;
+      transition:
+        transform var(--transition),
+        visibility var(--transition);
+    }
+    .sidebar.open {
+      transform: none;
+      visibility: visible;
+    }
+    .sidebar .nav-label {
+      position: static;
+      width: auto;
+      height: auto;
+      clip-path: none;
+    }
+    .brand {
+      padding: var(--space-1) var(--space-2) var(--space-3);
+    }
+    .nav-link,
+    .user-button {
+      justify-content: flex-start;
+      padding: 6px var(--space-2);
+    }
+    .attention-badge {
+      top: auto;
+      right: var(--space-2);
+    }
+    .drawer-backdrop.open {
+      display: block;
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      background: var(--overlay);
+    }
+    .mobile-bar {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      flex: none;
+      height: 48px;
+      padding: 0 var(--space-2);
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .mobile-bar .brand {
+      padding: 0;
+    }
+    .mobile-bar .attention-badge {
+      position: static;
+    }
+    .page {
+      padding: var(--space-3);
+    }
   }
 
   /* tables */
@@ -416,6 +918,225 @@
   .catalog-list ul {
     margin: 2px 0 6px;
     padding-left: 16px;
+  }
+
+  /* list pages (Runs, Flows): a role=table grid instead of <table>, so each row can be one stretched link
+     (`tr { position: relative }` is unreliable across browsers). */
+  .list {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+  }
+  .list-grid {
+    display: grid;
+    align-items: start;
+    min-width: 0;
+  }
+  /* Column tracks shared by header and rows; both use the same .runs-grid/.flows-grid class. Each row is its own
+     grid, so tracks must not size to content (rows would misalign): the status track fits "awaiting approval". */
+  .runs-grid {
+    grid-template-columns: 156px minmax(0, 1fr) 200px 88px 92px;
+  }
+  .flows-grid {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.4fr) minmax(0, 1.6fr) 210px;
+  }
+  .flows-grid .cell-actions {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: var(--space-1);
+  }
+  /* Meta cell: trigger, workspace, version and updated flow as one inline line, gaps on mobile. */
+  .flows-grid .cell-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+    min-width: 0;
+  }
+  .flows-grid .cell-meta .cell-workspace {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .list-head {
+    border-bottom: 1px solid var(--border);
+    font-size: var(--text-sm);
+    color: var(--muted);
+    font-weight: 600;
+    padding: 7px 10px;
+  }
+  .list-row {
+    position: relative;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border);
+    transition: background-color var(--transition);
+  }
+  .list-row:last-child {
+    border-bottom: none;
+  }
+  .list-row:hover {
+    background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+  }
+  /* The row link's ::after covers the whole row (the row is position:relative); nested links sit above it. */
+  .list-row-link::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+  }
+  /* Nested interactive elements stay clickable above the stretched row link. The row link itself must stay
+     unpositioned: it is the ::after's containing block via the row. */
+  .list-row :is(a, button):not(.list-row-link) {
+    position: relative;
+    z-index: 1;
+  }
+  /* Keyboard focus lights the whole row: the ring is drawn inside the stretched ::after, not around the text. */
+  .list-row-link:focus-visible {
+    outline: none;
+    box-shadow: none;
+  }
+  .list-row-link:focus-visible::after {
+    box-shadow: inset var(--focus-ring);
+  }
+  .list-more {
+    display: flex;
+    justify-content: center;
+    padding: var(--space-3) 0 var(--space-1);
+  }
+  /* Phones: fewer columns (steps drop below the name; the rest becomes one wrapped meta line). */
+  @media (max-width: 639px) {
+    .flows-grid.list-head {
+      display: none;
+    }
+    .flows-grid {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "name actions"
+        "pills actions"
+        "meta meta";
+      row-gap: 3px;
+    }
+    .flows-grid .cell-name {
+      grid-area: name;
+      min-width: 0;
+    }
+    .flows-grid .cell-steps {
+      grid-area: pills;
+    }
+    .flows-grid .cell-meta {
+      grid-area: meta;
+      gap: 2px 12px;
+    }
+    .flows-grid .cell-actions {
+      grid-area: actions;
+      justify-self: end;
+      text-align: right;
+    }
+    .flows-grid .cell-actions .btn {
+      margin-left: 0;
+    }
+    .flows-grid .cell-actions .btn + .btn {
+      margin-left: 4px;
+    }
+  }
+
+  /* runs rows */
+  .cell-status {
+    padding-top: 1px;
+  }
+  .cell-name {
+    min-width: 0;
+  }
+  .cell-name .list-row-link {
+    display: inline-block;
+    max-width: 100%;
+  }
+  .cell-refs {
+    display: flex;
+    flex-direction: column;
+    align-items: start;
+    gap: 2px;
+  }
+  .cell-sub .cell-flow {
+    color: var(--muted);
+  }
+  .cell-sub .cell-flow:hover {
+    color: var(--text);
+  }
+  .cell-error {
+    color: var(--danger);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .cell-duration,
+  .cell-created {
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .cell-trigger {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .runs-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-bottom: var(--space-3);
+  }
+  .runs-search {
+    width: min(260px, 100%);
+  }
+  /* Five status tabs: tighter on phones, and scroll rather than overflow the page on very narrow screens. */
+  .runs-toolbar .tabs {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  @media (max-width: 639px) {
+    .runs-toolbar .tabs button {
+      padding: 3px 8px;
+    }
+  }
+  .runs-note {
+    margin: 0 0 var(--space-3);
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+  /* Phones: two lines (status+name, then a meta line) instead of five columns; no horizontal scroll. */
+  @media (max-width: 639px) {
+    .runs-grid.list-head {
+      display: none;
+    }
+    .runs-grid.list-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 3px 12px;
+    }
+    .runs-grid .cell-name {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    /* Full-width break before the meta cells (trigger, created, duration), which follow it inline. */
+    .runs-grid.list-row::before {
+      content: "";
+      flex-basis: 100%;
+      order: 1;
+    }
+    .runs-grid > .cell-trigger,
+    .runs-grid > .cell-created,
+    .runs-grid > .cell-duration {
+      order: 2;
+      width: auto;
+    }
+    .runs-grid .cell-error {
+      max-width: 100%;
+    }
   }
 
   /* forms */
@@ -469,10 +1190,15 @@
   .warn-box {
     margin: 0 0 10px;
     padding: 6px 10px;
-    color: var(--warn);
+    color: color-mix(in srgb, var(--warn) 70%, var(--text));
     background: color-mix(in srgb, var(--warn) 10%, transparent);
     border-radius: var(--radius-sm);
     font-size: var(--text-sm);
+  }
+  .warn-box svg {
+    flex: none;
+    vertical-align: -2px;
+    margin-right: 2px;
   }
 
   /* collapsible */
@@ -521,7 +1247,7 @@
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow);
     width: min(520px, 94vw);
-    max-height: 86vh;
+    max-height: 86dvh;
     display: flex;
     flex-direction: column;
   }
@@ -547,6 +1273,23 @@
   .modal-body {
     padding: 14px;
     overflow: auto;
+  }
+  .modal:focus {
+    outline: none;
+  }
+  /* Phones: dialogs become a full-screen sheet with the footer pinned at the bottom. */
+  @media (max-width: 639px) {
+    .modal,
+    .modal-wide {
+      width: 100vw;
+      height: 100dvh;
+      max-height: none;
+      border: none;
+      border-radius: 0;
+    }
+    .modal-body {
+      flex: 1;
+    }
   }
   .scroll-pre {
     max-height: 240px;
@@ -591,39 +1334,35 @@
   .editor-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
+    row-gap: 6px;
     padding: 8px 16px;
     background: var(--panel);
     border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
   }
   .title-input {
     font-size: 16px;
     font-weight: 600;
     border-color: transparent;
     background: transparent;
-    width: 280px;
+    /* Shrink with the viewport so the header wraps instead of overflowing at phone widths. */
+    width: min(280px, 100%);
+  }
+  @media (max-width: 639px) {
+    .title-input {
+      flex: 1 1 100%;
+      width: auto;
+    }
   }
   .title-input:hover {
     border-color: var(--border);
   }
-  .tabs {
-    display: flex;
+  .editor-header .tabs {
+    flex: none;
   }
-  .tabs button {
-    border-radius: 0;
-    padding: 3px 12px;
-  }
-  .tabs button:first-child {
-    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
-  }
-  .tabs button:last-child {
-    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-    border-left: none;
-  }
-  .tabs button.active {
-    background: var(--panel-2);
-    font-weight: 600;
-    opacity: 1;
+  .editor-header .grow {
+    min-width: 0;
   }
   .editor-body {
     flex: 1;
@@ -635,14 +1374,93 @@
     min-width: 0;
   }
   .side-panel {
+    position: relative;
     width: 440px;
     flex: none;
     border-left: 1px solid var(--border);
     background: var(--panel);
     overflow: auto;
   }
+  /* Drag handle on the panel's left edge: 8px strip just inside it (the panel's overflow clips outside). */
+  .panel-resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 8px;
+    border: none;
+    background: none;
+    padding: 0;
+    cursor: col-resize;
+    touch-action: none;
+    z-index: 2;
+  }
+  .panel-resize:hover,
+  .panel-resize:focus-visible {
+    background: color-mix(in srgb, var(--accent) 35%, transparent);
+    outline: none;
+    box-shadow: var(--focus-ring);
+  }
+  /* Below 1024px the panel overlays the canvas as a drawer; hidden unless something is selected. */
+  .flow-drawer-backdrop {
+    display: none;
+  }
+  @media (max-width: 1023px) {
+    .editor-body {
+      position: relative;
+    }
+    .flow-drawer-backdrop.open {
+      display: block;
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      border: none;
+      background: var(--overlay);
+      cursor: default;
+    }
+    .side-panel {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      right: 0;
+      z-index: 4;
+      max-width: min(440px, 88vw);
+      box-shadow: var(--shadow);
+      transform: translateX(100%);
+      visibility: hidden;
+      transition:
+        transform var(--transition),
+        visibility var(--transition);
+    }
+    .side-panel.panel-open {
+      transform: none;
+      visibility: visible;
+    }
+    .panel-resize {
+      display: none;
+    }
+    /* Room for the drawer's close button in the top-right corner. */
+    .side-panel .panel-title {
+      padding-right: 32px;
+    }
+  }
   .panel-body {
     padding: 12px 14px;
+    /* Keep content clear of the resize handle strip on the panel's left edge. */
+    padding-left: 16px;
+  }
+  /* Drawer-only close button (top-right corner); invisible on wide screens where the panel is docked. */
+  .panel-close {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 2;
+    background: var(--panel);
+  }
+  @media (min-width: 1024px) {
+    .panel-close {
+      display: none;
+    }
   }
   .panel-title {
     display: flex;
@@ -660,6 +1478,10 @@
     border-radius: var(--radius-md);
     background: var(--panel-2);
     font-size: var(--text-md);
+    color: var(--muted);
+  }
+  .kind-icon .kind-glyph {
+    color: var(--text);
   }
   .json-editor {
     flex: 1;
@@ -763,24 +1585,69 @@
   .insert-btn {
     position: absolute;
     pointer-events: all;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 22px;
     height: 22px;
+    padding: 0;
     border-radius: 50%;
     border: 1px solid var(--border);
     background: var(--panel);
     color: var(--muted);
-    font-size: 15px;
-    line-height: 1;
     cursor: pointer;
   }
   .insert-btn:hover {
     border-color: var(--accent);
     color: var(--accent);
   }
+  /* Header tag that opens the validation-issues popover (also a .popover-root button). */
+  .issues-btn {
+    font: inherit;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .issues-menu {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 300px;
+    max-width: min(460px, 88vw);
+    max-height: 60vh;
+    overflow: auto;
+  }
+  .issues-menu-title {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    padding: 2px var(--space-2) var(--space-1);
+  }
+  .issues-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    white-space: normal;
+    padding: 5px var(--space-2);
+  }
+  .issues-item-target {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--text);
+  }
+  .issues-item-text {
+    color: var(--danger);
+  }
   .kind-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
+    margin-top: 10px;
+  }
+  .kind-grid-empty {
+    margin: 10px 0 0;
   }
   .kind-card {
     font: inherit;
@@ -810,32 +1677,71 @@
     flex-direction: column;
     height: 100%;
   }
+  /* Compact sticky header (one row + one sub line): replaces the old 40vh self-scrolling header. */
   .run-header {
-    padding: 10px 16px;
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    flex: none;
+    padding: var(--space-2) var(--space-4);
     background: var(--panel);
     border-bottom: 1px solid var(--border);
-    max-height: 40vh;
-    overflow: auto;
+  }
+  .run-header-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-3);
+    min-width: 0;
+  }
+  .run-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .run-title-refs {
+    min-width: 0;
+  }
+  .run-id {
     flex: none;
   }
-  .run-meta {
+  .run-header-sub {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 18px;
-    color: var(--muted);
-    margin-top: 4px;
+    gap: var(--space-1) var(--space-4);
+    margin-top: 2px;
   }
   .run-body {
     flex: 1;
     min-height: 0;
     display: flex;
+    position: relative;
   }
-  .step-list {
+  .step-list-wrap {
     width: 280px;
     flex: none;
     border-right: 1px solid var(--border);
-    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .step-list-toolbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding: var(--space-1) var(--space-2);
+    border-bottom: 1px solid var(--border);
+  }
+  .step-list-title {
+    margin: 0;
+  }
+  .step-list {
+    flex: 1;
+    min-height: 0;
     overflow: auto;
+    padding: var(--space-2);
     display: flex;
     flex-direction: column;
     gap: 2px;
@@ -895,15 +1801,6 @@
     font-size: var(--text-xs);
     min-width: 0;
   }
-  /* Per-step "Run from here" action shown on failed runs. */
-  .step-retry {
-    flex: none;
-    padding: 2px 7px;
-    font-size: var(--text-xs);
-  }
-  .step-retry:hover {
-    border-color: var(--border);
-  }
   .step-header {
     position: sticky;
     /* Sticky offsets start inside .run-main's 12px top padding; -12px closes that gap (matches the margin). */
@@ -918,7 +1815,7 @@
     background: var(--bg);
     border-bottom: 1px solid var(--border);
   }
-  /* Step pane: scrolling transcript, plus an intervention composer docked below it when one is open. */
+  /* Step pane: tabs above, scrolling transcript, docked request panels below the scroll area. */
   .run-pane {
     flex: 1;
     min-width: 0;
@@ -926,12 +1823,51 @@
     display: flex;
     flex-direction: column;
   }
+  .run-pane-toolbar {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  /* Step picker for <640px (the drawer list is hidden there); hidden on wider screens. */
+  .step-select {
+    display: none;
+    max-width: 200px;
+    min-width: 0;
+  }
   .run-main {
     flex: 1;
     min-width: 0;
     min-height: 0;
     overflow: auto;
     padding: 12px 20px 40px;
+    position: relative;
+  }
+  /* Shown only while the user has scrolled up: floating above the transcript, bottom center. */
+  .jump-latest-wrap {
+    position: sticky;
+    bottom: var(--space-3);
+    display: flex;
+    justify-content: center;
+    z-index: 3;
+    pointer-events: none;
+  }
+  .jump-latest {
+    pointer-events: auto;
+    padding: var(--space-2) var(--space-4);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel);
+    color: var(--accent);
+    box-shadow: var(--shadow-sm);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .jump-latest:hover {
+    border-color: var(--accent);
   }
   .transcript {
     display: flex;
@@ -1002,12 +1938,18 @@
     margin: 4px 0 0;
     padding: 0;
   }
+  .plan li {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
   .plan-completed {
     color: var(--muted);
     text-decoration: line-through;
   }
   .plan-mark {
-    font-family: var(--font-mono);
+    display: inline-flex;
+    flex: none;
   }
   .other-update {
     color: var(--muted);
@@ -1095,6 +2037,93 @@
     max-height: none;
     background: none;
   }
+  /* Dismissible run error between header and body. */
+  .error-callout {
+    flex: none;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    color: var(--danger);
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  }
+  .error-callout-text {
+    flex: 1;
+    min-width: 0;
+    font-size: var(--text-md);
+  }
+  .error-callout .icon-btn {
+    color: var(--danger);
+  }
+  /* Warning banner for any pending request; clicking jumps to the asking step. */
+  .request-banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    padding: var(--space-2) var(--space-4);
+    border: none;
+    border-bottom: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border));
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    color: color-mix(in srgb, var(--warn) 70%, var(--text)); /* plain --warn is ~3:1 on the tint in light mode */
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+  }
+  .request-banner:hover {
+    background: color-mix(in srgb, var(--warn) 22%, transparent);
+  }
+  /* Details side panel: a right column of the run body ≥1024px, an overlay drawer below it. */
+  .run-details {
+    flex: none;
+    width: 320px;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+  }
+  .run-details-head {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--border);
+  }
+  .run-details-head h3 {
+    margin: 0;
+  }
+  .run-details-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .detail-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    min-width: 0;
+  }
+  .detail-row .mono {
+    word-break: break-all;
+  }
+  .detail-label {
+    font-size: var(--text-xs);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
   /* intervention chat: the reviewer note scrolls with the transcript; the composer is docked below the pane */
   .intervention-note {
     max-width: 980px;
@@ -1142,6 +2171,32 @@
     width: 100%;
     box-sizing: border-box;
   }
+  /* Docked pending-request panels share the composer's slot and chrome. */
+  .request-panel {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    max-height: 60vh;
+    overflow: auto;
+    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .request-panel-head {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: color-mix(in srgb, var(--warn) 70%, var(--text));
+  }
+  .request-panel-text {
+    margin: 0;
+  }
+  .request-panel .scroll-pre,
+  .request-panel pre {
+    max-height: 160px;
+    margin: 0;
+  }
   .diagnostics {
     margin-top: 16px;
     max-width: 980px;
@@ -1153,6 +2208,90 @@
     color: var(--danger);
   }
 
+  /* Steps drawer: opened from the pane toolbar between 640 and 1023px; a fixed column on wider screens. */
+  .step-list-open {
+    display: none;
+  }
+  @media (max-width: 1023px) {
+    .step-list-wrap {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      z-index: 4;
+      width: min(320px, 80vw);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      transform: translateX(-100%);
+      visibility: hidden;
+      transition:
+        transform var(--transition),
+        visibility var(--transition);
+    }
+    .step-list-wrap.open {
+      transform: none;
+      visibility: visible;
+    }
+    .step-list-open {
+      display: inline-flex;
+    }
+    .step-list-backdrop {
+      position: absolute;
+      inset: 0;
+      z-index: 3;
+      background: var(--overlay);
+    }
+    .run-details {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 6;
+      max-width: 90vw;
+      box-shadow: var(--shadow);
+    }
+  }
+  @media (min-width: 1024px) {
+    .step-list-close {
+      display: none;
+    }
+  }
+  @media (max-width: 639px) {
+    /* Below 640px the step list is a native select above the pane. */
+    .step-list-wrap,
+    .step-list-backdrop,
+    .step-list-open {
+      display: none;
+    }
+    .step-select {
+      display: block;
+      flex: 1 1 100%;
+    }
+    .run-pane-toolbar {
+      flex-wrap: wrap;
+      padding: var(--space-2);
+    }
+    .run-pane-toolbar .tabs {
+      order: 1;
+    }
+    .run-main {
+      padding: var(--space-3) var(--space-3) 40px;
+    }
+    .step-header {
+      margin: -12px 0 12px;
+      padding: 12px 0 8px;
+    }
+    .request-banner,
+    .error-callout {
+      padding: var(--space-2);
+    }
+    .request-panel,
+    .intervention-composer {
+      padding: var(--space-2) var(--space-3);
+    }
+  }
+
+  /* step ids & template variables */
   /* step ids & template variables */
   .step-id {
     flex: none;
@@ -1221,14 +2360,132 @@
     white-space: nowrap;
   }
 
+  /* list pages: flow step pills and runner cards (Flows/Runners lists) */
+  .step-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .step-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 22px;
+    height: 22px;
+    padding: 0 4px;
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    color: var(--muted);
+    font-size: var(--text-xs);
+    cursor: default;
+  }
+  .step-pill .kind-glyph {
+    color: var(--muted);
+  }
+  .step-pill-more {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .runner-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: var(--space-3);
+  }
+  .runner-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+  }
+  .runner-card-head {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+  .runner-name {
+    flex: 1;
+    min-width: 0;
+  }
+  .runner-name strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .runner-state {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 600;
+    padding-top: 2px;
+  }
+  .runner-state.on {
+    color: var(--ok);
+  }
+  .runner-state.off {
+    color: var(--muted);
+  }
+  .runner-facts {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-1) var(--space-3);
+  }
+  .runner-fact {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .runner-fact-label {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+  }
+  .runner-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+  }
+  /* The runners table was dropped; tags carry their old margin, so zero it inside the flex row. */
+  .runner-tags .tag {
+    margin: 0;
+  }
+  .runner-jobs {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+  .runner-jobs .runner-fact-label {
+    flex: none;
+  }
+  .runner-jobs-bar {
+    flex: 1;
+    height: 6px;
+    border-radius: var(--radius-lg);
+    background: var(--panel-2);
+    overflow: hidden;
+  }
+  .runner-jobs-fill {
+    display: block;
+    height: 100%;
+    border-radius: var(--radius-lg);
+    background: var(--accent);
+    transition: width var(--transition);
+  }
+  .runner-jobs .mono {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+  }
+
   /* M2/M3 additions */
-  .user-menu,
-  .theme-picker {
-    font-size: var(--text-md);
-  }
-  .theme-picker select {
-    padding: 2px 4px;
-  }
   .hint-list {
     margin: 0 0 8px;
     padding-left: 18px;
@@ -1243,18 +2500,8 @@
   .run-name {
     font-weight: 600;
   }
-  .token-panel {
-    margin-bottom: 16px;
-    padding: 10px 12px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-  }
-  .token-form input {
-    min-width: 220px;
-  }
+  /* Result view of the add-runner modal: copy fields plus the runner.json snippet. */
   .token-result {
-    margin-top: 10px;
     max-width: 720px;
   }
   .token-snippet {
@@ -1287,8 +2534,8 @@
   .iteration-divider {
     display: flex;
     align-items: center;
-    gap: 8px;
-    margin: 10px 0 6px;
+    gap: var(--space-2);
+    margin: var(--space-3) 0 var(--space-2);
     color: var(--muted);
     font-size: var(--text-sm);
     text-transform: uppercase;

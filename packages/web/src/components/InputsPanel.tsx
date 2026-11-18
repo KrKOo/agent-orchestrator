@@ -11,6 +11,7 @@ import {
   pullRequestInputOf,
 } from "@orch/protocol";
 import { useEffect, useState } from "react";
+import { Plus, Settings2, X } from "lucide-react";
 import { PathPicker } from "./PathPicker";
 
 export const DEFAULT_LOCAL_WORKSPACE: LocalPathWorkspace = {
@@ -117,7 +118,9 @@ export function InputsPanel({
   return (
     <div className="panel-body">
       <div className="panel-title">
-        <span className="kind-icon">⚙</span>
+        <span className="kind-icon">
+          <Settings2 size={15} aria-hidden />
+        </span>
         <h3>Trigger, Inputs &amp; Workspace</h3>
       </div>
       {errors.length > 0 && (
@@ -245,7 +248,7 @@ export function InputsPanel({
                   aria-label="Remove input"
                   onClick={() => setInputs(def.inputs.filter((_, n) => n !== idx))}
                 >
-                  ×
+                  <X size={14} aria-hidden />
                 </button>
               </div>
               {isPr && (
@@ -265,7 +268,7 @@ export function InputsPanel({
             setInputs([...def.inputs, { key: `input_${def.inputs.length + 1}`, label: "", type: "text", required: true }])
           }
         >
-          + Add input
+          <Plus size={14} aria-hidden /> Add input
         </button>
       </section>
 
@@ -556,7 +559,7 @@ function ModelRolesEditor({
             )}
             <ModelSelect label="" value={model} models={models} onChange={(m) => setModel(idx, m)} />
             <button type="button" className="icon-btn" aria-label={`Remove ${role || "role"}`} onClick={() => remove(idx)}>
-              ×
+              <X size={14} aria-hidden />
             </button>
           </div>
         );
@@ -567,7 +570,7 @@ function ModelRolesEditor({
           className="btn small"
           onClick={() => onChange({ ...roles, [nextFreeRole(roles)]: models[0]?.id ?? "provider/model" })}
         >
-          + Add model role
+          <Plus size={14} aria-hidden /> Add model role
         </button>
       </div>
     </div>

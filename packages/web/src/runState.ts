@@ -223,6 +223,22 @@ function resetAttempt(st: StepView, status: StepStatus): StepView {
   return { ...st, status, output: undefined, structured: undefined, error: undefined };
 }
 
+/**
+ * Marks every open request resolved. A run that ends while one waits (cancel, runner lost) emits no
+ * per-request *_resolved event, and the runner drops answers to it, so it must not stay answerable,
+ * least of all into the next retry's attempt.
+ */
+function settleRequests(state: RunViewState): RunViewState {
+  const settle = <T extends { resolved: boolean }>(list: T[]): T[] =>
+    list.some((r) => !r.resolved) ? list.map((r) => (r.resolved ? r : { ...r, resolved: true })) : list;
+  return {
+    ...state,
+    permissions: settle(state.permissions),
+    elicitations: settle(state.elicitations),
+    interventions: settle(state.interventions),
+  };
+}
+
 /** A retry reset `fromStepId` and every step after it to pending. */
 function resetFrom(state: RunViewState, fromStepId: string): RunViewState {
   const idx = state.stepOrder.indexOf(fromStepId);
@@ -252,13 +268,15 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
   const s: RunViewState = { ...state, lastSeq: ev.seq };
   switch (ev.type) {
     case "run.status": {
+      const terminal = TERMINAL_STATUSES.includes(ev.payload.status);
       // A retried run re-enters a non-terminal status: the previous attempt's error no longer applies.
-      const error = TERMINAL_STATUSES.includes(ev.payload.status) ? (ev.payload.error ?? s.error) : undefined;
+      const error = terminal ? (ev.payload.error ?? s.error) : undefined;
       const from = ev.payload.resumeFromStepId;
       // Retry rewinds loop steps too (the runner restarts their counters), so drop the stale badges.
       const loops = from === undefined ? s.loops : resetLoopsFrom(s, from);
+      const base = terminal ? settleRequests(s) : s;
       return {
-        ...(from === undefined ? s : resetFrom(s, from)),
+        ...(from === undefined ? base : resetFrom(base, from)),
         loops,
         status: ev.payload.status,
         error,

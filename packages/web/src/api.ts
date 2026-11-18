@@ -12,6 +12,7 @@ import type {
   RunEvent,
   RunnerRow,
   RunRow,
+  RunStatus,
   ThemesResponse,
 } from "@orch/protocol";
 
@@ -73,7 +74,16 @@ export const api = {
   startRun: (flowId: string, inputs: Record<string, string>, opts?: { name?: string; autoName?: boolean }) =>
     request<RunRow>("POST", `/api/flows/${enc(flowId)}/runs`, { inputs, ...opts }),
 
-  listRuns: (flowId?: string) => request<RunRow[]>("GET", `/api/runs${flowId ? `?flowId=${enc(flowId)}` : ""}`),
+  /** One page of runs, newest first (`RUNS_PAGE_SIZE` max); `before` is the previous page's `runsCursor`. */
+  listRuns: (query: { flowId?: string; status?: readonly RunStatus[]; q?: string; before?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (query.flowId) params.set("flowId", query.flowId);
+    if (query.status?.length) params.set("status", query.status.join(","));
+    if (query.q) params.set("q", query.q);
+    if (query.before) params.set("before", query.before);
+    const qs = params.toString();
+    return request<RunRow[]>("GET", `/api/runs${qs ? `?${qs}` : ""}`);
+  },
   getRun: (id: string) => request<RunDetail>("GET", `/api/runs/${enc(id)}`),
   getRunEvents: (id: string, afterSeq = 0) =>
     request<RunEvent[]>("GET", `/api/runs/${enc(id)}/events?afterSeq=${afterSeq}`),

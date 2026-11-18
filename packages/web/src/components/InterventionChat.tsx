@@ -39,6 +39,8 @@ export function InterventionComposer({
   /** Definition of the run, to spell out what a `repeat` answers to (falls back to the step id). */
   steps,
   awaiting,
+  /** Name of the step being chatted with, shown when the composer docks for a non-selected step. */
+  stepName,
   onPick,
   onSubmitted,
 }: {
@@ -51,6 +53,7 @@ export function InterventionComposer({
   steps: Step[];
   /** The request is open (no reply is streaming and it was not answered from here). */
   awaiting: boolean;
+  stepName?: string;
   onPick: (sessionId: string) => void;
   onSubmitted: (requestId: string) => void;
 }) {
@@ -83,6 +86,11 @@ export function InterventionComposer({
 
   return (
     <div className="intervention-composer">
+      {stepName && (
+        <div className="composer-step-label small muted">
+          step <strong>{stepName}</strong>
+        </div>
+      )}
       {request.error && <p className="error">{request.error}</p>}
       {error && <p className="error">{error}</p>}
       {request.sessions.length === 0 ? (

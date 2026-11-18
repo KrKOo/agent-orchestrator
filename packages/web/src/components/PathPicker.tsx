@@ -1,7 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { ArrowUp, Folder } from "lucide-react";
 import { useState } from "react";
 import { api, errorMessage } from "../api";
-import { Modal } from "../ui";
+import { Modal, Skeleton } from "../ui";
 
 /** Browses directories on an online runner (`fs.list` relayed by the server) and picks one. */
 export function PathPicker({
@@ -74,19 +75,19 @@ export function PathPicker({
           </select>
         </label>
         <button type="button" className="btn small" disabled={path === ""} onClick={goUp}>
-          ↑ Up
+          <ArrowUp size={14} aria-hidden /> Up
         </button>
       </div>
       {runners.error && <p className="error">{errorMessage(runners.error)}</p>}
       {listing.error && <p className="error">{errorMessage(listing.error)}</p>}
-      {listing.isLoading && <p className="muted">Loading…</p>}
+      {listing.isLoading && <Skeleton rows={4} />}
       {listing.data && (
         <ul className="fs-list">
           {listing.data.entries.length === 0 && <li className="muted">No subdirectories.</li>}
           {listing.data.entries.map((e) => (
             <li key={e.path}>
               <button type="button" className="link-btn" onClick={() => setPath(e.path)}>
-                <span className="folder">▸</span> {path === "" ? e.path : e.name}
+                <Folder size={14} aria-hidden className="folder" /> {path === "" ? e.path : e.name}
               </button>
               {e.isGitRepo && <span className="tag">git</span>}
             </li>
