@@ -1,4 +1,8 @@
 import {
+  branchBlocks,
+  choiceGateOf,
+  conditionBranches,
+  type ConditionStep,
   type FlowDefinition,
   type FlowRow,
   isAgentStep,
@@ -9,6 +13,7 @@ import {
   type Step,
   STEP_KINDS,
   type StepKind,
+  templateVariables,
   validateFlow,
 } from "@orch/protocol";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -29,7 +34,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ApiRequestError, api, errorMessage } from "../api";
 import { DEFAULT_LOCAL_WORKSPACE, InputsPanel } from "../components/InputsPanel";
-import { KIND_ICON, KIND_LABEL, loopStopSubtitle, StepPanel } from "../components/StepPanel";
+import { KIND_ICON, KIND_LABEL, conditionSubtitle, loopStopSubtitle, StepPanel } from "../components/StepPanel";
 import { Modal } from "../ui";
 
 const NEW_FLOW: FlowDefinition = {
@@ -50,8 +55,34 @@ const NEW_FLOW: FlowDefinition = {
   steps: [{ id: "prompt_1", kind: "prompt", name: "Prompt", prompt: "", freshSession: false, timeoutSec: 1800 }],
 };
 
-function newStep(kind: StepKind, id: string, earlier: Step[], inputs: FlowDefinition["inputs"]): Step {
+/**
+ * A new If… step inserted at `at`: it compares the last value available there and ends its then-block at the
+ * first later step that adds no validation error (nested in enclosing branches, not crossing a loop body, later
+ * refs still valid). Without such a step `thenEnd` names the condition itself, an ordinary "must be a later step"
+ * error instead of a schema failure that would hide the flow's other errors.
+ */
+function newCondition(def: FlowDefinition, id: string, at: number): ConditionStep {
+  const withStep = (step: ConditionStep): FlowDefinition => ({ ...def, steps: [...def.steps.slice(0, at), step, ...def.steps.slice(at)] });
+  const errorCount = (step: ConditionStep): number => {
+    const res = validateFlow(withStep(step));
+    return res.ok ? 0 : res.errors.length;
+  };
+  let step: ConditionStep = { id, name: "If", kind: "condition", ref: "inputs", op: "truthy", thenEnd: id };
+  const ref = templateVariables(withStep(step), at).at(-1)?.path;
+  if (ref) {
+    // A choice gate compares with equals against one of its choice ids.
+    const gate = choiceGateOf(def, ref);
+    step = { ...step, ref, ...(gate ? { op: "equals" as const, value: gate.choices![0]!.id } : {}) };
+  }
+  const baseline = errorCount(step);
+  const thenEnd = def.steps.slice(at).find((s) => errorCount({ ...step, thenEnd: s.id }) < baseline)?.id;
+  return thenEnd ? { ...step, thenEnd } : step;
+}
+
+function newStep(kind: StepKind, id: string, def: FlowDefinition, at: number): Step {
   const base = { id, name: KIND_LABEL[kind], timeoutSec: 1800 };
+  const earlier = def.steps.slice(0, at);
+  const inputs = def.inputs;
   const lastAgent = earlier.filter(isAgentStep).at(-1)?.id ?? "";
   switch (kind) {
     case "prompt":
@@ -86,6 +117,8 @@ function newStep(kind: StepKind, id: string, earlier: Step[], inputs: FlowDefini
         stop: { when: "max" },
         onExhausted: "continue",
       };
+    case "condition":
+      return newCondition(def, id, at);
   }
 }
 
@@ -123,6 +156,8 @@ interface ChainNodeData extends Record<string, unknown> {
   selected: boolean;
   /** Loop step: rendered compact, with the handle its back-edge leaves from. */
   loop?: boolean;
+  /** Condition branch this step sits in: a small tag in the node head. */
+  branch?: "then" | "else";
 }
 type ChainNode = Node<ChainNodeData, "chain">;
 
@@ -148,6 +183,11 @@ function ChainNodeView({ data }: NodeProps<ChainNode>) {
           {data.stepId !== undefined && (
             <span className="step-id" title="Step id">
               {data.stepId || "(no id)"}
+            </span>
+          )}
+          {data.branch && (
+            <span className="tag branch-tag" title={`Step of the ${data.branch} branch of the condition above`}>
+              {data.branch}
             </span>
           )}
         </div>
@@ -218,6 +258,8 @@ const LOOP_NODE_WIDTH = 240;
 const ROW = 110;
 /** Horizontal spacing between nested loops' back-arrows. */
 const LOOP_EDGE_STEP = 22;
+/** Indent per branch nesting level: steps inside a condition's branch sit this far to the right. */
+const BRANCH_INDENT = 70;
 
 /**
  * Nesting height per loop step index: 1 for loops with no loop inside their body, else one more than the
@@ -242,7 +284,7 @@ function settingsSubtitle(def: FlowDefinition): string {
   return def.workspace.kind === "local_path" ? def.workspace.path || "(choose a workspace path)" : "manual";
 }
 
-function stepSubtitle(step: Step): string {
+function stepSubtitle(step: Step, def: FlowDefinition): string {
   switch (step.kind) {
     case "prompt":
       return step.prompt.split("\n")[0] || "(empty prompt)";
@@ -261,11 +303,13 @@ function stepSubtitle(step: Step): string {
     case "github_pr":
       return `title ${step.titleFrom || "?"} · body ${step.bodyFrom || "?"}`;
     case "intervention":
-      return step.message?.split("\n")[0] || "wait for user";
+      return step.choices ? `choices: ${step.choices.map((c) => c.label || c.id).join(" / ")}` : step.message?.split("\n")[0] || "wait for user";
     case "github_comment":
       return `on ${step.target || "?"} · body ${step.bodyFrom || "?"}`;
     case "loop":
       return loopStopSubtitle(step.stop, step.maxIterations);
+    case "condition":
+      return conditionSubtitle(step, def);
   }
 }
 
@@ -324,6 +368,10 @@ export function FlowEditor() {
 
   const { nodes, edges } = useMemo(() => {
     if (!draft) return { nodes: [] as Node[], edges: [] as Edge[] };
+    // Branch nesting per step index: steps inside a condition's then/else block sit one level further
+    // right; a step in two nested branches is indented twice. Innermost wins for the tag.
+    const branches = conditionBranches(draft);
+    const blocks = branchBlocks(branches);
     const nodes: Node[] = [
       {
         id: "inputs",
@@ -340,21 +388,27 @@ export function FlowEditor() {
       } satisfies ChainNode,
       ...draft.steps.map((step, idx): ChainNode => {
         const loop = step.kind === "loop";
+        const condition = step.kind === "condition";
         const width = loop ? LOOP_NODE_WIDTH : NODE_WIDTH;
         const target = loop ? draft.steps.find((s, i) => i < idx && s.id === step.to) : undefined;
+        const depth = blocks.filter((b) => b.start <= idx && idx <= b.end).length;
         return {
           id: `step-${idx}`,
           type: "chain",
-          position: { x: (NODE_WIDTH - width) / 2, y: (idx + 1) * ROW },
+          position: {
+            x: (NODE_WIDTH - width) / 2 + depth * BRANCH_INDENT,
+            y: (idx + 1) * ROW,
+          },
           style: { width },
           data: {
             icon: KIND_ICON[step.kind],
             title: loop ? `Repeat from ${target?.name || step.to || "?"}` : step.name || "(unnamed step)",
             stepId: step.id,
-            subtitle: loop ? stepSubtitle(step) : `${KIND_LABEL[step.kind]} · ${stepSubtitle(step)}`,
+            subtitle: loop ? stepSubtitle(step, draft) : `${KIND_LABEL[step.kind]} · ${stepSubtitle(step, draft)}`,
             errors: errorsByNode.get(idx) ?? [],
             selected: selection === idx,
             loop,
+            branch: condition ? undefined : blocks.findLast((b) => b.start <= idx && idx <= b.end)?.branch,
           },
         };
       }),
@@ -400,7 +454,7 @@ export function FlowEditor() {
   const insertStep = (kind: StepKind, at: number) => {
     let n = 1;
     while (draft.steps.some((s) => s.id === `${kind}_${n}`)) n++;
-    const step = newStep(kind, `${kind}_${n}`, draft.steps.slice(0, at), draft.inputs);
+    const step = newStep(kind, `${kind}_${n}`, draft, at);
     setSteps([...draft.steps.slice(0, at), step, ...draft.steps.slice(at)]);
     setSelection(at);
     setInsertAt(null);
@@ -585,6 +639,7 @@ const KIND_HELP: Record<StepKind, string> = {
   intervention: "Pause and chat with the run's agent sessions, then continue",
   github_comment: "Post a comment on an issue or pull request input",
   loop: "Jump back to an earlier step: repeat a fixed count, until a value is truthy/falsy, or ask each time",
+  condition: "Branch on a value: run a then-block, optionally an else-block; the other branch is skipped",
 };
 
 function RunDialog({ flow, onClose }: { flow: FlowRow; onClose: () => void }) {

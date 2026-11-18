@@ -9,8 +9,9 @@ Glossary:
 - **run**: one execution of a flow; it has one `run_steps` row per step.
 - **runner**: worker host that executes runs.
 - **workspace**: git worktree (`local_path`) or PR checkout (`github_checkout`).
-- **intervention**: step that pauses the run (`awaiting_input`) for human chat.
+- **intervention**: step that pauses the run (`awaiting_input`) for human chat; optionally offers choices; the pick is `structured.choice`.
 - **loop**: step (`kind: "loop"`) that jumps back to an earlier step `to`, repeating the body up to `maxIterations` (stop: fixed count, a body value, or ask).
+- **condition**: step (`kind: "condition"`, "If…") that compares a template path (`ref`) and runs its then-block (through `thenEnd`) or its optional else-block (through `elseEnd`); the other branch is `skipped`.
 - **trust**: `owner` vs untrusted (e.g. fork PRs).
 
 ## Architecture & Data Flow
@@ -36,7 +37,7 @@ flowchart LR
   4. The runner streams `job.events`.
   5. `RunService.ingest` (`runs.ts`) persists into `run_events` and projects into `runs`/`run_steps`/`findings`.
   6. `Hub` (`hub.ts`) fans out to browser subscribers.
-- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 4`):
+- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 5`):
   - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`).
   - Events are at-least-once, deduped by `(runId, seq)`, and acked via `job.ack`.
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).

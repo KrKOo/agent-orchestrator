@@ -1,6 +1,12 @@
 import {
   type Catalog,
+  choiceGateOf,
+  CONDITION_OPS,
+  type ConditionOp,
+  type ConditionStep,
+  conditionNeedsValue,
   type FlowDefinition,
+  type InterventionChoice,
   isAgentStep,
   isTextStep,
   LOOP_MAX_ITERATIONS,
@@ -25,6 +31,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   intervention: "Intervention",
   github_comment: "GitHub comment",
   loop: "Repeat from…",
+  condition: "If…",
 };
 
 export const KIND_ICON: Record<Step["kind"], string> = {
@@ -39,6 +46,7 @@ export const KIND_ICON: Record<Step["kind"], string> = {
   intervention: "⏸",
   github_comment: "📝",
   loop: "↺",
+  condition: "⑂",
 };
 
 /** Subtitle for a loop stop condition, shared by the step panel and the canvas node. */
@@ -51,6 +59,31 @@ export function loopStopSubtitle(stop: Extract<Step, { kind: "loop" }>["stop"], 
     case "ask":
       return `up to ${maxIterations}× · ask each time`;
   }
+}
+
+/** Readable wording of a condition comparison, shared by the step panel and the canvas node. */
+export const OP_LABEL: Record<ConditionOp, string> = {
+  equals: "equals",
+  not_equals: "≠ (not equals)",
+  contains: "contains",
+  not_contains: "doesn't contain",
+  truthy: "is truthy (non-empty)",
+  falsy: "is falsy (empty/no)",
+};
+
+/**
+ * Subtitle of a condition node: `if <ref> <op> <value>`. On a choice gate the value is shown as the
+ * picked option's label (`if review = Fix` / `≠` for not_equals); other ops fall back to the raw ref.
+ */
+export function conditionSubtitle(step: ConditionStep, def: FlowDefinition): string {
+  const gate = choiceGateOf(def, step.ref);
+  if (gate) {
+    const mark = step.op === "not_equals" ? "≠" : "=";
+    const chosen = gate.choices?.find((c) => c.id === step.value);
+    return `if ${gate.id} ${mark} ${chosen?.label ?? step.value ?? "?"}`;
+  }
+  if (step.op === "truthy" || step.op === "falsy") return `if ${step.ref} ${OP_LABEL[step.op]}`;
+  return `if ${step.ref} ${OP_LABEL[step.op]} ${step.value === undefined ? "" : `"${step.value}"`}`.trimEnd();
 }
 
 /** Clickable list of the variables a template field can reference, grouped into inputs and earlier steps. */
@@ -131,6 +164,153 @@ function loopStopRefs(def: FlowDefinition, ranges: Map<number, number>, start: n
     }
   }
   return choices;
+}
+
+/** Form fields for a `condition` step. */
+function ConditionFields({
+  step,
+  def,
+  index,
+  set,
+}: {
+  step: ConditionStep;
+  def: FlowDefinition;
+  index: number;
+  set: (patch: Partial<ConditionStep>) => void;
+}) {
+  // `ref` candidates: the template variables `templateVariables` lists for this step (inputs and earlier
+  // steps this step may read — branch-skipped sources are already left out). The current ref stays
+  // selectable even when it is no longer in the list (a draft with a broken reference still renders).
+  const vars = templateVariables(def, index);
+  const gate = choiceGateOf(def, step.ref);
+  // On a choice gate only equals/not_equals make sense (validateFlow enforces this too).
+  const ops = gate ? CONDITION_OPS.filter((o) => o === "equals" || o === "not_equals") : [...CONDITION_OPS];
+  const later = def.steps.slice(index + 1);
+  // `thenEnd` candidates: every later step; nesting/loop rules are validateFlow's job, like the loop's `to`.
+  const endOptions = later.map((s) => ({ value: s.id, label: `${s.name} (${s.id})` }));
+  // `elseEnd` candidates: steps after thenEnd.
+  const thenEndAt = def.steps.findIndex((s, i) => i > index && s.id === step.thenEnd);
+  const elseOptions = thenEndAt === -1 ? [] : def.steps.slice(thenEndAt + 1).map((s) => ({ value: s.id, label: `${s.name} (${s.id})` }));
+
+  return (
+    <>
+      <label className="field">
+        <span>Branch on</span>
+        <select
+          value={step.ref}
+          onChange={(e) => {
+            const ref = e.target.value;
+            // Picking a choice gate ref with an op that cannot compare choices switches to equals.
+            const gate = choiceGateOf(def, ref);
+            if (gate && step.op !== "equals" && step.op !== "not_equals") set({ ref, op: "equals" });
+            else set({ ref });
+          }}
+        >
+          <option value="">— choose a template path —</option>
+          {step.ref && !vars.some((v) => v.path === step.ref) && <option value={step.ref}>{step.ref} (invalid)</option>}
+          {vars.map((v) => (
+            <option key={v.path} value={v.path}>
+              {v.path} — {v.description}
+            </option>
+          ))}
+        </select>
+        <small className="muted">The then-block runs the steps after this one through the then-end; the other branch is skipped.</small>
+      </label>
+
+      <label className="field">
+        <span>Comparison</span>
+        <select value={step.op} onChange={(e) => setOp(e.target.value as ConditionOp)}>
+          {ops.map((o) => (
+            <option key={o} value={o}>
+              {OP_LABEL[o]}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      {gate ? (
+        <label className="field">
+          <span>Choice</span>
+          <select value={step.value ?? ""} onChange={(e) => set({ value: e.target.value === "" ? undefined : e.target.value })}>
+            <option value="">— choose the picked option —</option>
+            {step.value !== undefined && !gate.choices?.some((c) => c.id === step.value) && (
+              <option value={step.value}>{step.value} (invalid)</option>
+            )}
+            {gate.choices?.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.label} ({c.id})
+              </option>
+            ))}
+          </select>
+          <small className="muted">
+            Compares <code>{`{{${step.ref}}}`}</code>, the option picked at "{gate.name}", against its id.
+          </small>
+        </label>
+      ) : (
+        conditionNeedsValue(step.op) && (
+          <label className="field">
+            <span>Value</span>
+            <input value={step.value ?? ""} onChange={(e) => set({ value: e.target.value })} />
+            <small className="muted">Compared as text (trimmed): equals/not_equals match the whole value, contains searches it.</small>
+          </label>
+        )
+      )}
+
+      <label className="field">
+        <span>Then runs through</span>
+        <select value={step.thenEnd} onChange={(e) => set({ thenEnd: e.target.value })}>
+          <option value="">— choose a later step —</option>
+          {step.thenEnd && !endOptions.some((o) => o.value === step.thenEnd) && (
+            <option value={step.thenEnd}>{step.thenEnd} (invalid)</option>
+          )}
+          {endOptions.map((o) => (
+            <option key={o.value} value={o.value}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <small className="muted">The then-block runs from the next step through this one.</small>
+      </label>
+
+      <div className="field">
+        <span>Else</span>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={step.elseEnd !== undefined}
+            onChange={(e) =>
+              // Default the else block to the step right after the then-block.
+              set(e.target.checked ? { elseEnd: elseOptions[0]?.value ?? "" } : { elseEnd: undefined })
+            }
+          />
+          Else branch
+        </label>
+        {step.elseEnd !== undefined && (
+          <select value={step.elseEnd} onChange={(e) => set({ elseEnd: e.target.value })}>
+            <option value="">— choose a step after the then-block —</option>
+            {step.elseEnd && !elseOptions.some((o) => o.value === step.elseEnd) && (
+              <option value={step.elseEnd}>{step.elseEnd} (invalid)</option>
+            )}
+            {elseOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        )}
+        <small className="muted">
+          With an else branch it runs from the step after the then-block through the else-end; without one the else steps are
+          skipped too. Either way the branch not taken is marked skipped.
+        </small>
+      </div>
+    </>
+  );
+
+  /** Switching the op: without a value it drops `value`, with one it starts empty (validateFlow needs a value). */
+  function setOp(op: ConditionOp) {
+    if (!conditionNeedsValue(op)) set({ op, value: undefined });
+    else set({ op, value: step.value ?? "" });
+  }
 }
 
 /** Editor form for one step; `onChange` receives the whole replacement step. */
@@ -250,7 +430,7 @@ export function StepPanel({
         <label className="field">
           <span>Id</span>
           <input className="mono" value={step.id} onChange={(e) => set({ id: e.target.value })} />
-          {step.kind !== "loop" && (
+          {(step.kind === "loop" || step.kind === "condition") ? undefined : (
             <small className="muted">
               Later steps use <code>{`{{steps.${step.id || "<id>"}.output}}`}</code>
             </small>
@@ -261,7 +441,7 @@ export function StepPanel({
           <input value={step.name} onChange={(e) => set({ name: e.target.value })} />
         </label>
       </div>
-      {step.kind !== "loop" && (
+      {step.kind !== "loop" && step.kind !== "condition" && (
         <label className="field">
           <span>Timeout (seconds)</span>
           <input
@@ -294,6 +474,7 @@ export function StepPanel({
             vars={vars}
             onChange={(message) => set({ message: message === "" ? undefined : message })}
           />
+          <ChoiceFields step={step} set={set} />
           <p className="muted small">
             The run pauses here and opens a chat in the run view: message the agent session or an earlier slash step's session
             (slash commands work too) as often as needed, then continue. The selected session's latest reply becomes{" "}
@@ -303,6 +484,7 @@ export function StepPanel({
       )}
 
       {step.kind === "loop" && <LoopFields step={step} def={def} index={index} vars={vars} set={set} />}
+      {step.kind === "condition" && <ConditionFields step={step} def={def} index={index} set={set} />}
 
       {step.kind === "prompt" && (
         <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />
@@ -626,5 +808,78 @@ function LoopFields({
         </label>
       )}
     </>
+  );
+}
+
+/** Choices of an intervention gate: one button in the run view, the picked id becomes `structured.choice`. */
+function ChoiceFields({ step, set }: { step: Extract<Step, { kind: "intervention" }>; set: (patch: Partial<Step>) => void }) {
+  const choices = step.choices;
+  const setChoice = (i: number, patch: Partial<InterventionChoice>) => {
+    if (!choices) return;
+    set({ choices: choices.map((c, j) => (j === i ? { ...c, ...patch } : c)) } as Partial<Step>);
+  };
+  return (
+    <div className="field">
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={choices !== undefined}
+          onChange={(e) =>
+            // On: two starter choices; off: no choices at all (a plain continue gate).
+            e.target.checked
+              ? set({ choices: [{ id: "approve", label: "Approve" }, { id: "fix", label: "Fix" }] } as Partial<Step>)
+              : set({ choices: undefined } as Partial<Step>)
+          }
+        />
+        Offer choices (branch on the pick)
+      </label>
+      {choices && (
+        <>
+          <small className="muted">
+            2–8 options: each becomes a button in the run view; the picked one is available as{" "}
+            <code>{`{{steps.${step.id}.structured.choice}}`}</code>.
+          </small>
+          {choices.map((c, i) => (
+            <div className="choice-row" key={i}>
+              <input
+                className="mono"
+                placeholder="choice_id"
+                title="Id conditions compare against"
+                value={c.id}
+                onChange={(e) => setChoice(i, { id: e.target.value })}
+              />
+              <input
+                placeholder="Button label"
+                title="Text of the button in the run view"
+                value={c.label}
+                onChange={(e) => setChoice(i, { label: e.target.value })}
+              />
+              <button
+                type="button"
+                className="btn small danger"
+                disabled={choices.length <= 2}
+                title={choices.length <= 2 ? "At least two choices" : "Remove this choice"}
+                onClick={() => set({ choices: choices.filter((_, j) => j !== i) } as Partial<Step>)}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className="btn small"
+            disabled={choices.length >= 8}
+            title={choices.length >= 8 ? "At most 8 choices" : "Add a choice"}
+            onClick={() => set({ choices: [...choices, { id: `choice_${choices.length + 1}`, label: "" }] } as Partial<Step>)}
+          >
+            + Add choice
+          </button>
+          <p className="muted small">
+            Branch on <code>{`{{steps.${step.id}.structured.choice}}`}</code> with an If… step: its options above can only be
+            compared with equals / not equals.
+          </p>
+        </>
+      )}
+    </div>
   );
 }

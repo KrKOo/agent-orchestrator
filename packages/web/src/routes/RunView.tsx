@@ -332,7 +332,9 @@ function RunViewInner({ runId }: { runId: string }) {
               </div>
             )}
             {step.items.length === 0 && step.subagents.length === 0 && step.output === undefined && !step.error && !gateRequest && (
-              <p className="muted">{step.status === "pending" ? "Step has not started." : "Waiting for output…"}</p>
+              <p className="muted">
+                {step.status === "pending" ? "Step has not started." : step.status === "skipped" ? "Skipped: the run bypassed this step." : "Waiting for output…"}
+              </p>
             )}
             {gateStart?.message && <p className="intervention-note pre-wrap">{gateStart.message}</p>}
             {startSession && <InterventionStart session={startSession} />}
@@ -340,9 +342,13 @@ function RunViewInner({ runId }: { runId: string }) {
             {selectedDef && (
               <StepResult
                 step={step}
-                stepId={selectedDef.kind === "loop" ? undefined : selectedDef.id}
+                // Condition steps, like loops, produce no template value for later steps.
+                stepId={selectedDef.kind === "loop" || selectedDef.kind === "condition" ? undefined : selectedDef.id}
                 markdown={isAgentStep(selectedDef) || selectedDef.kind === "slash"}
                 mono={selectedDef.kind === "shell"}
+                // The latest request holds the pick (chat turns and earlier loop passes resolve earlier ones); only
+                // a finished attempt shows it, so a gate reset by a loop repeat or retry shows no stale pick.
+                gate={selectedDef.kind === "intervention" && step.status === "succeeded" ? state.interventions.findLast((i) => i.stepId === selectedDef.id) : undefined}
               />
             )}
             {runLevel && runLevel.items.length > 0 && (

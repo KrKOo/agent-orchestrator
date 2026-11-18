@@ -13,6 +13,7 @@ import {
   UNTRUSTED_PREAMBLE,
   TERMINAL_STATUSES,
   type SessionUpdate,
+  wrapUntrustedText,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
@@ -1457,6 +1458,192 @@ describe("runJob", () => {
 
       expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
       expect(ofType(events, "intervention.request")[0]!.payload.session).toBe("agent");
+    });
+  });
+
+  describe("condition steps and intervention choices", () => {
+    const finishedOf = (events: RunEventDraft[], stepId: string) => ofType(events, "step.finished").filter((e) => e.stepId === stepId).map((e) => e.payload);
+    const choices = [
+      { id: "approve", label: "Approve" },
+      { id: "fix", label: "Fix" },
+    ];
+    const review = { kind: "intervention", id: "review", name: "Review", choices } as const;
+    const pick = { kind: "condition", id: "pick", name: "Fix?", ref: "steps.review.structured.choice", op: "equals", value: "fix", thenEnd: "fixit", elseEnd: "ok" } as const;
+    const fixit = { kind: "shell", id: "fixit", name: "Fix it", command: "printf fixed" } as const;
+    const ok = { kind: "shell", id: "ok", name: "Approved", command: "printf approved" } as const;
+    const after = { kind: "shell", id: "after", name: "After", command: `printf 'after:%s' "{{steps.review.structured.choice}}"` } as const;
+
+    test("a gate with choices asks until one is picked; the pick drives the branch", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "continue" }, { action: "continue", choice: "redo" }, { action: "continue", choice: "fix" }]);
+      const run = assigned({ steps: [review, pick, fixit, ok, after] });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const requests = ofType(events, "intervention.request").map((e) => e.payload);
+      expect(requests.map((r) => [r.choices, r.error])).toEqual([
+        [choices, undefined],
+        [choices, "Pick one of: Approve, Fix."],
+        [choices, "Pick one of: Approve, Fix."],
+      ]);
+      expect(ofType(events, "intervention.resolved").map((e) => e.payload.choice)).toEqual([undefined, undefined, "fix"]);
+      expect(finishedOf(events, "review")).toEqual([{ status: "succeeded", output: "", structured: { choice: "fix" } }]);
+      expect(finishedOf(events, "pick")).toEqual([
+        { status: "succeeded", output: `steps.review.structured.choice equals "fix": true → then branch\nValue: "fix"`, structured: { branch: "then" } },
+      ]);
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["review", "pick", "fixit", "after"]);
+      expect(finishedOf(events, "ok")).toEqual([{ status: "skipped" }]);
+      expect(finishedOf(events, "after")[0]).toEqual({ status: "succeeded", output: "after:fix" });
+    });
+
+    test("the other pick runs the else branch and skips the then branch", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "continue", choice: "approve" }]);
+      const run = assigned({ steps: [review, pick, fixit, ok, after] });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["review", "pick", "ok", "after"]);
+      expect(finishedOf(events, "fixit")).toEqual([{ status: "skipped" }]);
+      expect(finishedOf(events, "pick")[0]!.structured).toEqual({ branch: "else" });
+    });
+
+    test("nested conditions: an inner false branch is skipped, the outer else after the then-block too", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        inputs: [{ key: "note", label: "Note", type: "text", required: false }],
+        steps: [
+          { kind: "shell", id: "a", name: "A", command: "printf yes" },
+          { kind: "condition", id: "outer", name: "Outer", ref: "steps.a.output", op: "equals", value: "yes", thenEnd: "b2", elseEnd: "c" },
+          // An input left out counts as absent: falsy.
+          { kind: "condition", id: "inner", name: "Inner", ref: "inputs.note", op: "truthy", thenEnd: "b1" },
+          { kind: "shell", id: "b1", name: "B1", command: "printf b1" },
+          { kind: "shell", id: "b2", name: "B2", command: "printf b2" },
+          { kind: "shell", id: "c", name: "C", command: "printf c" },
+          { kind: "shell", id: "d", name: "D", command: "printf d" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["a", "outer", "inner", "b2", "d"]);
+      expect(ofType(events, "step.finished").filter((e) => e.payload.status === "skipped").map((e) => e.stepId)).toEqual(["b1", "c"]);
+      expect(finishedOf(events, "inner")[0]!.output).toBe("inputs.note truthy: false → then branch skipped\nValue: (absent)");
+    });
+
+    test("a gate inside a loop asks on every pass, and each pass branches on its own pick", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const pending = scriptedGate(deps, events, [{ action: "continue", choice: "fix" }, { action: "continue", choice: "approve" }]);
+      const run = assigned({
+        steps: [review, { ...pick, elseEnd: undefined }, fixit, { kind: "loop", id: "again", name: "Again", to: "review", maxIterations: 2 }],
+      });
+      await runJob(run, deps, new AbortController().signal, pending);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "intervention.request")).toHaveLength(2);
+      expect(finishedOf(events, "fixit").map((p) => p.status)).toEqual(["succeeded", "skipped"]);
+    });
+
+    test("a retry from the condition reads the prior pick", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(assigned({ steps: [review, pick, fixit, ok, after] }));
+      run.resume = { fromStepIdx: 1, prior: [{ stepId: "review", output: "", structured: { choice: "fix" } }] };
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["pick", "fixit", "after"]);
+      expect(finishedOf(events, "ok")).toEqual([{ status: "skipped" }]);
+    });
+
+    test("a retry inside a branch keeps the branch the prior attempt took", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(assigned({ steps: [review, pick, fixit, ok, after] }));
+      // The prior pick says approve, but the recorded branch wins: the cursor sits in the then-block.
+      run.resume = {
+        fromStepIdx: 2,
+        prior: [
+          { stepId: "review", output: "", structured: { choice: "approve" } },
+          { stepId: "pick", output: "", structured: { branch: "then" } },
+        ],
+      };
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["fixit", "after"]);
+      expect(finishedOf(events, "ok")).toEqual([{ status: "skipped" }]);
+    });
+
+    test("run from a step of the branch not taken runs that branch only", async () => {
+      const prior = (branch: "then" | "else") => [
+        { stepId: "review", output: "", structured: { choice: branch === "then" ? "fix" : "approve" } },
+        { stepId: "pick", output: "", structured: { branch } },
+        { stepId: branch === "then" ? "fixit" : "ok", output: "x" },
+      ];
+      // The prior attempt took else; run from the skipped then-step: the else-block is skipped after it.
+      const fromThen = harnessDeps(new FakeSandboxProvider());
+      const run1 = withWorktree(assigned({ steps: [review, pick, fixit, ok, after] }));
+      run1.resume = { fromStepIdx: 2, prior: prior("else").filter((p) => p.stepId !== "ok") };
+      await runJob(run1, fromThen.deps, new AbortController().signal);
+      expect(fromThen.sent.at(-1)).toMatchObject({ status: "succeeded" });
+      expect(ofType(fromThen.events, "step.started").map((e) => e.stepId)).toEqual(["fixit", "after"]);
+      expect(finishedOf(fromThen.events, "ok")).toEqual([{ status: "skipped" }]);
+
+      // The prior attempt took then; run from the skipped else-step: it runs.
+      const fromElse = harnessDeps(new FakeSandboxProvider());
+      const run2 = withWorktree(assigned({ steps: [review, pick, fixit, ok, after] }));
+      run2.resume = { fromStepIdx: 3, prior: prior("then") };
+      await runJob(run2, fromElse.deps, new AbortController().signal);
+      expect(fromElse.sent.at(-1)).toMatchObject({ status: "succeeded" });
+      expect(ofType(fromElse.events, "step.started").map((e) => e.stepId)).toEqual(["ok", "after"]);
+    });
+
+    test("a git_push skipped in a branch not taken does not count as pushed on resume", async () => {
+      const runPr = async (branch: "then" | "else") => {
+        const { deps, sent } = harnessDeps(new FakeSandboxProvider());
+        deps.rpc = async <T>(method: string) =>
+          method === "github.createPullRequest" ? ({ url: "https://github.com/acme/widget/pull/9" } as T) : Promise.reject(new Error(`no rpc: ${method}`));
+        const run = withWorktree(
+          assigned({
+            steps: [
+              { kind: "prompt", id: "done", name: "Done", prompt: "earlier" },
+              { kind: "condition", id: "ship", name: "Ship?", ref: "steps.done.output", op: "truthy", thenEnd: "pr" },
+              { kind: "git_push", id: "push", name: "Push" },
+              { kind: "github_pr", id: "pr", name: "PR", titleFrom: "done", bodyFrom: "done" },
+            ],
+          }),
+        );
+        run.resume = {
+          fromStepIdx: 3,
+          prior: [
+            { stepId: "done", output: "prior-output" },
+            { stepId: "ship", output: "", structured: { branch } },
+            { stepId: "push", output: branch === "then" ? "orch/x" : "" },
+          ],
+        };
+        await runJob(run, deps, new AbortController().signal);
+        return sent.at(-1);
+      };
+      expect(await runPr("then")).toMatchObject({ status: "succeeded" });
+      expect(await runPr("else")).toMatchObject({ status: "failed", error: "github_pr requires an earlier git_push" });
+    });
+
+    test("a condition compares PR / issue text without its untrusted wrapper", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned(
+        {
+          inputs: [{ key: "title", label: "Title", type: "text", required: true }],
+          steps: [
+            { kind: "condition", id: "is_fix", name: "Fix?", ref: "inputs.title", op: "equals", value: "Fix it", thenEnd: "a" },
+            { kind: "shell", id: "a", name: "A", command: "printf a" },
+          ],
+        },
+        "owner",
+        { inputs: { title: wrapUntrustedText("Fix it") } },
+      );
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toMatchObject({ status: "succeeded" });
+      expect(ofType(events, "step.started").map((e) => e.stepId)).toEqual(["is_fix", "a"]);
     });
   });
 

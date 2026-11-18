@@ -228,10 +228,18 @@ export const GitHubPrStep = z.object({
   base: z.string().min(1).optional(),
   draft: z.boolean().default(false),
 });
+/** One button of an intervention with choices: `id` is the value conditions compare against, `label` the button text. */
+export const InterventionChoice = z.object({
+  id: z.string().regex(ID_RE, "choice id must match /^[a-z][a-z0-9_]*$/"),
+  label: z.string().min(1),
+});
+export type InterventionChoice = z.infer<typeof InterventionChoice>;
 /**
  * Pauses the run so the user can chat with the run's agent sessions from the web UI: the shared
  * ACP session of prompt/skill/command steps, or the resumable `omp -p` session of an earlier slash
  * step. On continue, the latest result of the selected session becomes this step's output.
+ * With `choices`, one button per choice replaces "Continue": the picked id becomes the step's structured
+ * output `{ choice }` (`{{steps.<id>.structured.choice}}`), which `condition` steps branch on.
  * No `timeoutSec` (or `0`) means wait until answered or cancelled; otherwise each wait for the user is capped.
  */
 export const InterventionStep = z.object({
@@ -239,7 +247,9 @@ export const InterventionStep = z.object({
   kind: z.literal("intervention"),
   message: z.string().optional(),
   timeoutSec: z.number().int().min(0).optional(),
+  choices: z.array(InterventionChoice).min(2, "list at least two choices").max(8, "at most 8 choices").optional(),
 });
+export type InterventionStep = z.infer<typeof InterventionStep>;
 /**
  * Posts the output of `bodyFrom` as a comment on the issue or pull request of input `target` (a required
  * `github_issue` or `github_pull_request` input), server-side with the orchestrator's GitHub credentials.
@@ -283,6 +293,31 @@ export const LoopStep = z.object({
   timeoutSec: z.number().int().min(0).optional(),
 });
 export type LoopStep = z.infer<typeof LoopStep>;
+/** Comparisons of a `condition` step. `equals`/`not_equals` compare the trimmed text; `contains`/`not_contains` search it (case-sensitive); `truthy`/`falsy` follow `isTruthyValue`. */
+export const CONDITION_OPS = ["equals", "not_equals", "contains", "not_contains", "truthy", "falsy"] as const;
+export type ConditionOp = (typeof CONDITION_OPS)[number];
+/** Ops that compare against the step's `value`; the others take none. */
+export function conditionNeedsValue(op: ConditionOp): boolean {
+  return op !== "truthy" && op !== "falsy";
+}
+/**
+ * "If…": branches the run on `ref` (a template path without braces: `inputs.<key>[.<field>]`,
+ * `steps.<id>.output` or `steps.<id>.structured[.<field>…]`). The then-block runs from the next step
+ * through `thenEnd`; the optional else-block runs from the step after `thenEnd` through `elseEnd`.
+ * The branch not taken is marked `skipped`. Branches nest inside one branch of another condition or a loop
+ * body, or are disjoint from them. A condition step has no template value: later steps cannot reference it.
+ */
+export const ConditionStep = z.object({
+  ...stepBase,
+  kind: z.literal("condition"),
+  ref: z.string().min(1),
+  op: z.enum(CONDITION_OPS),
+  value: z.string().optional(),
+  thenEnd: z.string().min(1),
+  elseEnd: z.string().min(1).optional(),
+  timeoutSec: z.number().int().min(0).optional(),
+});
+export type ConditionStep = z.infer<typeof ConditionStep>;
 
 export const Step = z.discriminatedUnion("kind", [
   PromptStep,
@@ -296,13 +331,14 @@ export const Step = z.discriminatedUnion("kind", [
   InterventionStep,
   GitHubCommentStep,
   LoopStep,
+  ConditionStep,
 ]);
 export type Step = z.infer<typeof Step>;
 export type StepKind = Step["kind"];
 export type AgentStep = Extract<Step, { kind: "prompt" | "skill" | "command" }>;
 /** Steps that change the local workspace's repository or its GitHub remote; need a writable worktree. */
 export type ActionStep = Extract<Step, { kind: "git_commit" | "git_push" | "github_pr" }>;
-export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "shell", "git_commit", "git_push", "github_pr", "intervention", "github_comment", "loop"];
+export const STEP_KINDS: StepKind[] = ["prompt", "skill", "command", "slash", "shell", "git_commit", "git_push", "github_pr", "intervention", "github_comment", "loop", "condition"];
 
 export function isAgentStep(step: Step): step is AgentStep {
   return step.kind === "prompt" || step.kind === "skill" || step.kind === "command";
@@ -343,10 +379,79 @@ function loopBackIds(def: Pick<FlowDefinition, "steps">, ranges: Map<number, num
     if (start > stepIndex || stepIndex >= end) continue;
     for (let j = stepIndex + 1; j < end; j++) {
       const step = def.steps[j]!;
-      if (step.kind !== "loop") ids.add(step.id);
+      if (step.kind !== "loop" && step.kind !== "condition") ids.add(step.id);
     }
   }
   return ids;
+}
+
+/** Branch blocks of a condition step, as step indexes: then `[cond + 1, thenEnd]`, else `[thenEnd + 1, elseEnd]`. */
+export interface ConditionBranches {
+  thenEnd: number;
+  elseEnd?: number;
+}
+
+/**
+ * Branches by position: condition step index → its block ends. Conditions whose `thenEnd` is not a later
+ * step, or whose `elseEnd` is not after `thenEnd`, are left out (`validateFlow` reports them).
+ */
+export function conditionBranches(def: Pick<FlowDefinition, "steps">): Map<number, ConditionBranches> {
+  const branches = new Map<number, ConditionBranches>();
+  def.steps.forEach((step, idx) => {
+    if (step.kind !== "condition") return;
+    const thenEnd = def.steps.findIndex((s, i) => i > idx && s.id === step.thenEnd);
+    if (thenEnd === -1) return;
+    if (step.elseEnd === undefined) {
+      branches.set(idx, { thenEnd });
+      return;
+    }
+    const elseEnd = def.steps.findIndex((s, i) => i > thenEnd && s.id === step.elseEnd);
+    if (elseEnd !== -1) branches.set(idx, { thenEnd, elseEnd });
+  });
+  return branches;
+}
+
+/** Branch blocks as inclusive step index ranges, with the condition step they belong to. */
+export function branchBlocks(branches: Map<number, ConditionBranches>): { cond: number; start: number; end: number; branch: "then" | "else" }[] {
+  const blocks: { cond: number; start: number; end: number; branch: "then" | "else" }[] = [];
+  for (const [cond, b] of branches) {
+    blocks.push({ cond, start: cond + 1, end: b.thenEnd, branch: "then" });
+    if (b.elseEnd !== undefined) blocks.push({ cond, start: b.thenEnd + 1, end: b.elseEnd, branch: "else" });
+  }
+  return blocks;
+}
+
+/**
+ * Condition step index whose branch holds step `target` but not step `from`: `target` may have been
+ * skipped when `from` runs, so `from` must not read it. Undefined when every branch around `target` contains `from`.
+ */
+export function excludingBranch(branches: Map<number, ConditionBranches>, target: number, from: number): number | undefined {
+  return branchBlocks(branches).find((b) => b.start <= target && target <= b.end && !(b.start <= from && from <= b.end))?.cond;
+}
+
+/** Whether a condition holds for the resolved `actual` value of its ref; an absent value (`undefined`) compares as empty text. */
+export function conditionHolds(op: ConditionOp, actual: unknown, value = ""): boolean {
+  if (op === "truthy" || op === "falsy") return isTruthyValue(actual) === (op === "truthy");
+  const text =
+    actual === undefined ? "" : typeof actual === "string" ? actual : actual !== null && typeof actual === "object" ? JSON.stringify(actual) : String(actual);
+  switch (op) {
+    case "equals":
+      return text.trim() === value.trim();
+    case "not_equals":
+      return text.trim() !== value.trim();
+    case "contains":
+      return text.includes(value);
+    case "not_contains":
+      return !text.includes(value);
+  }
+}
+
+/** The intervention gate whose `structured.choice` a ref like `steps.<gate>.structured.choice` reads, if any. */
+export function choiceGateOf(def: Pick<FlowDefinition, "steps">, ref: string): InterventionStep | undefined {
+  const parts = ref.split(".");
+  if (parts.length !== 4 || parts[0] !== "steps" || parts[2] !== "structured" || parts[3] !== "choice") return undefined;
+  const step = def.steps.find((s) => s.id === parts[1]);
+  return step?.kind === "intervention" && step.choices ? step : undefined;
 }
 
 /**
@@ -417,13 +522,17 @@ const INPUT_FIELDS: Record<Exclude<InputDef["type"], "text">, readonly string[]>
   github_pull_request: PR_INPUT_FIELDS,
 };
 
-/** `loopBack`: later steps of an enclosing loop body, referenceable as `.output` only (previous iteration). */
+/**
+ * `loopBack`: later steps of an enclosing loop body, referenceable as `.output` only (previous iteration).
+ * `outsideBranch`: why the referencing step must not read step `id` (it sits in a branch that may be skipped), or null.
+ */
 function checkRef(
   ref: string,
   inputs: Map<string, InputDef>,
   steps: Map<string, Step>,
   earlier: Set<string>,
   loopBack: Set<string>,
+  outsideBranch: (id: string) => string | null,
 ): string | null {
   const parts = ref.split(".");
   if (parts[0] === "inputs") {
@@ -438,17 +547,26 @@ function checkRef(
   if (parts[0] === "steps") {
     const id = parts[1];
     if (id !== undefined && !earlier.has(id) && loopBack.has(id)) {
-      return parts[2] === "output" && parts.length === 3
-        ? null
-        : `references later step "${id}" of this loop; only steps.${id}.output (previous iteration) is available`;
+      if (!(parts[2] === "output" && parts.length === 3)) {
+        return `references later step "${id}" of this loop; only steps.${id}.output (previous iteration) is available`;
+      }
+      return outsideBranch(id);
     }
     if (id === undefined || !earlier.has(id)) return `references step "${id ?? ""}" which is not an earlier step`;
-    // A loop step only reports how it ended; the runner keeps no template value for it.
-    if (steps.get(id)?.kind === "loop") return `references loop step "${id}", which has no output to use`;
+    // Loop and condition steps only report how they ended; the runner keeps no template value for them.
+    const kind = steps.get(id)?.kind;
+    if (kind === "loop" || kind === "condition") return `references ${kind} step "${id}", which has no output to use`;
+    const skippable = outsideBranch(id);
+    if (skippable) return skippable;
     if (parts[2] === "output" && parts.length === 3) return null;
     if (parts[2] === "structured") {
-      if (parts.length === 3) return null;
       const step = steps.get(id);
+      // An intervention's only structured value is the picked choice.
+      if (step?.kind === "intervention") {
+        if (!step.choices) return `intervention "${id}" has no structured output; give it choices to branch on steps.${id}.structured.choice`;
+        return parts.length === 4 && parts[3] === "choice" ? null : `intervention "${id}" exposes only steps.${id}.structured.choice`;
+      }
+      if (parts.length === 3) return null;
       const fields = step && isAgentStep(step) && step.structured ? step.structured.fields.map((f) => f.name) : null;
       // Without a declared spec the check stays permissive (back-compat; replayed resume data; nested paths like
       // `steps.<id>.structured.files.0`). With a spec, validate the first path segment and allow deeper nesting.
@@ -469,8 +587,9 @@ export interface TemplateVariable {
 
 /**
  * Variables a template of `def.steps[stepIndex]` can reference, following `validateFlow`'s reference rules.
- * `structured` is listed only for agent steps since action steps never submit it. Inside a loop body,
- * later body steps' `.output` is listed too (previous iteration).
+ * `structured` is listed only for agent steps (action steps never submit it) and interventions with choices.
+ * Inside a loop body, later body steps' `.output` is listed too (previous iteration). Steps in a condition
+ * branch that does not contain this step are left out: they may have been skipped.
  */
 export function templateVariables(def: FlowDefinition, stepIndex: number): TemplateVariable[] {
   const vars = new Map<string, string>();
@@ -490,8 +609,10 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
       for (const f of PR_INPUT_FIELDS) add(`inputs.${input.key}.${f}`, `${label}: ${PR_FIELD_DESCRIPTIONS[f]}`);
     }
   }
-  for (const step of def.steps.slice(0, stepIndex)) {
-    if (!ID_RE.test(step.id) || step.kind === "loop") continue;
+  const branches = conditionBranches(def);
+  for (const [j, step] of def.steps.slice(0, stepIndex).entries()) {
+    if (!ID_RE.test(step.id) || step.kind === "loop" || step.kind === "condition") continue;
+    if (excludingBranch(branches, j, stepIndex) !== undefined) continue;
     add(`steps.${step.id}.output`, `Text output of "${step.name}"`);
     if (isAgentStep(step)) {
       if (step.structured) {
@@ -502,11 +623,16 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
         add(`steps.${step.id}.structured`, `JSON "${step.name}" submitted via submit_output (append .<field> for a value)`);
       }
     }
+    if (step.kind === "intervention" && step.choices) {
+      add(`steps.${step.id}.structured.choice`, `Choice picked at "${step.name}" (${step.choices.map((c) => c.id).join(" | ")})`);
+    }
   }
   const ranges = loopRanges(def);
   for (const id of loopBackIds(def, ranges, stepIndex)) {
-    const step = def.steps.find((s) => s.id === id)!;
-    if (ID_RE.test(id)) add(`steps.${id}.output`, `Text output of "${step.name}" (previous iteration; empty on the first)`);
+    const at = def.steps.findIndex((s) => s.id === id);
+    if (ID_RE.test(id) && excludingBranch(branches, at, stepIndex) === undefined) {
+      add(`steps.${id}.output`, `Text output of "${def.steps[at]!.name}" (previous iteration; empty on the first)`);
+    }
   }
   return Array.from(vars, ([path, description]) => ({ path, description }));
 }
@@ -561,12 +687,28 @@ export function validateFlow(input: unknown): ValidateResult {
   const agentSteps = new Set<string>();
   const textSteps = new Set<string>();
   const stepById = new Map<string, Step>();
+  const branches = conditionBranches(flow);
+  /** Branch containment for step `from`: it must not read a step in a branch that does not contain it (maybe skipped). */
+  const outsideBranchOf =
+    (from: number) =>
+    (id: string): string | null => {
+      const at = flow.steps.findIndex((s) => s.id === id);
+      const cond = at === -1 ? undefined : excludingBranch(branches, at, from);
+      return cond === undefined
+        ? null
+        : `references step "${id}" inside a branch of condition "${flow.steps[cond]!.id}" that does not contain this step; it may have been skipped`;
+    };
   /** `*From` refs: `id` | `id.output` | `id.structured.<field>`; `.output` is the default.
    * `sources` limits the referenced step kind (`agentSteps` by default; `github_comment.bodyFrom` takes text steps). */
-  const checkFromRef = (field: string, ref: string, where: string, sources: Set<string> = agentSteps, noun = "prompt/skill/command") => {
+  const checkFromRef = (field: string, ref: string, where: string, idx: number, sources: Set<string> = agentSteps, noun = "prompt/skill/command") => {
     const [id, ...rest] = ref.split(".");
     if (!id || !sources.has(id)) {
       errors.push(`${where}.${field}: "${ref}" must be an earlier ${noun} step`);
+      return;
+    }
+    const skippable = outsideBranchOf(idx)(id);
+    if (skippable) {
+      errors.push(`${where}.${field}: "${ref}" ${skippable}`);
       return;
     }
     if (rest.length === 0) return;
@@ -587,8 +729,52 @@ export function validateFlow(input: unknown): ValidateResult {
     }
     errors.push(`${where}.${field}: "${ref}" must be an earlier step id, optionally followed by .output or .structured.<field>`);
   };
-  let pushed = false;
   const ranges = loopRanges(flow);
+  const checkCondition = (step: ConditionStep, idx: number, where: string) => {
+    const own = branches.get(idx);
+    if (!flow.steps.some((s, i) => i > idx && s.id === step.thenEnd)) {
+      errors.push(`${where}.thenEnd: "${step.thenEnd}" must be a later step`);
+    } else if (step.elseEnd !== undefined && !own) {
+      errors.push(`${where}.elseEnd: "${step.elseEnd}" must be a step after "${step.thenEnd}"`);
+    }
+    if (conditionNeedsValue(step.op) && step.value === undefined) errors.push(`${where}.value: "${step.op}" needs a value to compare with`);
+    if (!conditionNeedsValue(step.op) && step.value !== undefined) errors.push(`${where}.value: "${step.op}" takes no value`);
+
+    if (!/^[A-Za-z0-9_.]+$/.test(step.ref)) {
+      errors.push(`${where}.ref: "${step.ref}" must be a template path like steps.<id>.output (without braces)`);
+    } else {
+      const problem = checkRef(step.ref, inputs, stepById, seen, loopBackIds(flow, ranges, idx), outsideBranchOf(idx));
+      const gate = problem ? undefined : choiceGateOf(flow, step.ref);
+      if (problem) errors.push(`${where}.ref: ${step.ref} ${problem}`);
+      else if (gate) {
+        const ids = gate.choices!.map((c) => c.id);
+        if (step.op !== "equals" && step.op !== "not_equals") {
+          errors.push(`${where}.op: a choice of "${gate.id}" can only be compared with equals or not_equals`);
+        } else if (step.value !== undefined && !ids.includes(step.value)) {
+          errors.push(`${where}.value: value "${step.value}" is not a choice of "${gate.id}" (${ids.join(", ")})`);
+        }
+      }
+    }
+
+    if (!own) return;
+    const end = own.elseEnd ?? own.thenEnd;
+    for (const [cond, other] of branches) {
+      // An enclosing condition's span holds this one's start: all of this one must sit in the same branch.
+      const otherEnd = other.elseEnd ?? other.thenEnd;
+      if (cond >= idx || idx > otherEnd) continue;
+      const branchEnd = idx <= other.thenEnd ? other.thenEnd : otherEnd;
+      if (end > branchEnd) {
+        errors.push(`${where}: its branches run past the ${idx <= other.thenEnd ? "then" : "else"} branch of condition "${flow.steps[cond]!.id}" it starts in; nest them inside one branch`);
+      }
+    }
+    for (const [loopIdx, start] of ranges) {
+      if (end < start || loopIdx < idx) continue; // disjoint
+      if (start <= idx && end < loopIdx) continue; // this condition inside the loop body
+      // The whole loop inside one of this condition's branches.
+      if ((idx < start && loopIdx <= own.thenEnd) || (own.elseEnd !== undefined && own.thenEnd < start && loopIdx <= own.elseEnd)) continue;
+      errors.push(`${where}: its branches cross the body of loop "${flow.steps[loopIdx]!.id}"; branches and loop bodies must nest or be disjoint`);
+    }
+  };
   flow.steps.forEach((step, idx) => {
     const where = `steps.${idx} (${step.id})`;
     if (seen.has(step.id)) errors.push(`${where}: duplicate step id "${step.id}"`);
@@ -600,6 +786,13 @@ export function validateFlow(input: unknown): ValidateResult {
         names.add(f.name);
       }
     }
+    if (step.kind === "intervention" && step.choices) {
+      const ids = new Set<string>();
+      for (const [i, c] of step.choices.entries()) {
+        if (ids.has(c.id)) errors.push(`${where}.choices[${i}]: duplicate choice id "${c.id}"`);
+        ids.add(c.id);
+      }
+    }
     // Zod strips unknown keys, so the raw input decides whether `structured` was declared (slash stays text-only).
     const rawSteps = input && typeof input === "object" && "steps" in input ? input.steps : undefined;
     const rawStep = Array.isArray(rawSteps) ? rawSteps[idx] : undefined;
@@ -609,7 +802,7 @@ export function validateFlow(input: unknown): ValidateResult {
 
     for (const [field, tpl] of stepTemplates(step)) {
       for (const ref of templateRefs(tpl)) {
-        const problem = checkRef(ref, inputs, stepById, seen, loopBackIds(flow, ranges, idx));
+        const problem = checkRef(ref, inputs, stepById, seen, loopBackIds(flow, ranges, idx), outsideBranchOf(idx));
         if (problem) errors.push(`${where}.${field}: {{${ref}}} ${problem}`);
       }
     }
@@ -639,11 +832,16 @@ export function validateFlow(input: unknown): ValidateResult {
             ? [["bodyFrom", step.bodyFrom]]
             : [];
     for (const [field, ref] of refFields) {
-      if (step.kind === "github_comment") checkFromRef(field, ref, where, textSteps, "prompt/skill/command/slash/shell/intervention");
-      else checkFromRef(field, ref, where);
+      if (step.kind === "github_comment") checkFromRef(field, ref, where, idx, textSteps, "prompt/skill/command/slash/shell/intervention");
+      else checkFromRef(field, ref, where, idx);
     }
-    if (step.kind === "git_push") pushed = true;
-    if (step.kind === "github_pr" && !pushed) errors.push(`${where}: github_pr requires an earlier git_push step`);
+    if (step.kind === "github_pr") {
+      const pushes = flow.steps.flatMap((s, j) => (j < idx && s.kind === "git_push" ? [j] : []));
+      if (pushes.length === 0) errors.push(`${where}: github_pr requires an earlier git_push step`);
+      else if (pushes.every((j) => excludingBranch(branches, j, idx) !== undefined)) {
+        errors.push(`${where}: github_pr requires a git_push that always runs before it, not one inside a condition branch that does not contain it`);
+      }
+    }
     if (step.kind === "github_pr" && [...ranges].some(([e, s]) => s <= idx && idx < e)) {
       errors.push(`${where}: github_pr cannot run inside a loop (it would open one pull request per iteration)`);
     }
@@ -662,6 +860,7 @@ export function validateFlow(input: unknown): ValidateResult {
         if (problem) errors.push(`${where}.stop.ref: ${problem}`);
       }
     }
+    if (step.kind === "condition") checkCondition(step, idx, where);
 
     seen.add(step.id);
     stepById.set(step.id, step);

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { InterventionAction } from "./flow";
+import { InterventionAction, InterventionChoice } from "./flow";
 
 /** `awaiting_input`: an intervention step is paused for the user (the runner still holds the run). */
 export const RUN_STATUSES = ["queued", "awaiting_approval", "assigned", "running", "awaiting_input", "succeeded", "failed", "cancelled"] as const;
@@ -11,7 +11,10 @@ export const RETRYABLE_STATUSES: readonly RunStatus[] = ["failed", "cancelled"];
 /** Max run name length (UTF-16 code units, as zod counts), for user-given and agent-generated names alike. */
 export const RUN_NAME_MAX = 120;
 
-/** `skipped`: a loop body step bypassed because a `value` stop ended the iteration before it. */
+/**
+ * `skipped`: a step the run bypassed: a loop body step after a `value` stop ended the iteration, or a step
+ * in the branch of a `condition` step that was not taken.
+ */
 export const StepStatus = z.enum(["pending", "running", "succeeded", "failed", "cancelled", "skipped"]);
 export type StepStatus = z.infer<typeof StepStatus>;
 
@@ -139,12 +142,15 @@ export const RunEvent = z.discriminatedUnion("type", [
       error: z.string().optional(),
       /** Set on `ask` loop gates that can still repeat: `iteration` is the one a repeat starts. */
       repeat: z.object({ toStepId: z.string(), iteration: z.number().int().min(2), maxIterations: z.number().int().min(1) }).optional(),
+      /** Set on interventions with choices: `continue` must carry one of these ids as `choice`. */
+      choices: z.array(InterventionChoice).optional(),
     }),
   }),
   z.object({
     ...base,
     type: z.literal("intervention.resolved"),
-    payload: z.object({ requestId: z.string(), action: InterventionAction }),
+    /** `choice`: the id picked on a gate with choices. */
+    payload: z.object({ requestId: z.string(), action: InterventionAction, choice: z.string().optional() }),
   }),
   z.object({
     ...base,

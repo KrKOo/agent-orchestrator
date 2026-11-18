@@ -216,3 +216,48 @@ describe("loops", () => {
     expect(s.steps.c!.status).toBe("skipped");
   });
 });
+
+describe("intervention choices", () => {
+  test("a resolved gate keeps the picked choice; replay changes nothing", () => {
+    seq = 0;
+    const events: RunEvent[] = [
+      ev({
+        type: "intervention.request",
+        stepId: "gate",
+        payload: {
+          requestId: "i1",
+          message: "review it",
+          sessions: [],
+          choices: [
+            { id: "approve", label: "Approve" },
+            { id: "fix", label: "Fix" },
+          ],
+        },
+      }),
+      ev({ type: "intervention.resolved", stepId: "gate", payload: { requestId: "i1", action: "continue", choice: "fix" } }),
+    ];
+    const s = applyRunEvents(initialRunViewState, events);
+    expect(s.interventions[0]).toMatchObject({
+      requestId: "i1",
+      stepId: "gate",
+      resolved: true,
+      choice: "fix",
+      choices: [
+        { id: "approve", label: "Approve" },
+        { id: "fix", label: "Fix" },
+      ],
+    });
+    // Replayed events (seq <= lastSeq) are ignored.
+    expect(applyRunEvents(s, events)).toBe(s);
+  });
+
+  test("a resolve without a choice (plain continue or cancel) leaves choice unset", () => {
+    seq = 0;
+    const s = applyRunEvents(initialRunViewState, [
+      ev({ type: "intervention.request", stepId: "gate", payload: { requestId: "i2", message: "m", sessions: [] } }),
+      ev({ type: "intervention.resolved", stepId: "gate", payload: { requestId: "i2", action: "cancel" } }),
+    ]);
+    expect(s.interventions[0]!.choice).toBeUndefined();
+    expect(s.interventions[0]!.resolved).toBe(true);
+  });
+});
