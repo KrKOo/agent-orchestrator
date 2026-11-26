@@ -38,7 +38,7 @@ flowchart LR
   5. `RunService.ingest` (`runs.ts`) persists into `run_events` and projects into `runs`/`run_steps`/`findings`.
   6. `Hub` (`hub.ts`) fans out to browser subscribers.
   - `runs.definition` is the run's own copy of the flow; `PUT /api/runs/:id/models` rewrites its `harness` models even while the run is live. For a live run the holding runner switches first (`job.setModels`); its `run.models` event is projected into `runs.definition` too, so the stored models follow the runner even when the API call timed out.
-- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 6`):
+- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 7`):
   - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`).
   - Events are at-least-once, deduped by `(runId, seq)`, and acked via `job.ack`.
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).

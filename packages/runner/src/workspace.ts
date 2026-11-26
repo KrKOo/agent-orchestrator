@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
 import { mkdir, realpath, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
-import { type AssignedRun, type GitHubTokenParams, type GitHubTokenResult, type LocalPathWorkspace, PR_DIFF_PATH } from "@orch/protocol";
+import { basename, join } from "node:path";
+import { type AssignedRun, CONTEXT_DIR, type GitHubTokenParams, type GitHubTokenResult, type LocalPathWorkspace, PR_DIFF_PATH } from "@orch/protocol";
 import type { RunnerConfig } from "./config";
 import { isWithinRoot } from "./fs-rpc";
 import { fetchShas, git, gitOk, originRepo } from "./git";
@@ -65,7 +65,7 @@ export function checkoutDir(config: RunnerConfig, runId: string): string {
 export async function prepareWorkspace(run: AssignedRun, config: RunnerConfig, wctx: WorkspaceContext): Promise<PreparedWorkspace> {
   const ws = run.definition.workspace;
   if (ws.kind === "github_checkout") return prepareCheckout(run, config, wctx);
-  return prepareLocalPath(run, ws, config);
+  return prepareLocalPath(run, ws, config, wctx);
 }
 
 /**
@@ -99,16 +99,23 @@ async function prepareCheckout(run: AssignedRun, config: RunnerConfig, wctx: Wor
     repo: { owner, name },
     mounts: [
       { hostPath: dir, containerPath: dir, readonly: true },
-      { hostPath: contextDir, containerPath: dirname(PR_DIFF_PATH), readonly: true },
+      { hostPath: contextDir, containerPath: CONTEXT_DIR, readonly: true },
     ],
   };
 }
 
-async function prepareLocalPath(run: AssignedRun, ws: LocalPathWorkspace, config: RunnerConfig): Promise<PreparedWorkspace> {
+async function prepareLocalPath(run: AssignedRun, ws: LocalPathWorkspace, config: RunnerConfig, wctx: WorkspaceContext): Promise<PreparedWorkspace> {
   if (run.trust !== "owner") throw new Error("Untrusted runs cannot mount local paths");
   const path = await resolveAllowedPath(ws.path, config.allowedRoots);
   const gitDir = join(path, ".git");
   const repo = (await originRepo(path)) ?? undefined;
+  // `git_snapshot` steps write their diffs into `<runDir>/context`, which the sandbox reads at CONTEXT_DIR.
+  const contextMounts: Mount[] = [];
+  if (run.definition.steps.some((s) => s.kind === "git_snapshot")) {
+    const contextDir = join(wctx.runDir, "context");
+    await mkdir(contextDir, { recursive: true });
+    contextMounts.push({ hostPath: contextDir, containerPath: CONTEXT_DIR, readonly: true });
+  }
 
   if (ws.isolation === "worktree") {
     if (!existsSync(gitDir) || !statSync(gitDir).isDirectory()) throw new Error("worktree isolation requires a git repository");
@@ -153,12 +160,13 @@ async function prepareLocalPath(run: AssignedRun, ws: LocalPathWorkspace, config
         // Commits made in the worktree write objects and refs into the common dir.
         { hostPath: gitDir, containerPath: gitDir, readonly: false },
         ...(await gitOverlays(gitDir, true)),
+        ...contextMounts,
       ],
     };
   }
 
   const readonly = ws.access === "ro";
-  const mounts: Mount[] = [{ hostPath: path, containerPath: path, readonly }];
+  const mounts: Mount[] = [{ hostPath: path, containerPath: path, readonly }, ...contextMounts];
   if (!readonly && existsSync(gitDir) && statSync(gitDir).isDirectory()) mounts.push(...(await gitOverlays(gitDir, false)));
   return { hostPath: path, mounts, repo };
 }

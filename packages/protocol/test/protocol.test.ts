@@ -1054,6 +1054,56 @@ describe("intervention choices", () => {
   });
 });
 
+describe("git_snapshot steps", () => {
+  const impl = { id: "impl", name: "Implement", kind: "prompt", prompt: "go" };
+  const snap = { id: "snap", name: "Snapshot", kind: "git_snapshot" };
+  const review = (prompt: string) => ({ id: "review", name: "Review", kind: "prompt", prompt });
+  const errorsOf = (steps: unknown[], extra: Record<string, unknown> = {}) => {
+    const res = validateFlow({ ...baseFlow, ...extra, steps });
+    return res.ok ? [] : res.errors;
+  };
+
+  test("defaults since to previous and works with direct isolation", () => {
+    const res = validateFlow({ ...baseFlow, workspace: { ...baseFlow.workspace, isolation: "direct" }, steps: [impl, snap] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.steps[1]).toMatchObject({ kind: "git_snapshot", since: "previous" });
+    expect(isActionStep(res.flow.steps[1]!)).toBe(false);
+  });
+
+  test("needs a writable local_path workspace outside pull request flows", () => {
+    expect(errorsOf([impl, snap], { workspace: { ...baseFlow.workspace, access: "ro" } })).toEqual([
+      'steps.1 (snap): git_snapshot requires a local_path workspace with access "rw"',
+    ]);
+    expect(errorsOf([snap], { inputs: [], workspace: { kind: "github_checkout" } })).toContain(
+      'steps.0 (snap): git_snapshot requires a local_path workspace with access "rw"',
+    );
+    const pr = validateFlow({ ...prFlow, steps: [...prFlow.steps, snap] });
+    expect(pr.ok ? [] : pr.errors).toContain("steps.1 (snap): flows with a pull request input cannot contain git_snapshot steps");
+  });
+
+  test("templates may read the snapshot's fields, and only those", () => {
+    expect(errorsOf([impl, snap, review("Review {{steps.snap.structured.diffPath}} ({{steps.snap.structured.files}})")])).toEqual([]);
+    const bad = errorsOf([impl, snap, review("{{steps.snap.structured.bogus}}")]);
+    expect(bad[0]).toContain('step "snap" exposes only structured fields steps.snap.structured.tree, steps.snap.structured.base');
+    const cond = { id: "if1", name: "If", kind: "condition", ref: "steps.snap.structured.changed", op: "truthy", thenEnd: "review" };
+    expect(errorsOf([impl, snap, cond, review("r")])).toEqual([]);
+  });
+
+  test("a loop can stop on structured.changed", () => {
+    const loop = (ref: string) => ({ id: "again", name: "Again", kind: "loop", to: "snap", maxIterations: 3, stop: { when: "value", ref, is: "falsy" } });
+    expect(errorsOf([impl, snap, review("r"), loop("snap.structured.changed")])).toEqual([]);
+    expect(errorsOf([impl, snap, review("r"), loop("snap.structured.files")])[0]).toContain('git_snapshot "snap" can stop a loop only on snap.structured.changed');
+    expect(errorsOf([impl, snap, review("r"), loop("snap.output")])[0]).toContain('step "snap" has no text output');
+  });
+
+  test("templateVariables lists the snapshot fields", () => {
+    const res = validateFlow({ ...baseFlow, steps: [impl, snap, review("r")] });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    const paths = templateVariables(res.flow, 2).map((v) => v.path);
+    for (const f of ["tree", "base", "since", "diffPath", "files", "fileCount", "changed"]) expect(paths).toContain(`steps.snap.structured.${f}`);
+  });
+});
+
 describe("RunEvent", () => {
   test("parses run.name and rejects an empty or oversized name", () => {
     const base = { runId: "r1", seq: 1, ts: 1 };

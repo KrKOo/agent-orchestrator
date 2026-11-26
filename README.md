@@ -260,6 +260,70 @@ steps:
 One pick can drive several conditions. A gate inside a loop asks on every pass, so each pass branches on a fresh pick.
 `continue` without a valid choice is rejected (`400`), and the run view shows `Chose: <label>` on the resolved gate.
 
+## Incremental reviews
+
+In a review → fix loop every review pass would otherwise look at the whole feature. A **`git_snapshot` step** records
+the workspace as a git tree (tracked and untracked files; files its `.gitignore` files ignore are left out) in a
+repository the runner keeps in the run directory: the workspace's own repository, its HEAD, branch and index are never
+touched, and no config, hook or filter of it (or of the runner user) applies. It writes the diff from a base to
+`/orch/context/<stepId>.diff` (read-only in the sandbox, cut at 10 MiB) and outputs a `--stat` summary. Only the
+workspace directory is snapshotted: for a `direct` workspace inside a larger repo, files elsewhere in that repo are never
+read, paths are relative to the workspace, and only `.gitignore` files inside the workspace count (a path ignored later
+drops out of later snapshots). Git repositories nested in the workspace (a cloned dependency, a scaffolder's `git init`)
+are recorded as plain files, uncommitted edits included. `since` picks the base:
+
+- `previous` (default): this step's own snapshot from its last pass, so inside a loop only what changed since the last
+  review. The first pass diffs from the run start.
+- `start`: the workspace when the run began (uncommitted changes of a `direct` workspace included), i.e. everything the
+  run changed.
+
+Its structured output is `{{steps.<id>.structured.tree|base|since|diffPath|files|fileCount|changed}}`: tree shas, the
+base used, the diff path, the changed paths (JSON list of at most 500; `fileCount` is the total and the diff has them
+all) and `changed` (false when nothing changed). It needs a `local_path` workspace with access `rw` (either isolation)
+and is not allowed in pull request flows. Incremental reviews inside a loop, a full review at the end, and an outer loop
+around both:
+
+```yaml
+steps:
+  - { id: implement, kind: prompt, name: Implement, prompt: "Implement {{inputs.task}}" }
+  - { id: snap_inc, kind: git_snapshot, name: Changes since last review, since: previous }
+  - id: review_inc
+    kind: prompt
+    name: Review changes
+    freshSession: true
+    prompt: "Review ONLY the diff in {{steps.snap_inc.structured.diffPath}}; the rest was reviewed before."
+    structured:
+      fields:
+        - { name: clean, description: "true if the diff has no issues" }
+        - { name: findings, description: "Issues to fix" }
+  - { id: fix, kind: prompt, name: Fix, prompt: "Fix: {{steps.review_inc.structured.findings}}" }
+  - { id: inc_loop, kind: loop, name: Review/fix, to: snap_inc, maxIterations: 5, stop: { when: value, ref: review_inc.structured.clean, is: truthy } }
+  - { id: snap_full, kind: git_snapshot, name: Whole feature, since: start }
+  - id: review_full
+    kind: prompt
+    name: Review feature
+    freshSession: true
+    prompt: "Review the whole feature in {{steps.snap_full.structured.diffPath}}."
+    structured:
+      fields:
+        - { name: clean, description: "true if the feature has no issues" }
+        - { name: findings, description: "Issues to fix" }
+  - { id: fix_full, kind: prompt, name: Fix feature, prompt: "Fix: {{steps.review_full.structured.findings}}" }
+  - { id: outer, kind: loop, name: Full review, to: snap_inc, maxIterations: 3, stop: { when: value, ref: review_full.structured.clean, is: truthy } }
+```
+
+- A **slash** review works the same way: `{ kind: slash, command: review, args: "Review only the changes in {{steps.snap_inc.structured.diffPath}}" }`
+  (headless `/review` takes its argument as extra instructions).
+- Give review steps `freshSession: true`: agent steps share one ACP session by default, so each pass would also carry
+  every earlier turn.
+- Skip a review when nothing changed with a condition on `steps.snap_inc.structured.changed` (`op: truthy`, `thenEnd`
+  the review step), or stop a loop on it: a `value` stop accepts `<snapshotId>.structured.changed`.
+- After an outer repeat, `snap_inc` diffs from its own last pass, so the incremental review also sees `fix_full`'s changes.
+- **Retries** keep both bases: `previous` comes from the step's stored output (kept even when a condition skipped the
+  step on a later pass) and `start` from the run directory. Only a retry from the first step of a `worktree` run starts
+  over (the worktree is reset); a `direct` workspace keeps the first attempt's edits, so it keeps its start too. A
+  `previous` or `start` tree that is not on the runner (the retry landed on another one) falls back to `start` or to the
+  workspace at the retry, respectively. Both fallbacks are noted in the run log.
 
 ## Structured output
 
