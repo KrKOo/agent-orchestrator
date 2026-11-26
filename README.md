@@ -130,6 +130,56 @@ Delete a runner from its card on the Runners page (`DELETE /api/runners/:id`): i
 disconnected, and the runs it holds are cancelled on the runner and marked `failed` (`runner_deleted`; queued retries pinned
 to it fail with `resume_runner_deleted`). Run history is kept. Deletion is permanent: create a new runner to bring the host back.
 
+## Flow parameters
+
+A flow declares `inputs`; the Run dialog asks for them and templates read them as `{{inputs.<key>}}`. Input types:
+
+|type|run dialog|value|
+|---|---|---|
+|`text`|textarea|string|
+|`select`|choice of `options` (`[{value, label?}]`)|string|
+|`model`|model picker (runners' gateway models)|model id|
+|`path`|path with `Browse…` (runner `allowedRoots`)|absolute path|
+|`number`|number|number|
+|`boolean`|checkbox|boolean|
+|`github_issue`, `github_pull_request`|URL|object (see below)|
+
+Every type but the GitHub ones takes an optional `default`, used when the run leaves the input empty (a required input
+with a default is satisfied by it).
+
+**Bindings** let an input set a flow or step field: `bindings: {"<field>": "<inputKey>"}` on the flow, or on a step for
+its own fields. When a run is created the server writes the input values into a copy of the flow and validates the copy
+like a saved flow; that copy becomes the run's `definition` (retry reuses it). An empty input keeps the field's own value.
+A `workspace.path` outside every runner's `allowedRoots` leaves the run queued, as a fixed path does.
+In the editor, the "fixed value" select under each bindable field binds it, or creates an input from its current value.
+
+|field|value|input types|
+|---|---|---|
+|`workspace.path` (`local_path` only)|string|path, select, text|
+|`workspace.baseRef`|string|text, select|
+|`workspace.isolation`, `workspace.access`|enum|select|
+|`sandbox.image`|string|text, select|
+|`sandbox.cpus`, `sandbox.memoryMb`|number|number, select|
+|`sandbox.network.mode`|enum|select|
+|`sandbox.network.allow`, `runnerLabels`|list (comma/newline separated)|text, select|
+|`harness.model`, `harness.smolModel`, `harness.modelRoles.<role>`|model id|model, select|
+|`approval`|enum|select|
+|step `timeoutSec`; `loop` `maxIterations`|number|number, select|
+|step `freshSession` (prompt/skill/command); `github_pr` `draft`|boolean|boolean|
+|`skill` `skill`, `command`/`slash` `command`, `github_pr` `base`, `condition` `value`|string|text, select|
+
+GitHub inputs cannot be bound, so PR text never becomes configuration. Saving checks that every value known up front
+(each bound input's `default` and `select` options) yields a valid flow, e.g. a `select` offering `open` network in a PR
+flow is rejected. A run value that breaks the flow is a 400 naming the input:
+
+```sh
+curl -X POST localhost:7800/api/flows/<id>/runs -H 'Content-Type: application/json' \
+  -d '{"inputs": {"repo": "/Users/me/src/app", "model": "openai/gpt-5", "cpus": "4"}}'
+# 400 {"errors": ["inputs.cpus: sandbox.cpus: …"]} when the value does not fit the field
+```
+
+Runs started by PR webhook events use the defaults of all other inputs.
+
 ## Pull request reviews (M3)
 
 A pull request is a flow input, like a GitHub issue: declare one input of type `github_pull_request` and paste the
@@ -153,7 +203,7 @@ the final review) → `github_comment` (`target: "pr"`, `bodyFrom` the final pro
 review in the run view.
 
 To run on PR events too, add `trigger: {kind: "github_pull_request", repos: ["owner/name"]}`: each matching event fills the
-PR input (other inputs must be optional and stay empty). Fork and first-time-contributor PRs follow `forkPolicy` — for
+PR input (other inputs must be optional and take their defaults). Fork and first-time-contributor PRs follow `forkPolicy` — for
 webhook events and manual starts alike (default `require_approval`; approve them from the run view; `skip` rejects a manual
 start). Flows with a manual trigger have no policy. With `postChecks` (default `true`), runs of PR-triggered flows — webhook
 or manual — publish a check run on the PR head with progress and finding annotations.

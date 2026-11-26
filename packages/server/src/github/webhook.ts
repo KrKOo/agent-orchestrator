@@ -1,4 +1,4 @@
-import { pullRequestInputOf, type RunStatus } from "@orch/protocol";
+import { isGitHubInput, materializeFlow, parseInputValue, pullRequestInputOf, type RunStatus } from "@orch/protocol";
 import type { Webhooks } from "@octokit/webhooks";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -105,6 +105,34 @@ function createPullRequestRuns(deps: AppDeps, ev: PullRequestEvent): { runId: st
     const dedupeKey = `gh:${flow.id}:${repo}:${pr.number}:${headSha}`;
     if (db.select({ id: runs.id }).from(runs).where(eq(runs.dedupeKey, dedupeKey)).get()) continue;
 
+    // Other inputs are optional on PR-triggered flows (validateFlow): they take the flow author's defaults, so
+    // nothing from the PR reaches a bound field.
+    const inputs: Record<string, unknown> = {};
+    for (const d of flow.definition.inputs) {
+      if (isGitHubInput(d)) inputs[d.key] = null;
+      else {
+        const parsed = parseInputValue(d, "");
+        inputs[d.key] = parsed.ok ? parsed.value : "";
+      }
+    }
+    inputs[prDef.key] = pullRequestInput({
+      url: pr.html_url,
+      repo,
+      number: pr.number,
+      title: pr.title,
+      body: pr.body ?? "",
+      baseSha: pr.base.sha,
+      headSha,
+      untrustedSource,
+    });
+    // Checked before superseding so a flow that cannot run leaves the older runs alone. Saved flows pass this
+    // (validateFlow tries every default); only flows stored before that rule can fail.
+    const materialized = materializeFlow(flow.definition, inputs);
+    if (!materialized.ok) {
+      console.warn(`[webhook] flow ${flow.name} skipped: its defaults do not make a valid flow: ${materialized.errors.join("; ")}`);
+      continue;
+    }
+
     // Supersede older non-terminal runs of this flow for the same PR at another head.
     const older = db
       .select()
@@ -125,20 +153,7 @@ function createPullRequestRuns(deps: AppDeps, ev: PullRequestEvent): { runId: st
     const status = initialPullRunStatus(trigger, untrustedSource);
     if (status === null) continue;
 
-    // Other inputs are optional on PR-triggered flows (validateFlow); leave them empty.
-    const inputs: Record<string, unknown> = {};
-    for (const d of flow.definition.inputs) inputs[d.key] = d.type === "text" ? "" : null;
-    inputs[prDef.key] = pullRequestInput({
-      url: pr.html_url,
-      repo,
-      number: pr.number,
-      title: pr.title,
-      body: pr.body ?? "",
-      baseSha: pr.base.sha,
-      headSha,
-      untrustedSource,
-    });
-    const id = insertRun(deps, flow, inputs, {
+    const id = insertRun(deps, { ...flow, definition: materialized.flow }, inputs, {
       ...(ev.installation ? { installationId: ev.installation.id } : {}),
       dedupeKey,
       status,

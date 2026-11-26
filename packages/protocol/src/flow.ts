@@ -4,13 +4,108 @@ import { templateRefs } from "./template";
 export const ID_RE = /^[a-z][a-z0-9_]*$/;
 export const DOMAIN_RE = /^\.?[a-z0-9-]+(\.[a-z0-9-]+)+$/i;
 
-export const InputDef = z.object({
+const inputBase = {
   key: z.string().regex(ID_RE, "input key must match /^[a-z][a-z0-9_]*$/"),
   label: z.string(),
-  type: z.enum(["text", "github_issue", "github_pull_request"]),
   required: z.boolean().default(true),
+};
+
+/**
+ * One choice of a `select` input: `value` is what the run gets, `label` what the run dialog shows. Values cannot be
+ * padded with whitespace: run values are trimmed (`parseInputValue`), so a padded option could never be picked.
+ */
+export const SelectOption = z.object({
+  value: z
+    .string()
+    .min(1)
+    .refine((v) => v.trim() === v, "option values cannot start or end with whitespace"),
+  label: z.string().optional(),
 });
+export type SelectOption = z.infer<typeof SelectOption>;
+
+/**
+ * A flow parameter. GitHub inputs resolve to objects and only feed templates; the others resolve to a plain
+ * value (`parseInputValue`) that templates read and bindings write into flow fields (`materializeFlow`).
+ * `default` is used when the run leaves the input empty.
+ */
+export const InputDef = z.discriminatedUnion("type", [
+  z.object({ ...inputBase, type: z.literal("text"), default: z.string().optional() }),
+  z
+    .object({
+      ...inputBase,
+      type: z.literal("select"),
+      options: z.array(SelectOption).min(1, "list at least one option"),
+      default: z.string().optional(),
+    })
+    .superRefine((d, ctx) => {
+      const seen = new Set<string>();
+      d.options.forEach((o, i) => {
+        if (seen.has(o.value)) ctx.addIssue({ code: "custom", path: ["options", i, "value"], message: `duplicate option "${o.value}"` });
+        seen.add(o.value);
+      });
+      if (d.default !== undefined && d.default !== "" && !seen.has(d.default)) {
+        ctx.addIssue({ code: "custom", path: ["default"], message: `default "${d.default}" is not one of the options` });
+      }
+    }),
+  z.object({ ...inputBase, type: z.literal("model"), default: z.string().optional() }),
+  z.object({
+    ...inputBase,
+    type: z.literal("path"),
+    default: z
+      .string()
+      .refine((p) => p === "" || p.startsWith("/"), "default must be an absolute path")
+      .optional(),
+  }),
+  z.object({ ...inputBase, type: z.literal("number"), default: z.number().optional() }),
+  z.object({ ...inputBase, type: z.literal("boolean"), default: z.boolean().optional() }),
+  z.object({ ...inputBase, type: z.literal("github_issue") }),
+  z.object({ ...inputBase, type: z.literal("github_pull_request") }),
+]);
 export type InputDef = z.infer<typeof InputDef>;
+export type InputType = InputDef["type"];
+export const INPUT_TYPES: InputType[] = ["text", "select", "model", "path", "number", "boolean", "github_issue", "github_pull_request"];
+export type GitHubInputDef = Extract<InputDef, { type: "github_issue" | "github_pull_request" }>;
+/** Inputs whose resolved value is a plain string, number or boolean. */
+export type ValueInputDef = Exclude<InputDef, GitHubInputDef>;
+export type ValueInputType = ValueInputDef["type"];
+/** Resolved value of a `ValueInputDef`; `""` when the input was left empty without a default. */
+export type InputValue = string | number | boolean;
+
+export function isGitHubInput(def: InputDef): def is GitHubInputDef {
+  return def.type === "github_issue" || def.type === "github_pull_request";
+}
+
+/** A resolved input left empty: `""` for value inputs, `null` for GitHub inputs. */
+export function isEmptyInputValue(value: unknown): boolean {
+  return value === "" || value === null || value === undefined;
+}
+
+/**
+ * Parses the raw text of a value input (run dialog, API) into its stored value. Empty (blank) text yields the
+ * input's `default`, or `""` without one; whether a required input may stay empty is the caller's check.
+ */
+export function parseInputValue(def: ValueInputDef, raw: string): { ok: true; value: InputValue } | { ok: false; error: string } {
+  const text = raw.trim();
+  if (text === "") return { ok: true, value: def.default ?? "" };
+  switch (def.type) {
+    case "text":
+      return { ok: true, value: raw };
+    case "model":
+      return { ok: true, value: text };
+    case "path":
+      return text.startsWith("/") ? { ok: true, value: text } : { ok: false, error: "must be an absolute path" };
+    case "select":
+      return def.options.some((o) => o.value === text)
+        ? { ok: true, value: text }
+        : { ok: false, error: `must be one of ${def.options.map((o) => o.value).join(", ")}` };
+    case "number": {
+      const n = Number(text);
+      return Number.isFinite(n) ? { ok: true, value: n } : { ok: false, error: "must be a number" };
+    }
+    case "boolean":
+      return text === "true" || text === "false" ? { ok: true, value: text === "true" } : { ok: false, error: "must be true or false" };
+  }
+}
 
 /** Subfields exposed by a resolved `github_issue` input. */
 export const GITHUB_ISSUE_FIELDS = ["url", "repo", "number", "title", "body"] as const;
@@ -199,11 +294,19 @@ export const StructuredOutput = z.object({
 });
 export type StructuredOutput = z.infer<typeof StructuredOutput>;
 
+/**
+ * Field path → input key: the input's value replaces the field when a run is created (`materializeFlow`); an
+ * empty input keeps the field's own value. Optional so stored definitions from before bindings stay valid.
+ */
+const Bindings = z.record(z.string(), z.string().min(1)).optional();
+
 const stepBase = {
   id: z.string().regex(ID_RE, "step id must match /^[a-z][a-z0-9_]*$/"),
   name: z.string().min(1),
   /** `0` means no timeout: the step runs until it finishes or the run is cancelled. */
   timeoutSec: z.number().int().min(0).default(1800),
+  /** Step field (`STEP_BINDABLE_FIELDS`) → input key; kept on the step so it follows renames and moves. */
+  bindings: Bindings,
 };
 
 export const PromptStep = z.object({
@@ -528,6 +631,8 @@ export const FlowDefinition = z.object({
   runnerLabels: z.array(z.string().min(1)).default([]),
   trigger: Trigger.default({ kind: "manual" }),
   steps: z.array(Step).min(1, "flow needs at least one step"),
+  /** Flow field path (`FLOW_BINDABLE_FIELDS`, `harness.modelRoles.<role>`) → input key. */
+  bindings: Bindings,
 });
 export type FlowDefinition = z.infer<typeof FlowDefinition>;
 export type FlowDefinitionInput = z.input<typeof FlowDefinition>;
@@ -555,7 +660,7 @@ export function stepTemplates(step: Step): [string, string][] {
 }
 
 /** Subfields an object-valued input exposes to templates. */
-const INPUT_FIELDS: Record<Exclude<InputDef["type"], "text">, readonly string[]> = {
+const INPUT_FIELDS: Record<GitHubInputDef["type"], readonly string[]> = {
   github_issue: GITHUB_ISSUE_FIELDS,
   github_pull_request: PR_INPUT_FIELDS,
 };
@@ -576,7 +681,7 @@ function checkRef(
   if (parts[0] === "inputs") {
     const input = parts[1] === undefined ? undefined : inputs.get(parts[1]);
     if (!input) return `references undeclared input "${parts[1] ?? ""}"`;
-    if (input.type === "text") return parts.length === 2 ? null : `text input "${input.key}" has no subfields`;
+    if (!isGitHubInput(input)) return parts.length === 2 ? null : `${input.type} input "${input.key}" has no subfields`;
     if (parts.length === 2) return null;
     const fields = INPUT_FIELDS[input.type];
     if (parts.length === 3 && fields.includes(parts[2]!)) return null;
@@ -639,6 +744,8 @@ export function templateVariables(def: FlowDefinition, stepIndex: number): Templ
     const label = input.label || input.key;
     if (input.type === "text") {
       add(`inputs.${input.key}`, label);
+    } else if (!isGitHubInput(input)) {
+      add(`inputs.${input.key}`, `${label} (${input.type})`);
     } else if (input.type === "github_issue") {
       add(`inputs.${input.key}`, `${label} (GitHub issue, JSON)`);
       for (const f of GITHUB_ISSUE_FIELDS) add(`inputs.${input.key}.${f}`, `${label}: issue ${f}`);
@@ -684,6 +791,15 @@ export function validateFlow(input: unknown): ValidateResult {
     };
   }
   const flow = parsed.data;
+  // Zod strips unknown keys, so the raw input decides whether `structured` was declared (slash stays text-only).
+  const rawSteps = input && typeof input === "object" && "steps" in input ? input.steps : undefined;
+  const errors = checkFlow(flow, rawSteps);
+  errors.push(...bindingErrors(flow, new Set(errors)));
+  return errors.length ? { ok: false, errors } : { ok: true, flow };
+}
+
+/** Rules zod cannot express, on a parsed flow (bindings not applied); `rawSteps` are the steps before parsing. */
+function checkFlow(flow: FlowDefinition, rawSteps: unknown): string[] {
   const errors: string[] = [];
 
   const inputs = new Map<string, InputDef>();
@@ -827,8 +943,6 @@ export function validateFlow(input: unknown): ValidateResult {
         ids.add(c.id);
       }
     }
-    // Zod strips unknown keys, so the raw input decides whether `structured` was declared (slash stays text-only).
-    const rawSteps = input && typeof input === "object" && "steps" in input ? input.steps : undefined;
     const rawStep = Array.isArray(rawSteps) ? rawSteps[idx] : undefined;
     if (!isAgentStep(step) && rawStep && typeof rawStep === "object" && "structured" in rawStep) {
       errors.push(`${where}.structured: only prompt/skill/command steps can declare structured output`);
@@ -849,7 +963,7 @@ export function validateFlow(input: unknown): ValidateResult {
     }
     if (step.kind === "github_comment") {
       const target = inputs.get(step.target);
-      if (!target || target.type === "text" || !target.required) {
+      if (!target || !isGitHubInput(target) || !target.required) {
         errors.push(`${where}.target: "${step.target}" must be a required github_issue or github_pull_request input`);
       }
 
@@ -902,7 +1016,261 @@ export function validateFlow(input: unknown): ValidateResult {
     if (isTextStep(step)) textSteps.add(step.id);
   });
 
-  return errors.length ? { ok: false, errors } : { ok: true, flow };
+  return errors;
+}
+
+/** How a bound input value is written into a field: `list` splits text on commas and newlines. */
+export type BindingValueKind = "string" | "number" | "boolean" | "list";
+export interface BindableField {
+  label: string;
+  kind: BindingValueKind;
+  /** Input types that may set the field. GitHub inputs never do: untrusted PR text must not become configuration. */
+  types: readonly ValueInputType[];
+  /** The values of an enum field: the options a `select` input for it can offer. */
+  options?: readonly string[];
+}
+
+/** Flow-level fields an input can set, by dotted path. `harness.modelRoles.<role>` is bindable too (`MODEL_ROLE_FIELD`). */
+export const FLOW_BINDABLE_FIELDS: Record<string, BindableField & { localPathOnly?: true }> = {
+  "workspace.path": { label: "Workspace path", kind: "string", types: ["path", "select", "text"], localPathOnly: true },
+  "workspace.baseRef": { label: "Base ref", kind: "string", types: ["text", "select"], localPathOnly: true },
+  "workspace.isolation": {
+    label: "Isolation",
+    kind: "string",
+    types: ["select"],
+    options: LocalPathWorkspace.shape.isolation.unwrap().options,
+    localPathOnly: true,
+  },
+  "workspace.access": {
+    label: "Access",
+    kind: "string",
+    types: ["select"],
+    options: LocalPathWorkspace.shape.access.unwrap().options,
+    localPathOnly: true,
+  },
+  "sandbox.image": { label: "Sandbox image", kind: "string", types: ["text", "select"] },
+  "sandbox.cpus": { label: "CPUs", kind: "number", types: ["number", "select"] },
+  "sandbox.memoryMb": { label: "Memory (MB)", kind: "number", types: ["number", "select"] },
+  "sandbox.network.mode": { label: "Network", kind: "string", types: ["select"], options: NetworkPolicy.shape.mode.unwrap().options },
+  "sandbox.network.allow": { label: "Allowed domains", kind: "list", types: ["text", "select"] },
+  "harness.model": { label: "Model", kind: "string", types: ["model", "select"] },
+  "harness.smolModel": { label: "Small model", kind: "string", types: ["model", "select"] },
+  approval: { label: "Tool approval", kind: "string", types: ["select"], options: FlowDefinition.shape.approval.unwrap().options },
+  runnerLabels: { label: "Runner labels", kind: "list", types: ["text", "select"] },
+};
+export const MODEL_ROLE_BINDING_PREFIX = "harness.modelRoles.";
+const MODEL_ROLE_FIELD: BindableField = { label: "Model role", kind: "string", types: ["model", "select"] };
+
+/** Step fields an input can set, with the step kinds that have them. */
+export const STEP_BINDABLE_FIELDS: Record<string, BindableField & { kinds: readonly StepKind[] }> = {
+  timeoutSec: {
+    label: "Timeout (seconds)",
+    kind: "number",
+    types: ["number", "select"],
+    kinds: STEP_KINDS.filter((k) => k !== "condition"),
+  },
+  freshSession: { label: "Fresh session", kind: "boolean", types: ["boolean"], kinds: ["prompt", "skill", "command"] },
+  skill: { label: "Skill", kind: "string", types: ["select", "text"], kinds: ["skill"] },
+  command: { label: "Command", kind: "string", types: ["select", "text"], kinds: ["command", "slash"] },
+  base: { label: "Base branch", kind: "string", types: ["text", "select"], kinds: ["github_pr"] },
+  draft: { label: "Draft", kind: "boolean", types: ["boolean"], kinds: ["github_pr"] },
+  maxIterations: { label: "Max iterations", kind: "number", types: ["number", "select"], kinds: ["loop"] },
+  value: { label: "Value", kind: "string", types: ["text", "select"], kinds: ["condition"] },
+};
+
+/** One binding of a flow: `path` is the flow field path or `steps.<id>.<field>`; `value` the field's own value. */
+export interface FlowBinding {
+  key: string;
+  path: string;
+  field: BindableField;
+  value: unknown;
+}
+
+/**
+ * Value at dotted `path` in `obj`, reading own properties only: a missing role such as `harness.modelRoles.constructor`
+ * is undefined, not `Object.prototype.constructor`.
+ */
+export function valueAtPath(obj: unknown, path: string): unknown {
+  let value = obj;
+  for (const part of path.split(".")) {
+    if (value === null || typeof value !== "object" || !Object.hasOwn(value, part)) return undefined;
+    value = (value as Record<string, unknown>)[part];
+  }
+  return value;
+}
+
+/** The valid bindings of `def` (in flow order, flow fields first), e.g. to show what an input sets. */
+export function flowBindings(def: FlowDefinition): FlowBinding[] {
+  const out: FlowBinding[] = [];
+  for (const [path, key] of Object.entries(def.bindings ?? {})) {
+    const lookup = flowBindableField(def, path);
+    if (lookup.ok) out.push({ key, path, field: lookup.field, value: valueAtPath(def, path) });
+  }
+  for (const step of def.steps) {
+    for (const [field, key] of Object.entries(step.bindings ?? {})) {
+      const lookup = stepBindableField(step, field);
+      if (lookup.ok) out.push({ key, path: `steps.${step.id}.${field}`, field: lookup.field, value: valueAtPath(step, field) });
+    }
+  }
+  return out;
+}
+
+type FieldLookup = { ok: true; field: BindableField } | { ok: false; error: string };
+
+/** The bindable flow field at `path`, or why `path` cannot be bound in this flow. */
+export function flowBindableField(def: Pick<FlowDefinition, "workspace">, path: string): FieldLookup {
+  if (path.startsWith(MODEL_ROLE_BINDING_PREFIX)) {
+    const role = path.slice(MODEL_ROLE_BINDING_PREFIX.length);
+    if (role === "default") return { ok: false, error: "bind harness.model instead" };
+    if (role === "smol") return { ok: false, error: "bind harness.smolModel instead" };
+    if (!ID_RE.test(role)) return { ok: false, error: "role must match /^[a-z][a-z0-9_]*$/" };
+    return { ok: true, field: MODEL_ROLE_FIELD };
+  }
+  if (!Object.hasOwn(FLOW_BINDABLE_FIELDS, path)) return { ok: false, error: "not a field inputs can set" };
+  const field = FLOW_BINDABLE_FIELDS[path]!;
+  if (field.localPathOnly && def.workspace.kind !== "local_path") return { ok: false, error: `only local_path workspaces have this field` };
+  return { ok: true, field };
+}
+
+/** The bindable field `field` of `step`, or why it cannot be bound on this step. */
+export function stepBindableField(step: Step, field: string): FieldLookup {
+  if (!Object.hasOwn(STEP_BINDABLE_FIELDS, field)) return { ok: false, error: "not a field inputs can set" };
+  const spec = STEP_BINDABLE_FIELDS[field]!;
+  if (!spec.kinds.includes(step.kind)) return { ok: false, error: `${step.kind} steps have no bindable ${field}` };
+  if (step.kind === "condition" && !conditionNeedsValue(step.op)) return { ok: false, error: `"${step.op}" takes no value` };
+  return { ok: true, field: spec };
+}
+
+/** A binding written into a flow copy; `prefixes` start the error messages that concern its field. */
+interface AppliedBinding {
+  key: string;
+  prefixes: string[];
+}
+
+/** Starts of the validation errors on a bound field: zod issues name a step by index, `checkFlow` by index and id. */
+function errorPrefixes(target: { path: string } | { idx: number; id: string; field: string }): string[] {
+  if ("path" in target) return [`${target.path}:`, `${target.path}.`];
+  const { idx, id, field } = target;
+  return [`steps.${idx}.${field}:`, `steps.${idx}.${field}.`, `steps.${idx} (${id}).${field}:`];
+}
+
+function bindingValue(value: unknown, kind: BindingValueKind): unknown {
+  switch (kind) {
+    case "string":
+      return String(value);
+    // A `select` value is text; a non-numeric one becomes NaN, which the schema rejects.
+    case "number":
+      return typeof value === "number" ? value : Number(String(value).trim());
+    case "boolean":
+      return typeof value === "boolean" ? value : String(value).trim() === "true";
+    case "list":
+      return String(value)
+        .split(/[,\n]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+  }
+}
+
+/** Sets `obj.<path>`, creating missing objects on the way (e.g. a new `harness.modelRoles`). */
+function setPath(obj: Record<string, unknown>, path: string[], value: unknown): void {
+  let cur = obj;
+  for (const part of path.slice(0, -1)) {
+    const next = cur[part];
+    if (next === null || typeof next !== "object") cur[part] = {};
+    cur = cur[part] as Record<string, unknown>;
+  }
+  cur[path.at(-1)!] = value;
+}
+
+/**
+ * Copy of `def` with every binding whose input is not empty written into its field, and all bindings removed.
+ * Bindings that are not valid for the flow are skipped (`validateFlow` reports them).
+ */
+function applyBindings(def: FlowDefinition, inputs: Record<string, unknown>): { copy: FlowDefinition; applied: AppliedBinding[] } {
+  const copy = structuredClone(def);
+  const applied: AppliedBinding[] = [];
+  for (const [path, key] of Object.entries(def.bindings ?? {})) {
+    const lookup = flowBindableField(def, path);
+    if (!lookup.ok || isEmptyInputValue(inputs[key])) continue;
+    setPath(copy as unknown as Record<string, unknown>, path.split("."), bindingValue(inputs[key], lookup.field.kind));
+    applied.push({ key, prefixes: errorPrefixes({ path }) });
+  }
+  def.steps.forEach((step, idx) => {
+    for (const [field, key] of Object.entries(step.bindings ?? {})) {
+      const lookup = stepBindableField(step, field);
+      if (!lookup.ok || isEmptyInputValue(inputs[key])) continue;
+      (copy.steps[idx] as Record<string, unknown>)[field] = bindingValue(inputs[key], lookup.field.kind);
+      applied.push({ key, prefixes: errorPrefixes({ idx, id: step.id, field }) });
+    }
+  });
+  delete copy.bindings;
+  for (const step of copy.steps) delete step.bindings;
+  return { copy, applied };
+}
+
+/**
+ * The flow a run executes: `def` with the bound fields set from the resolved `inputs` (empty inputs keep the
+ * field's value), without bindings, validated whole. Errors on a bound field come back as `inputs.<key>: …`.
+ */
+export function materializeFlow(def: FlowDefinition, inputs: Record<string, unknown>): ValidateResult {
+  const { copy, applied } = applyBindings(def, inputs);
+  const v = validateFlow(copy);
+  if (v.ok) return v;
+  return {
+    ok: false,
+    errors: v.errors.map((e) => {
+      const by = applied.find((a) => a.prefixes.some((p) => e.startsWith(p)));
+      return by ? `inputs.${by.key}: ${e}` : e;
+    }),
+  };
+}
+
+/**
+ * Binding errors: unknown or inapplicable fields, missing or GitHub inputs, incompatible input types. Then every
+ * value known at save time (each bound input's default and select options, other inputs empty) must yield a
+ * valid flow; errors beyond `baseline` (the flow's own) are reported on the binding they come from.
+ */
+function bindingErrors(flow: FlowDefinition, baseline: Set<string>): string[] {
+  const errors: string[] = [];
+  const inputs = new Map(flow.inputs.map((i) => [i.key, i]));
+  const bound = new Map<ValueInputDef, { where: string; prefixes: string[] }[]>();
+  const check = (where: string, prefixes: string[], lookup: FieldLookup, key: string) => {
+    if (!lookup.ok) return errors.push(`${where}: ${lookup.error}`);
+    const input = inputs.get(key);
+    if (!input) return errors.push(`${where}: references undeclared input "${key}"`);
+    if (isGitHubInput(input)) return errors.push(`${where}: ${input.type} input "${key}" cannot set flow fields`);
+    if (!lookup.field.types.includes(input.type)) {
+      return errors.push(`${where}: a ${input.type} input cannot set ${lookup.field.label} (use ${lookup.field.types.join(" or ")})`);
+    }
+    bound.set(input, [...(bound.get(input) ?? []), { where, prefixes }]);
+  };
+  for (const [path, key] of Object.entries(flow.bindings ?? {})) {
+    check(`bindings.${path}`, errorPrefixes({ path }), flowBindableField(flow, path), key);
+  }
+  flow.steps.forEach((step, idx) => {
+    for (const [field, key] of Object.entries(step.bindings ?? {})) {
+      check(`steps.${idx} (${step.id}).bindings.${field}`, errorPrefixes({ idx, id: step.id, field }), stepBindableField(step, field), key);
+    }
+  });
+  if (errors.length) return errors;
+
+  for (const [input, bindings] of bound) {
+    const candidates: { value: InputValue; what: string }[] = [];
+    if (input.default !== undefined && input.default !== "") candidates.push({ value: input.default, what: `default ${JSON.stringify(input.default)}` });
+    if (input.type === "select") {
+      for (const o of input.options) if (o.value !== input.default) candidates.push({ value: o.value, what: `option "${o.value}"` });
+    }
+    for (const { value, what } of candidates) {
+      const v = validateFlow(applyBindings(flow, { [input.key]: value }).copy);
+      if (v.ok) continue;
+      for (const e of v.errors) {
+        if (baseline.has(e)) continue;
+        const where = (bindings.find((b) => b.prefixes.some((p) => e.startsWith(p))) ?? bindings[0]!).where;
+        errors.push(`${where}: with ${what} of input "${input.key}": ${e}`);
+      }
+    }
+  }
+  return errors;
 }
 
 /** Validates a `value` stop's ref: `<stepId>.output` of a text step or `<stepId>.structured.<field>` of an agent step, directly in body `[start, end)`. */

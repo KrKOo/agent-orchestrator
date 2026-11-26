@@ -99,7 +99,9 @@ export function Flows() {
                     : "manual"}
                 </span>
                 <span className="cell-workspace mono small">
-                  {f.definition.workspace.kind === "local_path" ? f.definition.workspace.path : "PR checkout"}
+                  {f.definition.workspace.kind === "local_path"
+                    ? `${f.definition.workspace.path}${f.definition.bindings?.["workspace.path"] ? ` · input ${f.definition.bindings["workspace.path"]}` : ""}`
+                    : "PR checkout"}
                 </span>
                 <span className="cell-version">v{f.version}</span>
                 <span className="cell-updated">

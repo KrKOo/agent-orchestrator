@@ -343,6 +343,26 @@ describe("GitHub webhook", () => {
     const runId = (await deliver(prPayload())).json.runIds![0]!;
     expect(deps.runs.get(runId)!.inputs).toMatchObject({ focus: "", pr: { number: 7 } });
   });
+
+  test("bound optional inputs of a PR-triggered flow take their defaults", async () => {
+    const { deps, deliver } = setup();
+    const def = prFlowDef();
+    addFlow(deps, {
+      ...def,
+      inputs: [
+        ...def.inputs,
+        { key: "model", label: "Model", type: "model", required: false, default: "openai/gpt-5" },
+        { key: "size", label: "CPUs", type: "number", required: false },
+      ],
+      bindings: { "harness.model": "model", "sandbox.cpus": "size" },
+    });
+    const runId = (await deliver(prPayload())).json.runIds![0]!;
+    const run = deps.runs.get(runId)!;
+    expect(run.inputs).toMatchObject({ model: "openai/gpt-5", size: "", pr: { number: 7 } });
+    expect(run.definition.harness.model).toBe("openai/gpt-5");
+    expect(run.definition.sandbox.cpus).toBe(2); // no default: the flow's value stays
+    expect(run.definition.bindings).toBeUndefined();
+  });
 });
 
 describe("manual PR runs", () => {

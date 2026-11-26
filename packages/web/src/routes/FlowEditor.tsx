@@ -6,6 +6,7 @@ import {
   type FlowDefinition,
   type FlowRow,
   isAgentStep,
+  isGitHubInput,
   isTextStep,
   loopRanges,
   pullRequestInputOf,
@@ -108,7 +109,7 @@ function newStep(kind: StepKind, id: string, def: FlowDefinition, at: number): S
     case "intervention":
       return { id, name: KIND_LABEL[kind], kind, message: "" };
     case "github_comment": {
-      const target = pullRequestInputOf({ inputs }) ?? inputs.find((i) => i.required && i.type !== "text");
+      const target = pullRequestInputOf({ inputs }) ?? inputs.find((i) => i.required && isGitHubInput(i));
       return { ...base, kind, target: target?.key ?? "", bodyFrom: earlier.filter(isTextStep).at(-1)?.id ?? "" };
     }
     case "loop":
@@ -828,6 +829,7 @@ export function FlowEditor() {
                 catalog={catalog.data}
                 errors={errorsByNode.get(selectedIdx) ?? []}
                 onChange={(step) => setSteps(draft.steps.map((s, i) => (i === selectedIdx ? step : s)))}
+                onChangeDef={update}
                 onMove={(delta) => {
                   const to = selectedIdx + delta;
                   const steps = draft.steps.slice();

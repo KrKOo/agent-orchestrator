@@ -8,6 +8,7 @@ import {
   type FlowDefinition,
   type InterventionChoice,
   isAgentStep,
+  isGitHubInput,
   isTextStep,
   LOOP_MAX_ITERATIONS,
   type LoopStep,
@@ -17,8 +18,9 @@ import {
   type TemplateVariable,
   templateVariables,
 } from "@orch/protocol";
-import { useId, useRef } from "react";
+import { type ReactNode, useId, useRef } from "react";
 import { ArrowDown, ArrowUp, Plus, TriangleAlert, X } from "lucide-react";
+import { BindInput } from "./BindInput";
 import { KindIcon } from "./icons";
 
 export const KIND_LABEL: Record<Step["kind"], string> = {
@@ -159,11 +161,13 @@ function ConditionFields({
   step,
   def,
   index,
+  bind,
   set,
 }: {
   step: ConditionStep;
   def: FlowDefinition;
   index: number;
+  bind: (field: string) => ReactNode;
   set: (patch: Partial<ConditionStep>) => void;
 }) {
   // `ref` candidates: the template variables `templateVariables` lists for this step (inputs and earlier
@@ -233,6 +237,7 @@ function ConditionFields({
           <small className="muted">
             Compares <code>{`{{${step.ref}}}`}</code>, the option picked at "{gate.name}", against its id.
           </small>
+          {bind("value")}
         </label>
       ) : (
         conditionNeedsValue(step.op) && (
@@ -240,6 +245,7 @@ function ConditionFields({
             <span>Value</span>
             <input value={step.value ?? ""} onChange={(e) => set({ value: e.target.value })} />
             <small className="muted">Compared as text (trimmed): equals/not_equals match the whole value, contains searches it.</small>
+            {bind("value")}
           </label>
         )
       )}
@@ -296,8 +302,14 @@ function ConditionFields({
 
   /** Switching the op: without a value it drops `value`, with one it starts empty (validateFlow needs a value). */
   function setOp(op: ConditionOp) {
-    if (!conditionNeedsValue(op)) set({ op, value: undefined });
-    else set({ op, value: step.value ?? "" });
+    if (!conditionNeedsValue(op)) {
+      // An op without a value has no value to bind either.
+      const bindings = { ...step.bindings };
+      delete bindings.value;
+      set({ op, value: undefined, bindings: Object.keys(bindings).length ? bindings : undefined });
+    } else {
+      set({ op, value: step.value ?? "" });
+    }
   }
 }
 
@@ -308,6 +320,7 @@ export function StepPanel({
   catalog,
   errors,
   onChange,
+  onChangeDef,
   onMove,
   onDelete,
 }: {
@@ -316,13 +329,16 @@ export function StepPanel({
   catalog: Catalog | undefined;
   errors: string[];
   onChange: (step: Step) => void;
+  /** Whole-flow edits: binding a step field to an input may add the input. */
+  onChangeDef: (def: FlowDefinition) => void;
   onMove: (delta: -1 | 1) => void;
   onDelete: () => void;
 }) {
   const step = def.steps[index]!;
   const earlierSteps = def.steps.slice(0, index);
   const earlierAgentSteps = earlierSteps.filter(isAgentStep);
-  const githubInputs = def.inputs.filter((i) => i.type !== "text");
+  const githubInputs = def.inputs.filter(isGitHubInput);
+  const bind = (field: string) => <BindInput def={def} target={{ step: index, field }} onChange={onChangeDef} />;
   const set = (patch: Partial<Step>) => onChange({ ...step, ...patch } as Step);
 
   /** Select of an earlier step whose output feeds `patchKey`; agent steps unless `sources` says otherwise.
@@ -374,6 +390,7 @@ export function StepPanel({
           ))}
         </select>
         {current?.description && <small className="muted">{current.description}</small>}
+        {bind(kind)}
       </label>
     );
   };
@@ -453,6 +470,7 @@ export function StepPanel({
           {step.kind === "intervention" && step.timeoutSec === undefined && (
             <small className="muted">Empty = wait forever (until answered or the run is cancelled)</small>
           )}
+          {bind("timeoutSec")}
         </label>
       )}
 
@@ -474,8 +492,8 @@ export function StepPanel({
         </>
       )}
 
-      {step.kind === "loop" && <LoopFields step={step} def={def} index={index} vars={vars} set={set} />}
-      {step.kind === "condition" && <ConditionFields step={step} def={def} index={index} set={set} />}
+      {step.kind === "loop" && <LoopFields step={step} def={def} index={index} vars={vars} bind={bind} set={set} />}
+      {step.kind === "condition" && <ConditionFields step={step} def={def} index={index} bind={bind} set={set} />}
 
       {step.kind === "prompt" && (
         <TemplateField label="Prompt" rows={8} value={step.prompt} vars={vars} onChange={(prompt) => set({ prompt })} />
@@ -495,6 +513,7 @@ export function StepPanel({
             Runs <code>{`omp -p /${step.command || "<command>"}`}</code> headless in the sandbox — e.g. <code>review</code>,{" "}
             <code>plan</code>, <code>init</code>.
           </small>
+          {bind("command")}
         </label>
       )}
       {step.kind === "slash" && (
@@ -549,6 +568,7 @@ export function StepPanel({
             />
             Start a fresh agent session for this step
           </label>
+          {bind("freshSession")}
           <div className="field">
             <span>Structured output (optional)</span>
             <small className="muted">
@@ -614,11 +634,13 @@ export function StepPanel({
               value={step.base ?? ""}
               onChange={(e) => set({ base: e.target.value === "" ? undefined : e.target.value })}
             />
+            {bind("base")}
           </label>
           <label className="check">
             <input type="checkbox" checked={step.draft} onChange={(e) => set({ draft: e.target.checked })} />
             Open as draft
           </label>
+          {bind("draft")}
         </>
       )}
       {step.kind === "github_comment" && (
@@ -657,12 +679,14 @@ function LoopFields({
   def,
   index,
   vars,
+  bind,
   set,
 }: {
   step: LoopStep;
   def: FlowDefinition;
   index: number;
   vars: TemplateVariable[];
+  bind: (field: string) => ReactNode;
   set: (patch: Partial<LoopStep>) => void;
 }) {
   const group = useId();
@@ -709,6 +733,7 @@ function LoopFields({
           onChange={(e) => set({ maxIterations: Number(e.target.value) })}
         />
         <small className="muted">1–{LOOP_MAX_ITERATIONS}: the body runs at most this many times.</small>
+        {bind("maxIterations")}
       </label>
 
       <div className="field">
@@ -782,6 +807,7 @@ function LoopFields({
               onChange={(e) => set({ timeoutSec: e.target.value === "" ? undefined : Number(e.target.value) })}
             />
             <small className="muted">Caps each wait for an answer; empty = wait forever.</small>
+            {bind("timeoutSec")}
           </label>
           <p className="muted small">
             The run pauses here like an intervention: chat with the run's sessions, then repeat from the start of the body or

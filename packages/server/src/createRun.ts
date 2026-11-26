@@ -90,6 +90,8 @@ export function runNamePrompt(def: FlowDefinition, inputs: Record<string, unknow
       text = unwrapUntrustedText(v.title);
     } else if (typeof value === "string" && value.trim()) {
       text = value.trim();
+    } else if (typeof value === "number" || typeof value === "boolean") {
+      text = String(value);
     } else {
       continue;
     }

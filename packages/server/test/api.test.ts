@@ -463,6 +463,52 @@ describe("runs API", () => {
     expect((await post({ stepId: "gate", action: "continue", choice: "fix" })).json).toEqual({ ok: true });
     expect(link.of("intervention.respond").at(-1)).toEqual({ t: "intervention.respond", runId: running, requestId: "req", action: "continue", choice: "fix" });
   });
+
+  test("bound inputs set the run's own definition; bad values are 400 inputs.<key> errors", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const created = await call("POST", "/api/flows", {
+      name: "Params",
+      inputs: [
+        { key: "model", label: "Model", type: "model", required: false },
+        { key: "repo", label: "Repo", type: "path", required: false },
+        { key: "net", label: "Network", type: "select", required: false, options: [{ value: "gateway_only" }, { value: "allowlist" }] },
+        { key: "mem", label: "Memory", type: "number", required: false },
+      ],
+      workspace: { kind: "local_path", path: "/Users/me/Documents/repo" },
+      harness: { id: "omp", model: "anthropic/claude-sonnet-4-5" },
+      bindings: { "harness.model": "model", "workspace.path": "repo", "sandbox.network.mode": "net", "sandbox.memoryMb": "mem" },
+      steps: [{ id: "impl", name: "Implement", kind: "prompt", prompt: "go" }],
+    });
+    expect(created.status).toBe(201);
+    const flow = created.json as FlowRow;
+    const start = (inputs: Record<string, string>) => call("POST", `/api/flows/${flow.id}/runs`, { inputs });
+
+    const ok = await start({ model: "openai/gpt-5", repo: "/Users/me/Documents/other", net: "allowlist", mem: "8192" });
+    expect(ok.status).toBe(201);
+    expect((ok.json as RunRow).inputs).toEqual({ model: "openai/gpt-5", repo: "/Users/me/Documents/other", net: "allowlist", mem: 8192 });
+    const def = deps.runs.get((ok.json as RunRow).id)!.definition;
+    expect(def.harness.model).toBe("openai/gpt-5");
+    expect(def.workspace).toMatchObject({ kind: "local_path", path: "/Users/me/Documents/other" });
+    expect(def.sandbox).toMatchObject({ network: { mode: "allowlist" }, memoryMb: 8192 });
+    expect(def.bindings).toBeUndefined();
+
+    // Empty inputs keep the flow's own values.
+    const plain = await start({});
+    expect(plain.status).toBe(201);
+    const plainDef = deps.runs.get((plain.json as RunRow).id)!.definition;
+    expect(plainDef.harness.model).toBe("anthropic/claude-sonnet-4-5");
+    expect(plainDef.workspace).toMatchObject({ path: "/Users/me/Documents/repo" });
+
+    expect(await start({ repo: "relative/dir" })).toEqual({ status: 400, json: { errors: ["inputs.repo: must be an absolute path"] } });
+    expect(await start({ net: "open" })).toEqual({ status: 400, json: { errors: ["inputs.net: must be one of gateway_only, allowlist"] } });
+    expect(await start({ mem: "lots" })).toEqual({ status: 400, json: { errors: ["inputs.mem: must be a number"] } });
+    // Parses as a number but breaks the flow once written into the field (memoryMb must be an integer).
+    const broken = await start({ mem: "1.5" });
+    expect(broken.status).toBe(400);
+    expect(broken.json.errors).toHaveLength(1);
+    expect(broken.json.errors[0]).toStartWith("inputs.mem: sandbox.memoryMb: ");
+  });
 });
 
 afterEach(() => {
