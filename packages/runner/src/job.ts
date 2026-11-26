@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type * as acp from "@agentclientprotocol/sdk";
 import {
@@ -40,13 +40,17 @@ import {
   harnessModelErrors,
   type JobSetModelsResult,
   type ModelEntry,
+  type GitSnapshotStep,
+  type SnapshotOutput,
+  snapshotDiffPath,
+  SNAPSHOT_FILES_LIMIT,
 } from "@orch/protocol";
 import { ulid } from "ulid";
 import { AcpHarness } from "./acp-session";
 import type { RunnerConfig } from "./config";
 import type { RunnerRpcMethod } from "./connection";
 import type { Gateway } from "./gateway";
-import { commitAll, pushBranch } from "./git";
+import { commitAll, diffTrees, pushBranch, snapshotStore, snapshotTree, treeExists } from "./git";
 import { harnessRoleModels, harnesses } from "./harness/omp";
 import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
@@ -57,6 +61,7 @@ import { TRUNCATED_MARK } from "./outbox";
 import type { Mount, Sandbox, SandboxProcess, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
 import { ToolUpdateCompactor } from "./tool-updates";
+import { isWithinRoot } from "./fs-rpc";
 import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
 
 export interface JobDeps {
@@ -85,6 +90,12 @@ const ANSWER_TIMEOUT_MS = 30 * 60_000;
 const CANCEL_GRACE_MS = 10_000;
 /** Cap for the stored (and template-referenced) stdout of a `shell` step. */
 const SHELL_OUTPUT_LIMIT = 1_000_000;
+/** Tree sha of the workspace when the run began, the `since: "start"` base of `git_snapshot` steps (in the run dir). */
+const SNAPSHOT_START_FILE = "snapshot-start";
+/** Character budget of the paths a `git_snapshot` step lists in `structured.files` (with `SNAPSHOT_FILES_LIMIT`). */
+const SNAPSHOT_FILES_CHARS = 64_000;
+/** Most bytes of patch a `git_snapshot` step writes to its diff file; the rest is cut with a marker. */
+const SNAPSHOT_DIFF_MAX_BYTES = 10 * 1024 * 1024;
 
 /** `{type, payload}` of every run event, correlated (distributes over the event union). */
 type EventBody = RunEventDraft extends infer E ? (E extends { type: infer T; payload: infer P } ? { type: T; payload: P } : never) : never;
@@ -931,8 +942,84 @@ export async function runJob(
     return { status: "succeeded", output: comment.url };
   };
 
+  /** Tree sha of the workspace when the run began; set before step 0 when the flow has a `git_snapshot` step. */
+  let startTree: string | null = null;
+  /** Runner-owned repo of the run's snapshots, in the run dir (see `SnapshotStore`). */
+  const snapshots = snapshotStore(runDir);
+  const snapshotLog = (text: string, stepId?: string) => emit({ type: "sandbox.log", payload: { stream: "stderr", text: `${text}\n` } }, stepId);
+
+  /**
+   * The run's start snapshot: a fresh run records the workspace now. A retry reads the first attempt's, so
+   * `since: "start"` keeps meaning the run's start, except a retry from step 0 of a worktree run: `prepareWorkspace`
+   * resets the worktree to its base, so the run starts over. A `direct` workspace is never reset, so even a retry from
+   * step 0 still holds the first attempt's edits, which the start must not absorb.
+   */
+  const takeStartSnapshot = async (): Promise<string> => {
+    const ws = workspace!;
+    // The store, the diffs and `snapshot-start` live in the run dir: a workspace holding it would snapshot them as its
+    // own files, so no two snapshots would ever match (`changed` stuck at true) and the store would grow every pass.
+    if (isWithinRoot(await realpath(runDir), await realpath(ws.hostPath))) {
+      throw new Error(
+        `git_snapshot cannot snapshot ${ws.hostPath}: it contains this run's directory ${runDir}; use a workspace outside the runner's data dir (${deps.config.dataDir})`,
+      );
+    }
+    const file = join(runDir, SNAPSHOT_START_FILE);
+    const startsOver = fromStepIdx === 0 && def.workspace.kind === "local_path" && def.workspace.isolation === "worktree";
+    if (resume && !startsOver) {
+      const saved = (await readFile(file, "utf8").catch(() => "")).trim();
+      if (saved && (await treeExists(snapshots, saved, signal))) return saved;
+      snapshotLog(
+        saved
+          ? `git_snapshot: the run's start snapshot ${saved.slice(0, 12)} is not on this runner; "start" now means the workspace at this retry`
+          : `git_snapshot: no start snapshot from the previous attempt; "start" now means the workspace at this retry`,
+      );
+    }
+    const tree = await snapshotTree(snapshots, ws.hostPath, signal);
+    await writeFile(file, `${tree}\n`);
+    return tree;
+  };
+
+  /**
+   * Snapshots the workspace as a tree (the user's repo untouched) and writes the diff from its base to
+   * `<runDir>/context/<id>.diff`, mounted at `snapshotDiffPath(id)`. `previous` reads this step's own tree from its
+   * last pass (kept across loop repeats, restored on retry); without one, or when it is not on this runner, it diffs
+   * from start.
+   */
+  const runSnapshotStep = async (step: GitSnapshotStep, abort: AbortSignal): Promise<StepOutcome> => {
+    const ws = workspace!;
+    let since: SnapshotOutput["since"] = "start";
+    let base = startTree!;
+    if (step.since === "previous") {
+      const last = ctx.steps[step.id]?.structured;
+      const prev = last !== null && typeof last === "object" ? (last as Partial<SnapshotOutput>).tree : undefined;
+      if (typeof prev === "string" && (await treeExists(snapshots, prev, abort))) {
+        since = "previous";
+        base = prev;
+      } else if (prev !== undefined) {
+        snapshotLog(`git_snapshot: previous snapshot ${String(prev).slice(0, 12)} is not on this runner; diffing from the run start`, step.id);
+      }
+    }
+    const tree = await snapshotTree(snapshots, ws.hostPath, abort);
+    const contextDir = join(runDir, "context");
+    await mkdir(contextDir, { recursive: true });
+    // Patch, paths and stat are all capped: a huge change set must not exhaust the runner's memory or disk.
+    const limits = { patchBytes: SNAPSHOT_DIFF_MAX_BYTES, files: SNAPSHOT_FILES_LIMIT, fileChars: SNAPSHOT_FILES_CHARS };
+    const { files, fileCount, stat, patchTruncated } = await diffTrees(snapshots, base, tree, join(contextDir, `${step.id}.diff`), limits, abort);
+    const structured: SnapshotOutput = { tree, base, since, diffPath: snapshotDiffPath(step.id), files, fileCount, changed: fileCount > 0 };
+    const summary = [
+      `${fileCount} file${fileCount === 1 ? "" : "s"} changed since ${base.slice(0, 12)} (${since === "previous" ? "previous snapshot" : "run start"})`,
+      patchTruncated ? `; the diff file is truncated at ${SNAPSHOT_DIFF_MAX_BYTES / 1024 / 1024} MiB` : "",
+    ].join("");
+    const text = stat ? `${summary}\n\n${stat}` : summary;
+    const output = text.length > SHELL_OUTPUT_LIMIT ? `${text.slice(0, SHELL_OUTPUT_LIMIT)}${TRUNCATED_MARK}` : text;
+    return { status: "succeeded", output, structured };
+  };
+
   const runActionStep = async (
-    step: Exclude<Step, AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" } | { kind: "loop" } | { kind: "condition" }>,
+    step: Exclude<
+      Step,
+      AgentStep | { kind: "slash" } | { kind: "shell" } | { kind: "intervention" } | { kind: "github_comment" } | { kind: "loop" } | { kind: "condition" } | GitSnapshotStep
+    >,
     abort: AbortSignal,
   ): Promise<StepOutcome> => {
     const ws = workspace!;
@@ -1051,7 +1138,9 @@ export async function runJob(
                   ? runConditionStep(step)
                   : step.kind === "github_comment"
                     ? await runCommentStep(step, abort.signal)
-                    : await runActionStep(step, abort.signal);
+                    : step.kind === "git_snapshot"
+                      ? await runSnapshotStep(step, abort.signal)
+                      : await runActionStep(step, abort.signal);
       return outcome.status === "cancelled" && abort.signal.aborted ? interrupted(outcome.output) : outcome;
     } catch (err) {
       return abort.signal.aborted ? interrupted() : { status: "failed", error: errorText(err) };
@@ -1082,6 +1171,10 @@ export async function runJob(
         },
       });
       checkCancelled();
+      if (def.steps.some((s) => s.kind === "git_snapshot")) {
+        startTree = await takeStartSnapshot();
+        checkCancelled();
+      }
 
       const sessionsDir = join(runDir, "sessions");
       await mkdir(sessionsDir, { recursive: true });
@@ -1195,10 +1288,18 @@ export async function runJob(
           console.error(`[job ${runId}] chat sessions snapshot: ${errorText(err)}`),
         );
       };
-      /** Marks the steps `[from, to]` of a branch not taken `skipped`; loops inside it start over when next reached. */
+      /**
+       * Marks the steps `[from, to]` of a branch not taken `skipped`; loops inside it start over when next reached.
+       * Steps that ran before (an earlier loop pass) keep their values in the event, as the server stores what it
+       * carries: a retry must still see them (e.g. a `git_snapshot`'s previous tree).
+       */
       const skipBranch = async (from: number, to: number) => {
         const skipped = def.steps.slice(from, to + 1);
-        for (const s of skipped) emit({ type: "step.finished", payload: { status: "skipped" } }, s.id);
+        for (const s of skipped) {
+          const prev = ctx.steps[s.id];
+          const kept = prev ? { output: prev.output, ...(prev.structured !== undefined ? { structured: prev.structured } : {}) } : {};
+          emit({ type: "step.finished", payload: { status: "skipped", ...kept } }, s.id);
+        }
         resetLoopsIn(from, to + 1);
         await snapshotSessions(skipped.map((s) => s.id));
       };

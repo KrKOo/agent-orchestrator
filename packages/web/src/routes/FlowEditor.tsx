@@ -99,6 +99,8 @@ function newStep(kind: StepKind, id: string, def: FlowDefinition, at: number): S
       return { ...base, kind, command: "" };
     case "shell":
       return { ...base, kind, command: "" };
+    case "git_snapshot":
+      return { ...base, kind, since: "previous" };
     case "git_commit":
       return { ...base, kind, messageFrom: lastAgent };
     case "git_push":
@@ -312,6 +314,8 @@ function stepSubtitle(step: Step, def: FlowDefinition): string {
       return step.command ? `/${step.command} (headless)` : "(no command chosen)";
     case "shell":
       return step.command.split("\n")[0] || "(empty command)";
+    case "git_snapshot":
+      return step.since === "start" ? "diff since run start" : "diff since previous pass";
     case "git_commit":
       return `message from ${step.messageFrom || "?"}`;
     case "git_push":
@@ -936,6 +940,7 @@ const KIND_HELP: Record<StepKind, string> = {
   command: "Run a command template with arguments",
   slash: "Run a built-in omp slash command (e.g. review, plan) headless",
   shell: "Run a bash command in the sandbox; its stdout feeds later steps",
+  git_snapshot: "Record the workspace and diff it against the previous pass or the run start (for incremental reviews)",
   git_commit: "Commit the worktree with a generated message",
   git_push: "Push the run branch to GitHub",
   github_pr: "Open a pull request from the run branch",

@@ -8,8 +8,9 @@ import { FlowDefinition, HarnessModels, InterventionAction } from "./flow";
  * 4: loop steps, `loop.repeat`, skipped steps (and the `repeat` intervention action).
  * 5: condition steps, intervention choices (`intervention.respond.choice`).
  * 6: server→runner RPCs are a union (`job.setModels` switches a live run's models), `run.models` events.
+ * 7: `git_snapshot` steps.
  */
-export const WIRE_PROTOCOL = 6;
+export const WIRE_PROTOCOL = 7;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;

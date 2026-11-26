@@ -27,6 +27,7 @@ export const KIND_LABEL: Record<Step["kind"], string> = {
   command: "Command",
   slash: "Slash command",
   shell: "Shell command",
+  git_snapshot: "Git snapshot",
   git_commit: "Git commit",
   git_push: "Git push",
   github_pr: "GitHub PR",
@@ -136,8 +137,9 @@ function TemplateField({
 }
 
 /**
- * Choices for a loop's `value` stop, mirroring validateFlow: `.output` of text steps and declared
- * `.structured.<field>` of agent steps directly in body `[start, end)` (not inside a nested loop).
+ * Choices for a loop's `value` stop, mirroring validateFlow: `.output` of text steps, declared
+ * `.structured.<field>` of agent steps and `.structured.changed` of git_snapshot steps directly in body
+ * `[start, end)` (not inside a nested loop).
  */
 function loopStopRefs(def: FlowDefinition, ranges: Map<number, number>, start: number, end: number): { value: string; label: string }[] {
   const choices: { value: string; label: string }[] = [];
@@ -150,6 +152,7 @@ function loopStopRefs(def: FlowDefinition, ranges: Map<number, number>, start: n
         choices.push({ value: `${s.id}.structured.${f.name}`, label: `${s.name} (${s.id}.structured.${f.name})` });
       }
     }
+    if (s.kind === "git_snapshot") choices.push({ value: `${s.id}.structured.changed`, label: `${s.name} (${s.id}.structured.changed)` });
   }
   return choices;
 }
@@ -537,6 +540,26 @@ export function StepPanel({
               bash as data, but never <code>eval</code> them or pass them to tools that interpret them as code.
             </p>
           )}
+        </>
+      )}
+      {step.kind === "git_snapshot" && (
+        <>
+          <label className="field">
+            <span>Diff since</span>
+            <select value={step.since} onChange={(e) => set({ since: e.target.value === "start" ? "start" : "previous" })}>
+              <option value="previous">previous pass of this step</option>
+              <option value="start">run start</option>
+            </select>
+            <small className="muted">
+              <code>previous</code>: only what changed since this step last ran (a loop's previous pass); the first pass diffs
+              from the run start. <code>start</code>: everything the run changed so far.
+            </small>
+          </label>
+          <p className="muted small">
+            Records the workspace (untracked files included, ignored ones not) without committing or touching the index, and
+            writes the diff to <code>{`{{steps.${step.id || "<id>"}.structured.diffPath}}`}</code> for later prompts.{" "}
+            <code>{`{{steps.${step.id || "<id>"}.structured.changed}}`}</code> is false when nothing changed.
+          </p>
         </>
       )}
       {isAgentStep(step) && (

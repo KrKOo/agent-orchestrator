@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   type AssignedRun,
   FlowDefinition,
@@ -12,6 +12,8 @@ import {
   type JobSetModelsResult,
   type RunEventDraft,
   type RunnerMessage,
+  type SnapshotOutput,
+  SNAPSHOT_FILES_LIMIT,
   UNTRUSTED_PREAMBLE,
   TERMINAL_STATUSES,
   type SessionUpdate,
@@ -20,6 +22,7 @@ import {
 import { ulid } from "ulid";
 import type { RunnerConfig } from "../src/config";
 import type { Gateway } from "../src/gateway";
+import { snapshotStore, snapshotTree } from "../src/git";
 import { JobManager, JobModels, PendingRequests, plainText, runJob, type JobDeps } from "../src/job";
 import { Library } from "../src/library";
 import { type McpOutputServer, startMcpServer } from "../src/mcp-output";
@@ -1945,6 +1948,515 @@ describe("runJob", () => {
       expect(ofType(later, "step.started").map((e) => e.stepId)).toEqual(["fix"]);
       expect(ofType(later, "step.finished").map((e) => [e.stepId, e.payload.status])).toEqual([["fix", "succeeded"]]);
       expect(ofType(later, "run.status").map((e) => e.payload.status)).not.toContain("cancelled");
+    });
+  });
+
+  describe("git_snapshot steps", () => {
+    const finishedOf = (events: RunEventDraft[], stepId: string) => ofType(events, "step.finished").filter((e) => e.stepId === stepId).map((e) => e.payload);
+    /** Shell step writing `f<n>.txt` on its n-th run; the counter lives outside the worktree so snapshots never see it. */
+    const edit = (extra = "") => {
+      const counter = join(root, `count-${ulid()}`);
+      return { kind: "shell" as const, id: "edit", name: "Edit", command: `n=$(($(cat ${counter} 2>/dev/null || echo 0) + 1)); echo $n > ${counter}; echo $n > f$n.txt; ${extra}true` };
+    };
+    const snapOf = (payload: { structured?: unknown }) => payload.structured as SnapshotOutput;
+    /** A new committed repo under `root` (inside allowedRoots) with `files`, for `direct` workspaces. */
+    const freshRepo = (files: Record<string, string>): string => {
+      const dir = join(root, `repo-${ulid()}`);
+      for (const [path, content] of Object.entries(files)) {
+        mkdirSync(dirname(join(dir, path)), { recursive: true });
+        writeFileSync(join(dir, path), content);
+      }
+      sh(dir, "git", "init", "-q", "-b", "main");
+      sh(dir, "git", "add", ".");
+      sh(dir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init");
+      return dir;
+    };
+
+    test("previous diffs only the last pass, start the whole run; untracked in, ignored out; HEAD and index untouched", async () => {
+      const sandboxes = new FakeSandboxProvider();
+      const { deps, events, sent } = harnessDeps(sandboxes);
+      const run = assigned({
+        steps: [
+          edit(`if [ $n = 1 ]; then echo ignored.txt > .gitignore; echo x > ignored.txt; echo more >> a.txt; fi; `),
+          { kind: "git_snapshot", id: "inc", name: "Since last pass" },
+          { kind: "git_snapshot", id: "full", name: "Since start", since: "start" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const runDir = join(config.dataDir, "runs", run.runId);
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      const startTree = readFileSync(join(runDir, "snapshot-start"), "utf8").trim();
+      expect(startTree).toBe(sh(repo, "git", "rev-parse", "HEAD^{tree}"));
+
+      const [inc1, inc2] = finishedOf(events, "inc").map(snapOf);
+      expect(inc1).toMatchObject({ base: startTree, since: "start", files: [".gitignore", "a.txt", "f1.txt"], changed: true, diffPath: "/orch/context/inc.diff" });
+      expect(inc2).toMatchObject({ base: inc1!.tree, since: "previous", files: ["f2.txt"], changed: true });
+      expect(finishedOf(events, "inc")[1]!.output).toStartWith(`1 file changed since ${inc1!.tree.slice(0, 12)} (previous snapshot)\n\n f2.txt | 1 +`);
+      const full2 = snapOf(finishedOf(events, "full")[1]!);
+      expect(full2).toMatchObject({ base: startTree, since: "start", files: [".gitignore", "a.txt", "f1.txt", "f2.txt"] });
+
+      // The diff of the last pass sits in the context dir the sandbox mounts read-only.
+      const diff = readFileSync(join(runDir, "context", "inc.diff"), "utf8");
+      expect(diff).toContain("+++ b/f2.txt");
+      expect(diff).not.toContain("f1.txt");
+      expect(sandboxes.specs[0]!.mounts).toContainEqual({ hostPath: join(runDir, "context"), containerPath: "/orch/context", readonly: true });
+      // Snapshots live in the run's own store: the user's repo gets none of their objects.
+      expect(Bun.spawnSync(["git", "cat-file", "-e", `${inc2!.tree}^{tree}`], { cwd: repo }).exitCode).not.toBe(0);
+      expect(Bun.spawnSync(["git", "--git-dir", snapshotStore(runDir).gitDir, "cat-file", "-e", `${inc2!.tree}^{tree}`]).exitCode).toBe(0);
+
+      // Nothing staged or committed: HEAD is the base, the index matches it, and the changes stay unstaged/untracked.
+      expect(sh(worktree, "git", "rev-parse", "HEAD")).toBe(sh(repo, "git", "rev-parse", "HEAD"));
+      expect(Bun.spawnSync(["git", "diff", "--cached", "--quiet"], { cwd: worktree }).exitCode).toBe(0);
+      const status = Bun.spawnSync(["git", "status", "--porcelain"], { cwd: worktree }).stdout.toString();
+      expect(status).toBe(" M a.txt\n?? .gitignore\n?? f1.txt\n?? f2.txt\n");
+    });
+
+    test("an unchanged workspace reports changed: false, which can stop a loop", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "git_snapshot", id: "snap", name: "Snapshot" },
+          { kind: "shell", id: "noop", name: "Noop", command: "true" },
+          { kind: "loop", id: "again", name: "Again", to: "snap", maxIterations: 3, stop: { when: "value", ref: "snap.structured.changed", is: "falsy" } },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [snap] = finishedOf(events, "snap");
+      expect(snapOf(snap!)).toMatchObject({ files: [], changed: false, since: "start" });
+      expect(snap!.output).toBe(`0 files changed since ${snapOf(snap!).base.slice(0, 12)} (run start)`);
+      expect(finishedOf(events, "again")[0]!.output).toBe("Stopped: snap.structured.changed is falsy (iteration 1 of 3)");
+    });
+
+    const retryFlow = () =>
+      assigned({
+        steps: [
+          edit(),
+          { kind: "git_snapshot", id: "inc", name: "Since last pass" },
+          { kind: "git_snapshot", id: "full", name: "Since start", since: "start" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+
+    test("a retry inside the loop diffs from the restored previous tree and the first attempt's start", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(retryFlow());
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      const runDir = join(config.dataDir, "runs", run.runId);
+      // Attempt 1 snapshotted the start, then wrote pre.txt and snapshotted it in `inc` before failing at `full`.
+      mkdirSync(runDir, { recursive: true });
+      const store = snapshotStore(runDir);
+      const startTree = await snapshotTree(store, worktree);
+      writeFileSync(join(runDir, "snapshot-start"), `${startTree}\n`);
+      writeFileSync(join(worktree, "pre.txt"), "pre\n");
+      const prevTree = await snapshotTree(store, worktree);
+      run.resume = { fromStepIdx: 2, prior: [{ stepId: "edit", output: "" }, { stepId: "inc", output: "", structured: { tree: prevTree } }] };
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [full1] = finishedOf(events, "full").map(snapOf);
+      expect(full1).toMatchObject({ base: startTree, since: "start", files: ["pre.txt"] });
+      // Pass 2 of the loop: `inc` diffs from the tree attempt 1 recorded, so pre.txt is no longer in it.
+      const [inc] = finishedOf(events, "inc").map(snapOf);
+      expect(inc).toMatchObject({ base: prevTree, since: "previous", files: ["f1.txt"] });
+      expect(ofType(events, "sandbox.log").map((e) => e.payload.text).join("")).not.toContain("git_snapshot:");
+    });
+
+    test("a pruned previous tree and a missing start file fall back to the workspace at the retry, with log lines", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = withWorktree(retryFlow());
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      writeFileSync(join(worktree, "pre.txt"), "pre\n");
+      run.resume = { fromStepIdx: 2, prior: [{ stepId: "edit", output: "" }, { stepId: "inc", output: "", structured: { tree: "f".repeat(40) } }] };
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const logs = ofType(events, "sandbox.log").map((e) => e.payload.text).join("");
+      expect(logs).toContain(`git_snapshot: no start snapshot from the previous attempt; "start" now means the workspace at this retry`);
+      expect(logs).toContain(`git_snapshot: previous snapshot ${"f".repeat(12)} is not on this runner; diffing from the run start`);
+      // "start" is now the workspace with pre.txt, so neither diff lists it.
+      expect(snapOf(finishedOf(events, "full")[0]!)).toMatchObject({ files: [], changed: false });
+      expect(snapOf(finishedOf(events, "inc")[0]!)).toMatchObject({ since: "start", files: ["f1.txt"] });
+    });
+
+    test("a workspace in a subdirectory of a repo snapshots only that subdirectory", async () => {
+      const dir = freshRepo({ "front/app.txt": "app\n", "back/secret.txt": "secret\n" });
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        workspace: { kind: "local_path", path: join(dir, "front"), isolation: "direct" },
+        steps: [
+          edit("echo leaked >> ../back/secret.txt; echo sibling > ../back/other.txt; "),
+          { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const snap = snapOf(finishedOf(events, "snap")[0]!);
+      // Paths are relative to the workspace; the sibling directory's changes never show up.
+      expect(snap).toMatchObject({ files: ["f1.txt"], fileCount: 1, changed: true });
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "snap.diff"), "utf8");
+      expect(diff).toContain("+++ b/f1.txt");
+      for (const leak of ["secret", "leaked", "sibling", "other.txt", "app.txt"]) expect(diff).not.toContain(leak);
+      // Nothing outside the subdirectory was even read: the sibling's blob is in neither the store nor the user's repo.
+      const otherBlob = sh(dir, "git", "hash-object", "back/other.txt");
+      const store = snapshotStore(join(config.dataDir, "runs", run.runId));
+      expect(Bun.spawnSync(["git", "--git-dir", store.gitDir, "cat-file", "-e", otherBlob]).exitCode).not.toBe(0);
+      expect(Bun.spawnSync(["git", "cat-file", "-e", otherBlob], { cwd: dir }).exitCode).not.toBe(0);
+    });
+
+    test("an unresolved merge conflict elsewhere in the repo does not break a subdirectory's snapshots", async () => {
+      const dir = freshRepo({ "front/app.txt": "app\n", "back/c.txt": "base\n" });
+      const commit = (msg: string) => sh(dir, "git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", msg);
+      sh(dir, "git", "checkout", "-qb", "other");
+      writeFileSync(join(dir, "back/c.txt"), "other\n");
+      commit("other");
+      sh(dir, "git", "checkout", "-q", "main");
+      writeFileSync(join(dir, "back/c.txt"), "main\n");
+      commit("main");
+      const merge = Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "other"], { cwd: dir });
+      expect(merge.exitCode).not.toBe(0);
+      expect(sh(dir, "git", "ls-files", "--unmerged")).not.toBe("");
+
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        workspace: { kind: "local_path", path: join(dir, "front"), isolation: "direct" },
+        steps: [edit(), { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" }],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(events, "snap")[0]!)).toMatchObject({ base: sh(dir, "git", "rev-parse", "HEAD:front"), files: ["f1.txt"] });
+      // The user's conflicted merge is left as it was.
+      expect(sh(dir, "git", "ls-files", "--unmerged")).not.toBe("");
+    });
+
+    test("a direct workspace retried from step 0 keeps the first attempt's start", async () => {
+      const dir = freshRepo({ "a.txt": "a\n" });
+      const run = assigned({
+        workspace: { kind: "local_path", path: dir, isolation: "direct" },
+        steps: [edit(), { kind: "git_snapshot", id: "full", name: "Since start", since: "start" }],
+      });
+      const first = harnessDeps(new FakeSandboxProvider());
+      await runJob(run, first.deps, new AbortController().signal);
+      const before = snapOf(finishedOf(first.events, "full")[0]!);
+      expect(before.files).toEqual(["f1.txt"]);
+
+      // The direct workspace still holds f1.txt: the retry's "start" must not absorb it.
+      run.resume = { fromStepIdx: 0, prior: [] };
+      const second = harnessDeps(new FakeSandboxProvider());
+      await runJob(run, second.deps, new AbortController().signal);
+
+      expect(second.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(second.events, "full")[0]!)).toMatchObject({ base: before.base, files: ["f1.txt", "f2.txt"] });
+      expect(ofType(second.events, "sandbox.log").map((e) => e.payload.text).join("")).not.toContain("git_snapshot:");
+    });
+
+    test("a snapshot skipped by a condition keeps its tree for a later retry", async () => {
+      const run = assigned({
+        steps: [
+          edit(`if [ $((n % 2)) = 1 ]; then echo run; else echo skip; fi; `),
+          { kind: "condition", id: "when", name: "Snapshot?", ref: "steps.edit.output", op: "contains", value: "run", thenEnd: "snap" },
+          { kind: "git_snapshot", id: "snap", name: "Snapshot" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+      const first = harnessDeps(new FakeSandboxProvider());
+      await runJob(run, first.deps, new AbortController().signal);
+
+      expect(first.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      // Pass 1 snapshots, pass 2 skips it: the skipped event carries pass 1's values, which the server stores.
+      const [ran, skipped] = finishedOf(first.events, "snap");
+      expect(skipped).toEqual({ status: "skipped", output: ran!.output, structured: ran!.structured });
+
+      // Retry from the loop step with what the server kept (each step's last step.finished): pass 3 runs the
+      // snapshot again, diffing from pass 1's tree.
+      const last = new Map(ofType(first.events, "step.finished").map((e) => [e.stepId!, e.payload]));
+      run.resume = {
+        fromStepIdx: 3,
+        prior: ["edit", "when", "snap"].map((stepId) => {
+          const p = last.get(stepId)!;
+          return { stepId, output: p.output ?? "", ...(p.structured !== undefined ? { structured: p.structured } : {}) };
+        }),
+      };
+      const second = harnessDeps(new FakeSandboxProvider());
+      await runJob(run, second.deps, new AbortController().signal);
+
+      expect(second.sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(second.events, "snap")[0]!)).toMatchObject({
+        since: "previous",
+        base: snapOf(ran!).tree,
+        files: ["f2.txt", "f3.txt"],
+      });
+    });
+
+    test("structured.files is capped; fileCount and the diff keep every path", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const total = SNAPSHOT_FILES_LIMIT + 100;
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "many", name: "Many", command: `mkdir gen && for i in $(seq 1 ${total}); do echo $i > gen/f$i.txt; done` },
+          { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [payload] = finishedOf(events, "snap");
+      const snap = snapOf(payload!);
+      expect(snap.files).toHaveLength(SNAPSHOT_FILES_LIMIT);
+      expect(snap).toMatchObject({ fileCount: total, changed: true });
+      expect(payload!.output).toStartWith(`${total} files changed since`);
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "snap.diff"), "utf8");
+      expect(diff.match(/^\+\+\+ b\//gm)).toHaveLength(total);
+    });
+
+    test("a filter or fsmonitor the agent plants through a redirected git dir never runs on the host", async () => {
+      const marks = join(root, `marks-${ulid()}`);
+      mkdirSync(marks);
+      const fsmonitor = join(marks, "fsmonitor.sh");
+      writeFileSync(fsmonitor, `#!/bin/sh\ntouch ${marks}/fsmonitor\n`, { mode: 0o755 });
+      // The agent points the worktree's `.git` file at a git dir of its own, whose config defines a clean filter
+      // (selected by `.gitattributes`) and an fsmonitor: commands plain `git add` would run on the host.
+      const plant = [
+        "git init -q --bare .evil",
+        "git config -f .evil/config core.bare false",
+        `git config -f .evil/config filter.evil.clean "touch ${marks}/filter; cat"`,
+        `git config -f .evil/config core.fsmonitor ${fsmonitor}`,
+        "echo '* filter=evil' > .gitattributes",
+        `printf 'gitdir: %s\\n' "$PWD/.evil" > .git`,
+      ].join(" && ");
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          { kind: "shell", id: "plant", name: "Plant", command: plant },
+          { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(events, "snap")[0]!).files).toContain(".gitattributes");
+      expect(existsSync(join(marks, "filter"))).toBe(false);
+      expect(existsSync(join(marks, "fsmonitor"))).toBe(false);
+      // The trap is armed: plain host `git add` in that worktree runs both.
+      const worktree = join(config.dataDir, "worktrees", run.runId);
+      Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "add", "-A"], { cwd: worktree, env: { ...process.env, GIT_INDEX_FILE: join(marks, "probe.index") } });
+      expect(existsSync(join(marks, "filter"))).toBe(true);
+      expect(existsSync(join(marks, "fsmonitor"))).toBe(true);
+    });
+
+    test("a stale index lock from a killed snapshot does not block the next one", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({ steps: [edit(), { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" }] });
+      const runDir = join(config.dataDir, "runs", run.runId);
+      mkdirSync(runDir, { recursive: true });
+      const lock = `${snapshotStore(runDir).indexFile}.lock`;
+      writeFileSync(lock, "");
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(events, "snap")[0]!).files).toEqual(["f1.txt"]);
+      expect(existsSync(lock)).toBe(false);
+    });
+
+    test("an oversized diff is cut at the cap with a marker, and the output says so", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const cap = 10 * 1024 * 1024;
+      const run = assigned({
+        steps: [
+          // ~12 MiB of text: its patch is past the cap.
+          { kind: "shell", id: "big", name: "Big", command: `head -c ${12 * 1024 * 1024} /dev/zero | tr '\\0' a | fold -w 99 > big.txt` },
+          { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [payload] = finishedOf(events, "snap");
+      expect(snapOf(payload!)).toMatchObject({ files: ["big.txt"], fileCount: 1 });
+      expect(payload!.output).toStartWith("1 file changed since");
+      expect(payload!.output).toContain("; the diff file is truncated at 10 MiB");
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "snap.diff"));
+      const mark = `\n… (diff truncated at ${cap} bytes)\n`;
+      expect(diff.byteLength).toBe(cap + Buffer.byteLength(mark));
+      expect(diff.subarray(cap).toString()).toBe(mark);
+    });
+
+    /** Runs `fn` with `process.env[key] = value`, restoring the previous value (or its absence) afterwards. */
+    const withEnv = async (key: string, value: string, fn: () => Promise<void>) => {
+      const saved = process.env[key];
+      process.env[key] = value;
+      try {
+        await fn();
+      } finally {
+        if (saved === undefined) delete process.env[key];
+        else process.env[key] = saved;
+      }
+    };
+
+    test("git config in the runner's environment never applies to snapshots", async () => {
+      const marks = join(root, `marks-${ulid()}`);
+      mkdirSync(marks);
+      // A runner started with a filter in GIT_CONFIG_PARAMETERS: the agent's `.gitattributes` selects it.
+      await withEnv("GIT_CONFIG_PARAMETERS", `'filter.envfilter.clean'='touch ${marks}/filter; cat'`, async () => {
+        const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+        const run = assigned({
+          steps: [
+            { kind: "shell", id: "attrs", name: "Attrs", command: "echo '* filter=envfilter' > .gitattributes; echo x > x.txt" },
+            { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+          ],
+        });
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        expect(snapOf(finishedOf(events, "snap")[0]!).files).toEqual([".gitattributes", "x.txt"]);
+        expect(existsSync(join(marks, "filter"))).toBe(false);
+        // The trap is armed: git with the runner's environment runs the filter on that file.
+        Bun.spawnSync(["git", "hash-object", "x.txt"], { cwd: join(config.dataDir, "worktrees", run.runId) });
+        expect(existsSync(join(marks, "filter"))).toBe(true);
+      });
+    });
+
+    test("the runner user's own ignore file does not hide workspace files", async () => {
+      const xdg = join(root, `xdg-${ulid()}`);
+      mkdirSync(join(xdg, "git"), { recursive: true });
+      writeFileSync(join(xdg, "git", "ignore"), "secret.log\n");
+      await withEnv("XDG_CONFIG_HOME", xdg, async () => {
+        const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+        const run = assigned({
+          steps: [
+            { kind: "shell", id: "write", name: "Write", command: "echo s > secret.log" },
+            { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+          ],
+        });
+        await runJob(run, deps, new AbortController().signal);
+
+        expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+        expect(snapOf(finishedOf(events, "snap")[0]!).files).toEqual(["secret.log"]);
+        // Plain git as the runner user does ignore it (without a global config that names another excludes file).
+        const status = Bun.spawnSync(["git", "status", "--porcelain"], {
+          cwd: join(config.dataDir, "worktrees", run.runId),
+          env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+        });
+        expect(status.stdout.toString()).toBe("");
+      });
+    });
+
+    test("a path ignored after a snapshot recorded it drops out of later snapshots", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          // Pass 1 installs deps/; pass 2 changes it and ignores it.
+          edit(`mkdir -p deps; echo v$n > deps/lib.txt; if [ $n = 2 ]; then echo deps/ > .gitignore; fi; `),
+          { kind: "git_snapshot", id: "full", name: "Since start", since: "start" },
+          { kind: "git_snapshot", id: "inc", name: "Since last pass" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [full1, full2] = finishedOf(events, "full").map(snapOf);
+      expect(full1!.files).toEqual(["deps/lib.txt", "f1.txt"]);
+      // Same workspace content minus deps/ as a run that ignored it from the start: history does not matter.
+      expect(full2!.files).toEqual([".gitignore", "f1.txt", "f2.txt"]);
+      // Against pass 1, deps/lib.txt is gone, not changed to v2.
+      expect(snapOf(finishedOf(events, "inc")[1]!).files).toEqual([".gitignore", "deps/lib.txt", "f2.txt"]);
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "inc.diff"), "utf8");
+      expect(diff).toContain("deleted file mode");
+      expect(diff).not.toContain("+v2");
+    });
+
+    test("a nested repository without commits is snapshotted as plain files", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          // A scaffolder's `git init`: no commit, so a gitlink could not even be recorded.
+          { kind: "shell", id: "scaffold", name: "Scaffold", command: "mkdir app && cd app && git init -q && echo x > main.py" },
+          { kind: "git_snapshot", id: "snap", name: "Snapshot", since: "start" },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      expect(snapOf(finishedOf(events, "snap")[0]!).files).toEqual(["app/main.py"]);
+    });
+
+    test("uncommitted edits inside a nested repository reach the snapshot", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        steps: [
+          // Pass 1 clones a dependency (a nested repo with a commit); pass 2 edits it without committing.
+          edit(
+            `if [ $n = 1 ]; then (mkdir vendor && cd vendor && git init -q && echo v1 > lib.py && git add . && git -c user.name=t -c user.email=t@t commit -qm i); else echo v2 > vendor/lib.py; fi; `,
+          ),
+          { kind: "git_snapshot", id: "inc", name: "Since last pass" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [inc1, inc2] = finishedOf(events, "inc").map(snapOf);
+      // Its files, not a gitlink to its HEAD commit.
+      expect(inc1!.files).toEqual(["f1.txt", "vendor/lib.py"]);
+      expect(inc2).toMatchObject({ since: "previous", files: ["f2.txt", "vendor/lib.py"], changed: true });
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "inc.diff"), "utf8");
+      expect(diff).toContain("+v2");
+    });
+
+    test("a file replaced by a nested repository is snapshotted as that repository's files", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const nestedRepos = [
+        "rm fresh cloned",
+        // No commits: a gitlink could not be recorded at all.
+        "(mkdir fresh && cd fresh && git init -q && echo c > code.txt)",
+        // Commits plus an uncommitted edit: a gitlink would miss the edit.
+        "(mkdir cloned && cd cloned && git init -q && echo v1 > code.txt && git add . && git -c user.name=t -c user.email=t@t commit -qm i && echo dirty > code.txt)",
+      ].join("; ");
+      const run = assigned({
+        steps: [
+          // Pass 1 writes plain files `fresh` and `cloned`; pass 2 replaces each with a directory holding a nested repo.
+          edit(`if [ $n = 1 ]; then echo f > fresh; echo f > cloned; else ${nestedRepos}; fi; `),
+          { kind: "git_snapshot", id: "inc", name: "Since last pass" },
+          { kind: "loop", id: "again", name: "Again", to: "edit", maxIterations: 2 },
+        ],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      expect(sent.at(-1)).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
+      const [inc1, inc2] = finishedOf(events, "inc").map(snapOf);
+      expect(inc1!.files).toEqual(["cloned", "f1.txt", "fresh"]);
+      expect(inc2!.files).toEqual(["cloned", "cloned/code.txt", "f2.txt", "fresh", "fresh/code.txt"]);
+      const diff = readFileSync(join(config.dataDir, "runs", run.runId, "context", "inc.diff"), "utf8");
+      expect(diff).toContain("+dirty");
+      expect(diff).not.toContain("Subproject commit");
+    });
+
+    test("a direct workspace containing the run's directory fails with a clear error", async () => {
+      mkdirSync(config.dataDir, { recursive: true });
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const run = assigned({
+        workspace: { kind: "local_path", path: config.dataDir, isolation: "direct" },
+        steps: [{ kind: "git_snapshot", id: "snap", name: "Snapshot" }],
+      });
+      await runJob(run, deps, new AbortController().signal);
+
+      const runDir = join(config.dataDir, "runs", run.runId);
+      expect(sent.at(-1)).toEqual({
+        t: "job.finished",
+        runId: run.runId,
+        status: "failed",
+        error: `git_snapshot cannot snapshot ${config.dataDir}: it contains this run's directory ${runDir}; use a workspace outside the runner's data dir (${config.dataDir})`,
+      });
+      // It fails before any step runs or any snapshot is stored.
+      expect(ofType(events, "step.started")).toEqual([]);
+      expect(existsSync(snapshotStore(runDir).gitDir)).toBe(false);
     });
   });
 });
