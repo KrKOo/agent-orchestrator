@@ -1,5 +1,6 @@
-import { type HarnessModels, type ModelEntry, MODEL_ROLE_LABELS } from "@orch/protocol";
+import { type HarnessModels, type ModelEntry, MODEL_ROLE_BINDING_PREFIX, MODEL_ROLE_LABELS } from "@orch/protocol";
 import { Plus, X } from "lucide-react";
+import type { ReactNode } from "react";
 
 /** Model ids grouped by provider for an `<optgroup>` select. */
 function groupByProvider(models: ModelEntry[]): [string, ModelEntry[]][] {
@@ -19,17 +20,23 @@ function modelLabel(m: ModelEntry): string {
 
 /**
  * Model picker for one harness role. A select fed by the runners' gateway models (kept as an option even when
- * the model is no longer advertised); free text when no runner is online to advertise models.
+ * the model is no longer advertised); free text when no runner is online to advertise models. `extra` renders
+ * below the picker (e.g. a `BindInput`). With `emptyLabel` the empty choice stays offered after a model is picked,
+ * so the value can be cleared again; otherwise it shows only while the value is empty.
  */
-function ModelSelect({
+export function ModelSelect({
   label,
   value,
   models,
+  extra,
+  emptyLabel,
   onChange,
 }: {
   label: string;
   value: string;
   models: ModelEntry[];
+  extra?: ReactNode;
+  emptyLabel?: string;
   onChange: (model: string) => void;
 }) {
   const known = models.some((m) => m.id === value);
@@ -40,7 +47,7 @@ function ModelSelect({
       {models.length > 0 ? (
         <>
           <select value={value === "" ? "" : known ? value : FREE_ENTRY} onChange={(e) => set(e.target.value)}>
-            {value === "" && <option value="">—</option>}
+            {(value === "" || emptyLabel !== undefined) && <option value="">{emptyLabel ?? "—"}</option>}
             {!known && value !== "" && <option value={FREE_ENTRY}>{value}</option>}
             {groupByProvider(models).map(([provider, group]) => (
               <optgroup key={provider} label={provider}>
@@ -64,6 +71,7 @@ function ModelSelect({
       ) : (
         <input className="mono" value={value} onChange={(e) => onChange(e.target.value)} placeholder="provider/model" />
       )}
+      {extra}
     </label>
   );
 }
@@ -83,10 +91,12 @@ function nextFreeRole(roles: Record<string, string>): string {
 function ModelRolesEditor({
   roles,
   models,
+  bind,
   onChange,
 }: {
   roles: Record<string, string>;
   models: ModelEntry[];
+  bind?: (path: string) => ReactNode;
   onChange: (roles: Record<string, string>) => void;
 }) {
   const entries = Object.entries(roles);
@@ -124,7 +134,13 @@ function ModelRolesEditor({
                 onChange={(e) => setRole(idx, e.target.value)}
               />
             )}
-            <ModelSelect label="" value={model} models={models} onChange={(m) => setModel(idx, m)} />
+            <ModelSelect
+              label=""
+              value={model}
+              models={models}
+              extra={bind?.(`${MODEL_ROLE_BINDING_PREFIX}${role}`)}
+              onChange={(m) => setModel(idx, m)}
+            />
             <button type="button" className="icon-btn" aria-label={`Remove ${role || "role"}`} onClick={() => remove(idx)}>
               <X size={14} aria-hidden />
             </button>
@@ -144,28 +160,41 @@ function ModelRolesEditor({
   );
 }
 
-/** The three harness model pickers (main, small, other roles), as in the flow editor and a run's details. */
+/**
+ * The three harness model pickers (main, small, other roles), as in the flow editor and a run's details. `bind`
+ * renders a control under each picker for its field path (`harness.model`, `harness.modelRoles.<role>`, …).
+ */
 export function HarnessModelPickers({
   value,
   models,
+  bind,
   onChange,
 }: {
   value: HarnessModels;
   models: ModelEntry[];
+  bind?: (path: string) => ReactNode;
   onChange: (models: HarnessModels) => void;
 }) {
   return (
     <>
-      <ModelSelect label="Model" value={value.model} models={models} onChange={(model) => onChange({ ...value, model })} />
+      <ModelSelect
+        label="Model"
+        value={value.model}
+        models={models}
+        extra={bind?.("harness.model")}
+        onChange={(model) => onChange({ ...value, model })}
+      />
       <ModelSelect
         label="Small model (optional)"
         value={value.smolModel ?? ""}
         models={models}
+        extra={bind?.("harness.smolModel")}
         onChange={(smolModel) => onChange({ ...value, smolModel: smolModel === "" ? undefined : smolModel })}
       />
       <ModelRolesEditor
         roles={value.modelRoles ?? {}}
         models={models}
+        bind={bind}
         onChange={(modelRoles) => onChange({ ...value, modelRoles: Object.keys(modelRoles).length ? modelRoles : undefined })}
       />
     </>

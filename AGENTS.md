@@ -13,6 +13,7 @@ Glossary:
 - **loop**: step (`kind: "loop"`) that jumps back to an earlier step `to`, repeating the body up to `maxIterations` (stop: fixed count, a body value, or ask).
 - **condition**: step (`kind: "condition"`, "If…") that compares a template path (`ref`) and runs its then-block (through `thenEnd`) or its optional else-block (through `elseEnd`); the other branch is `skipped`.
 - **trust**: `owner` vs untrusted (e.g. fork PRs).
+- **binding**: `bindings` entry (flow-level field path or step field → input key) that lets a non-GitHub input set a flow setting; applied by `materializeFlow` at run creation, an empty input keeps the field's value.
 
 ## Architecture & Data Flow
 
@@ -32,13 +33,13 @@ flowchart LR
 
 - **Run lifecycle**:
   1. Flow stored in `flows` (JSON `definition`).
-  2. `createRun.ts:insertRun` creates the run and its pending `runSteps`.
+  2. `createRun.ts:insertRun` creates the run and its pending `runSteps`. Its `runs.definition` is the materialized copy (`materializeFlow`: input values written into bound fields, bindings removed, revalidated), so scheduler, runner and retry only see final values.
   3. `scheduler.ts` (`kick()` every 5s + on demand) assigns queued runs, oldest first, to the least-loaded eligible runner. Eligibility checks: labels, `maxConcurrentJobs`, `maxConcurrentPerRepo`, trust, and `allowedRoots` containment.
   4. The runner streams `job.events`.
   5. `RunService.ingest` (`runs.ts`) persists into `run_events` and projects into `runs`/`run_steps`/`findings`.
   6. `Hub` (`hub.ts`) fans out to browser subscribers.
   - `runs.definition` is the run's own copy of the flow; `PUT /api/runs/:id/models` rewrites its `harness` models even while the run is live. For a live run the holding runner switches first (`job.setModels`); its `run.models` event is projected into `runs.definition` too, so the stored models follow the runner even when the API call timed out.
-- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 6`):
+- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 7`):
   - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`).
   - Events are at-least-once, deduped by `(runId, seq)`, and acked via `job.ack`.
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).

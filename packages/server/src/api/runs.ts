@@ -4,6 +4,10 @@ import {
   type GitHubIssueInput,
   harnessModelErrors,
   type InputDef,
+  isEmptyInputValue,
+  isGitHubInput,
+  materializeFlow,
+  parseInputValue,
   type PullRequestInput,
   type RunDetail,
   RUN_NAME_MAX,
@@ -61,9 +65,10 @@ export type InputResolution =
   | { ok: false; status: 400 | 502; body: { error: string } | { errors: string[] } };
 
 /**
- * Checks raw string inputs against the flow's `InputDef`s and resolves `github_issue` and
- * `github_pull_request` URLs. Optional inputs left empty become `""` (text) or `null` (GitHub inputs).
- * `untrustedPullSource` reports a fork or first-time-contributor pull request input.
+ * Checks raw string inputs against the flow's `InputDef`s: value inputs go through `parseInputValue` (an empty
+ * one takes its `default`, else `""`), `github_issue` and `github_pull_request` URLs are resolved (empty: `null`).
+ * Required inputs must have a value after defaults. `untrustedPullSource` reports a fork or first-time-contributor
+ * pull request input.
  */
 export async function resolveInputs(
   deps: Pick<AppDeps, "credentials" | "github">,
@@ -73,19 +78,24 @@ export async function resolveInputs(
   const errors: string[] = [];
   const declared = new Set(defs.map((d) => d.key));
   for (const key of Object.keys(raw)) if (!declared.has(key)) errors.push(`inputs.${key}: not declared by the flow`);
+  const inputs: Record<string, unknown> = {};
   for (const d of defs) {
-    if (d.required && !(raw[d.key] ?? "").trim()) errors.push(`inputs.${d.key}: required`);
+    const value = raw[d.key] ?? "";
+    if (isGitHubInput(d)) {
+      if (d.required && !value.trim()) errors.push(`inputs.${d.key}: required`);
+      continue;
+    }
+    const parsed = parseInputValue(d, value);
+    if (!parsed.ok) errors.push(`inputs.${d.key}: ${parsed.error}`);
+    else if (d.required && isEmptyInputValue(parsed.value)) errors.push(`inputs.${d.key}: required`);
+    else inputs[d.key] = parsed.value;
   }
   if (errors.length) return { ok: false, status: 400, body: { errors } };
 
-  const inputs: Record<string, unknown> = {};
   let untrustedPullSource = false;
   for (const d of defs) {
+    if (!isGitHubInput(d)) continue;
     const value = raw[d.key] ?? "";
-    if (d.type === "text") {
-      inputs[d.key] = value;
-      continue;
-    }
     if (!value.trim()) {
       inputs[d.key] = null;
       continue;
@@ -101,7 +111,7 @@ export async function resolveInputs(
       return { ok: false, status: clientSide ? 400 : 502, body: { error: `inputs.${d.key}: ${err.message}` } };
     }
   }
-  return { ok: true, inputs, untrustedPullSource };
+  return { ok: true, inputs: Object.fromEntries(defs.map((d) => [d.key, inputs[d.key]])), untrustedPullSource };
 }
 
 const INVALID_URL = { github_issue: "Invalid GitHub issue URL", github_pull_request: "Invalid GitHub pull request URL" } as const;
@@ -133,6 +143,9 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
     if (!parsed.success) return c.json({ errors: issueMessages(parsed.error.issues) }, 400);
     const resolved = await resolveInputs(deps, flow.definition.inputs, parsed.data.inputs ?? {});
     if (!resolved.ok) return c.json(resolved.body, resolved.status);
+    // The run keeps its own copy with the bound fields filled in: scheduler, runner and retry read final values.
+    const materialized = materializeFlow(flow.definition, resolved.inputs);
+    if (!materialized.ok) return c.json({ errors: materialized.errors }, 400);
     const status = initialPullRunStatus(flow.definition.trigger, resolved.untrustedPullSource);
     if (status === null) {
       return c.json({ error: 'Flow forkPolicy is "skip": fork and first-time-contributor pull requests never run' }, 403);
@@ -140,7 +153,7 @@ export function runRoutes(deps: AppDeps): { flowRuns: Hono; runs: Hono } {
 
     const id = insertRun(
       deps,
-      flow,
+      { ...flow, definition: materialized.flow },
       resolved.inputs,
       { triggerKind: "manual", createdBy: c.get("user")?.id ?? null, status },
       { ...(parsed.data.name !== undefined ? { name: parsed.data.name } : {}), ...(parsed.data.autoName ? { autoName: true } : {}) },

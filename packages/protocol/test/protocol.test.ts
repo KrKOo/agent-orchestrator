@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DOMAIN_RE,
   type FlowDefinition,
+  flowBindings,
   isActionStep,
   isAgentStep,
   conditionBranches,
@@ -9,7 +10,9 @@ import {
   harnessModelErrors,
   isTruthyValue,
   loopRanges,
+  materializeFlow,
   NETWORK_PRESETS,
+  parseInputValue,
   renderShellCommand,
   renderTemplate,
   RunEvent,
@@ -18,6 +21,7 @@ import {
   templateRefs,
   templateVariables,
   validateFlow,
+  type ValueInputDef,
 } from "../src";
 
 const ctx = {
@@ -1079,5 +1083,237 @@ describe("NETWORK_PRESETS", () => {
     for (const [key, preset] of Object.entries(NETWORK_PRESETS)) {
       for (const domain of preset.domains) expect({ key, domain, valid: DOMAIN_RE.test(domain) }).toEqual({ key, domain, valid: true });
     }
+  });
+});
+
+describe("input bindings", () => {
+  const paramFlow = {
+    name: "params",
+    inputs: [
+      { key: "repo", label: "Repo", type: "path", required: false, default: "/repos/a" },
+      { key: "model", label: "Model", type: "model", required: false },
+      { key: "size", label: "Size", type: "select", required: false, options: [{ value: "2" }, { value: "4", label: "Big" }] },
+      { key: "labels", label: "Labels", type: "text", required: false },
+      { key: "fresh", label: "Fresh", type: "boolean", required: false },
+      { key: "minutes", label: "Timeout", type: "number", required: false },
+      { key: "issue", label: "Issue", type: "github_issue", required: false },
+    ],
+    workspace: { kind: "local_path", path: "/repos/main" },
+    harness: { id: "omp", model: "anthropic/claude-sonnet-4-5" },
+    bindings: {
+      "workspace.path": "repo",
+      "harness.model": "model",
+      "harness.modelRoles.slow": "model",
+      "sandbox.cpus": "size",
+      runnerLabels: "labels",
+    },
+    steps: [
+      { id: "impl", name: "Implement", kind: "prompt", prompt: "go", bindings: { freshSession: "fresh", timeoutSec: "minutes" } },
+      { id: "again", name: "Again", kind: "loop", to: "impl", maxIterations: 2, bindings: { maxIterations: "size" } },
+    ],
+  };
+  const errorsOf = (flow: unknown): string[] => {
+    const res = validateFlow(flow);
+    return res.ok ? [] : res.errors;
+  };
+  const parsed = (flow: unknown): FlowDefinition => {
+    const res = validateFlow(flow);
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    return res.flow;
+  };
+
+  test("accepts flow and step bindings across the table", () => {
+    const flow = parsed(paramFlow);
+    expect(flow.bindings).toEqual(paramFlow.bindings);
+    expect(flow.steps[0]!.bindings).toEqual({ freshSession: "fresh", timeoutSec: "minutes" });
+    expect(
+      errorsOf({
+        ...paramFlow,
+        inputs: [
+          ...paramFlow.inputs,
+          { key: "pick", label: "Pick", type: "select", required: false, options: [{ value: "worktree" }] },
+          { key: "allow", label: "Allow", type: "text", required: false, default: "example.com, .npmjs.org" },
+          { key: "image", label: "Image", type: "text", required: false, default: "orch/custom:1" },
+        ],
+        bindings: {
+          ...paramFlow.bindings,
+          "workspace.isolation": "pick",
+          "sandbox.network.allow": "allow",
+          "sandbox.image": "image",
+          "harness.smolModel": "model",
+        },
+      }),
+    ).toEqual([]);
+  });
+
+  test("rejects unknown fields, undeclared and GitHub inputs, incompatible types and fields the step or workspace lacks", () => {
+    const only = (bindings: Record<string, string>) => errorsOf({ ...paramFlow, bindings });
+    expect(only({ "sandbox.provider": "labels" })).toEqual(["bindings.sandbox.provider: not a field inputs can set"]);
+    expect(only({ "harness.model": "nope" })).toEqual(['bindings.harness.model: references undeclared input "nope"']);
+    expect(only({ "sandbox.image": "issue" })).toEqual(['bindings.sandbox.image: github_issue input "issue" cannot set flow fields']);
+    expect(only({ "harness.model": "fresh" })).toEqual(["bindings.harness.model: a boolean input cannot set Model (use model or select)"]);
+    expect(only({ "harness.modelRoles.smol": "model" })).toEqual(["bindings.harness.modelRoles.smol: bind harness.smolModel instead"]);
+
+    expect(
+      errorsOf({
+        ...prFlow,
+        inputs: [...prFlow.inputs, { key: "dir", label: "Dir", type: "path", required: false }],
+        bindings: { "workspace.path": "dir" },
+      }),
+    ).toEqual(["bindings.workspace.path: only local_path workspaces have this field"]);
+    expect(
+      errorsOf({
+        ...paramFlow,
+        bindings: undefined,
+        steps: [{ id: "sh", name: "Sh", kind: "shell", command: "ls", bindings: { freshSession: "fresh" } }],
+      }),
+    ).toEqual(["steps.0 (sh).bindings.freshSession: shell steps have no bindable freshSession"]);
+    expect(
+      errorsOf({
+        ...paramFlow,
+        bindings: undefined,
+        steps: [
+          { id: "impl", name: "Impl", kind: "prompt", prompt: "go" },
+          { id: "check", name: "Check", kind: "condition", ref: "steps.impl.output", op: "truthy", thenEnd: "fix", bindings: { value: "labels" } },
+          { id: "fix", name: "Fix", kind: "prompt", prompt: "fix" },
+        ],
+      }),
+    ).toEqual(['steps.1 (check).bindings.value: "truthy" takes no value']);
+  });
+
+  test("select option values cannot be padded with whitespace (run values are trimmed, so they could never match)", () => {
+    const withSizeOptions = (options: { value: string }[]) =>
+      errorsOf({ ...paramFlow, inputs: paramFlow.inputs.map((i) => (i.key === "size" ? { ...i, options } : i)) });
+    expect(withSizeOptions([{ value: " 2 " }, { value: "4" }])).toEqual([
+      "inputs.2.options.0.value: option values cannot start or end with whitespace",
+    ]);
+    expect(withSizeOptions([{ value: "2" }, { value: "  " }])).toEqual([
+      "inputs.2.options.1.value: option values cannot start or end with whitespace",
+    ]);
+  });
+
+  test("every select option must yield a valid flow, including the pull request rules", () => {
+    const wide = errorsOf({
+      ...paramFlow,
+      inputs: [...paramFlow.inputs, { key: "net", label: "Net", type: "select", required: false, options: [{ value: "allowlist" }, { value: "wide" }] }],
+      bindings: { "sandbox.network.mode": "net" },
+    });
+    expect(wide).toHaveLength(1);
+    expect(wide[0]).toStartWith('bindings.sandbox.network.mode: with option "wide" of input "net": sandbox.network.mode: ');
+
+    expect(
+      errorsOf({
+        ...prFlow,
+        inputs: [...prFlow.inputs, { key: "net", label: "Net", type: "select", required: false, options: [{ value: "gateway_only" }, { value: "open" }] }],
+        bindings: { "sandbox.network.mode": "net" },
+      }),
+    ).toEqual([
+      'bindings.sandbox.network.mode: with option "open" of input "net": sandbox.network.mode: flows with a pull request input cannot use "open"',
+    ]);
+
+    // A rule outside the bound field is reported on the binding too.
+    expect(
+      errorsOf({
+        ...paramFlow,
+        inputs: [...paramFlow.inputs, { key: "iso", label: "Iso", type: "select", required: false, options: [{ value: "worktree" }, { value: "direct" }] }],
+        bindings: { "workspace.isolation": "iso" },
+        steps: [
+          { id: "msg", name: "Msg", kind: "prompt", prompt: "write" },
+          { id: "commit", name: "Commit", kind: "git_commit", messageFrom: "msg" },
+        ],
+      }),
+    ).toEqual([
+      'bindings.workspace.isolation: with option "direct" of input "iso": steps.1 (commit): git_commit requires workspace isolation "worktree" with access "rw"',
+    ]);
+  });
+
+  test("flowBindings reads own field values only: an unset `constructor` role is undefined, not Object's constructor", () => {
+    const flow = parsed({
+      ...paramFlow,
+      harness: { id: "omp", model: "anthropic/claude-sonnet-4-5", modelRoles: { slow: "openai/gpt-5" } },
+      bindings: { "harness.modelRoles.constructor": "model", "harness.modelRoles.slow": "model" },
+    });
+    const byPath = new Map(flowBindings(flow).map((b) => [b.path, b.value]));
+    expect(byPath.has("harness.modelRoles.constructor")).toBe(true);
+    expect(byPath.get("harness.modelRoles.constructor")).toBeUndefined();
+    expect(byPath.get("harness.modelRoles.slow")).toBe("openai/gpt-5");
+  });
+
+  test("defaults must yield a valid flow; step binding errors land on the step", () => {
+    expect(
+      errorsOf({ ...paramFlow, inputs: paramFlow.inputs.map((i) => (i.key === "repo" ? { ...i, default: "repos/a" } : i)) }),
+    ).toEqual(["inputs.0.default: default must be an absolute path"]);
+    expect(
+      errorsOf({
+        ...paramFlow,
+        inputs: [...paramFlow.inputs, { key: "dir", label: "Dir", type: "text", required: false, default: "repos/b" }],
+        bindings: { "workspace.path": "dir" },
+      }),
+    ).toEqual(['bindings.workspace.path: with default "repos/b" of input "dir": workspace.path: workspace.path must be absolute']);
+
+    const negative = errorsOf({ ...paramFlow, inputs: paramFlow.inputs.map((i) => (i.key === "minutes" ? { ...i, default: -5 } : i)) });
+    expect(negative).toHaveLength(1);
+    expect(negative[0]).toStartWith('steps.0 (impl).bindings.timeoutSec: with default -5 of input "minutes": steps.0.timeoutSec: ');
+  });
+
+  test("materializeFlow writes converted values, keeps fields of empty inputs and drops the bindings", () => {
+    const flow = parsed(paramFlow);
+    const res = materializeFlow(flow, {
+      repo: "/repos/b",
+      model: "openai/gpt-5",
+      size: "4",
+      labels: "gpu, big\nlinux",
+      fresh: true,
+      minutes: 60,
+      issue: null,
+    });
+    if (!res.ok) throw new Error(res.errors.join("\n"));
+    expect(res.flow.workspace).toMatchObject({ kind: "local_path", path: "/repos/b" });
+    expect(res.flow.harness).toEqual({ id: "omp", model: "openai/gpt-5", modelRoles: { slow: "openai/gpt-5" } });
+    expect(res.flow.sandbox.cpus).toBe(4);
+    expect(res.flow.runnerLabels).toEqual(["gpu", "big", "linux"]);
+    expect(res.flow.steps[0]).toMatchObject({ freshSession: true, timeoutSec: 60 });
+    expect(res.flow.steps[1]).toMatchObject({ maxIterations: 4 });
+    expect(res.flow.bindings).toBeUndefined();
+    expect(res.flow.steps.map((s) => s.bindings)).toEqual([undefined, undefined]);
+    expect(flow.bindings).toEqual(paramFlow.bindings); // the source flow is untouched
+
+    const empty = materializeFlow(flow, { repo: "", model: "", size: "", labels: "", fresh: "", minutes: "", issue: null });
+    if (!empty.ok) throw new Error(empty.errors.join("\n"));
+    expect(empty.flow.workspace).toMatchObject({ path: "/repos/main" });
+    expect(empty.flow.harness).toEqual({ id: "omp", model: "anthropic/claude-sonnet-4-5" });
+    expect(empty.flow.sandbox.cpus).toBe(2);
+    expect(empty.flow.steps[0]).toMatchObject({ freshSession: false, timeoutSec: 1800 });
+  });
+
+  test("materializeFlow reports values that break the flow as inputs.<key> errors", () => {
+    const flow = parsed(paramFlow);
+    const res = materializeFlow(flow, { repo: "relative", minutes: -1 });
+    expect(res.ok).toBe(false);
+    if (res.ok) return;
+    expect(res.errors).toHaveLength(2);
+    expect(res.errors).toContain("inputs.repo: workspace.path: workspace.path must be absolute");
+    expect(res.errors.find((e) => e.startsWith("inputs.minutes: steps.0.timeoutSec: "))).toBeDefined();
+  });
+
+  test("parseInputValue parses each value type and falls back to the default", () => {
+    const num: ValueInputDef = { key: "n", label: "N", type: "number", required: false, default: 3 };
+    expect(parseInputValue(num, " 4.5 ")).toEqual({ ok: true, value: 4.5 });
+    expect(parseInputValue(num, "")).toEqual({ ok: true, value: 3 });
+    expect(parseInputValue(num, "four")).toEqual({ ok: false, error: "must be a number" });
+    const bool: ValueInputDef = { key: "b", label: "B", type: "boolean", required: false };
+    expect(parseInputValue(bool, "true")).toEqual({ ok: true, value: true });
+    expect(parseInputValue(bool, "false")).toEqual({ ok: true, value: false });
+    expect(parseInputValue(bool, "yes")).toEqual({ ok: false, error: "must be true or false" });
+    expect(parseInputValue(bool, " ")).toEqual({ ok: true, value: "" });
+    const sel: ValueInputDef = { key: "s", label: "S", type: "select", required: true, options: [{ value: "a" }, { value: "b" }] };
+    expect(parseInputValue(sel, "b")).toEqual({ ok: true, value: "b" });
+    expect(parseInputValue(sel, "c")).toEqual({ ok: false, error: "must be one of a, b" });
+    const path: ValueInputDef = { key: "p", label: "P", type: "path", required: false, default: "/repos/a" };
+    expect(parseInputValue(path, "/repos/b ")).toEqual({ ok: true, value: "/repos/b" });
+    expect(parseInputValue(path, "repos/b")).toEqual({ ok: false, error: "must be an absolute path" });
+    expect(parseInputValue(path, "")).toEqual({ ok: true, value: "/repos/a" });
+    const text: ValueInputDef = { key: "t", label: "T", type: "text", required: false };
+    expect(parseInputValue(text, "  keep spacing ")).toEqual({ ok: true, value: "  keep spacing " });
   });
 });
