@@ -102,6 +102,7 @@ async function main(): Promise<void> {
     mcp,
     sandboxes: new DockerSandboxProvider(config),
     emit: (draft) => outbox.append(draft),
+    flushEvents: () => outbox.flush(),
     seedOutbox: (runId, seqFrom) => outbox.seed(runId, seqFrom),
     send,
     rpc: <T>(method: RunnerRpcMethod, params: unknown) => {
@@ -124,6 +125,7 @@ async function main(): Promise<void> {
       capabilities: {
         labels: config.labels,
         maxConcurrentJobs: config.maxConcurrentJobs,
+        maxManagers: config.maxManagers,
         allowedRoots: config.allowedRoots,
         harnesses: [{ id: "omp", version: harnessVersion }],
         models,
@@ -141,6 +143,9 @@ async function main(): Promise<void> {
         for (const [runId, seq] of Object.entries(msg.lastAckedSeq)) outbox.ack(runId, seq);
         // replayAll sends synchronously, so `replayed` follows every replayed frame on the socket.
         outbox.replayAll();
+        // Runs the server holds with no job in this process (it restarted) would stay live forever, and jobs the
+        // server already ended would keep their slot: reconcile both before any new assignment.
+        jobs.reconcileHeld(Object.keys(msg.lastAckedSeq));
         send({ t: "replayed" });
         return;
       case "job.assign":
@@ -160,6 +165,9 @@ async function main(): Promise<void> {
         return;
       case "intervention.respond":
         jobs.respondIntervention(msg.runId, msg.requestId, msg);
+        return;
+      case "manager.inbox":
+        jobs.deliverInbox(msg.runId, msg.items);
         return;
       case "rpc.call": {
         const result: Promise<unknown> =

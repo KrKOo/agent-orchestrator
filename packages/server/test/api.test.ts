@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, jest, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { type Catalog, type FlowRow, type RunDetail, type RunRow, RUNS_PAGE_SIZE, runsCursor, type ServerMessage } from "@orch/protocol";
+import { ulid } from "ulid";
 import { FS_LIST_TIMEOUT_MS, registerRunner } from "../src/api/runners";
 import { createApp } from "../src/app";
 import { schema } from "../src/db";
@@ -8,7 +9,7 @@ import type { AppDeps } from "../src/deps";
 import { PatCredentials } from "../src/github/credentials";
 import { eventsAfter } from "../src/ws/browser";
 import { authenticateRunner } from "../src/ws/runner";
-import { addRun, caps, connectRunner, FakeLink, flowDef, testDeps } from "./helpers";
+import { addRun, addTask, caps, connectRunner, FakeLink, flowDef, testDeps } from "./helpers";
 
 const flowBody = {
   name: "Issue to commit",
@@ -66,6 +67,35 @@ describe("flows API", () => {
     expect((await call("POST", "/api/flows", "{")).status).toBe(400);
     expect((await call("DELETE", `/api/flows/${flow.id}`)).status).toBe(204);
     expect((await call("GET", `/api/flows/${flow.id}`)).status).toBe(404);
+  });
+
+  test("flows list exposes origin/taskId and POST /:id/promote promotes manager flows only", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const task = addTask(deps);
+    const user = (await call("POST", "/api/flows", flowBody)).json as FlowRow;
+    expect(user).toMatchObject({ origin: "user", taskId: null });
+
+    const manager = ulid();
+    deps.db
+      .insert(schema.flows)
+      .values({ id: manager, name: "manager flow", definition: flowDef(), version: 1, createdAt: 1, updatedAt: 1, origin: "manager", taskId: task })
+      .run();
+    const builtin = ulid();
+    deps.db
+      .insert(schema.flows)
+      .values({ id: builtin, name: "builtin flow", definition: flowDef(), version: 1, createdAt: 1, updatedAt: 1, origin: "builtin" })
+      .run();
+
+    const promoted = await call("POST", `/api/flows/${manager}/promote`);
+    expect(promoted.status).toBe(200);
+    expect(promoted.json).toMatchObject({ id: manager, origin: "user", taskId: null });
+
+    expect((await call("POST", `/api/flows/${manager}/promote`)).status).toBe(409);
+    expect((await call("POST", `/api/flows/${builtin}/promote`)).status).toBe(409);
+    expect((await call("POST", "/api/flows/nope/promote")).status).toBe(404);
+    // The user flow was never touched.
+    expect((await call("GET", `/api/flows/${user.id}`)).json).toMatchObject({ origin: "user", taskId: null });
   });
 });
 
@@ -127,6 +157,49 @@ describe("runs API", () => {
     expect(bad.status).toBe(400);
     expect(bad.json.errors[0]).toStartWith("status.1:");
     expect((await call("GET", "/api/runs?before=nope")).status).toBe(400);
+  });
+
+  test("run list filters by taskId and handler", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const task = addTask(deps);
+    const taskRun = addRun(deps, { taskId: task, role: "worker", interventionHandler: "manager", createdAt: 4 });
+    const takenOver = addRun(deps, { taskId: task, role: "worker", interventionHandler: "user", createdAt: 3 });
+    const managerRun = addRun(deps, { taskId: task, role: "manager", createdAt: 2 });
+    const plain = addRun(deps, { createdAt: 1 });
+    const ids = async (query: string) => (await call("GET", `/api/runs?${query}`)).json.map((r: RunRow) => r.id);
+
+    expect(await ids(`taskId=${task}`)).toEqual([taskRun, takenOver, managerRun]);
+    expect(await ids("taskId=other")).toEqual([]);
+    // handler=user: runs outside a task plus task child runs handed to the user; the manager's own runs never.
+    expect(await ids("handler=user")).toEqual([takenOver, plain]);
+    expect(await ids("handler=manager")).toEqual([taskRun]);
+    expect(await ids(`taskId=${task}&handler=user`)).toEqual([takenOver]);
+    expect((await call("GET", "/api/runs?handler=side")).status).toBe(400);
+    // Approval is always the user's, even for a run whose interventions the manager handles (fork-PR children).
+    const needsApproval = addRun(deps, { taskId: task, role: "worker", interventionHandler: "manager", status: "awaiting_approval", createdAt: 5 });
+    expect(await ids("status=awaiting_input,awaiting_approval&handler=user")).toEqual([needsApproval]);
+  });
+
+  test("PUT /api/runs/:id/handler updates worker runs of a task, rejects others", async () => {
+    const deps = testDeps();
+    const call = client(deps);
+    const task = addTask(deps);
+    const worker = addRun(deps, { taskId: task, role: "worker", interventionHandler: "manager" });
+    const manager = addRun(deps, { taskId: task, role: "manager" });
+    const plain = addRun(deps);
+
+    const ok = await call("PUT", `/api/runs/${worker}/handler`, { handler: "user" });
+    expect(ok.status).toBe(200);
+    expect((ok.json as RunRow).interventionHandler).toBe("user");
+    // Back to the manager ("give back").
+    expect((await call("PUT", `/api/runs/${worker}/handler`, { handler: "manager" })).json).toMatchObject({ interventionHandler: "manager" });
+    expect((await call("PUT", `/api/runs/${manager}/handler`, { handler: "user" })).status).toBe(400);
+    expect((await call("PUT", `/api/runs/${plain}/handler`, { handler: "user" })).status).toBe(400);
+    expect((await call("PUT", "/api/runs/missing/handler", { handler: "user" })).status).toBe(404);
+    expect((await call("PUT", `/api/runs/${worker}/handler`, { handler: "nobody" })).status).toBe(400);
+    // The task's manager run itself is never "needs you"; runs outside a task always are.
+    expect((await call("GET", `/api/runs?handler=user`)).json.map((r: RunRow) => r.id)).toEqual([plain]);
   });
 
   test("run list pages with a before cursor across rows sharing createdAt", async () => {

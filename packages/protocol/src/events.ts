@@ -183,6 +183,10 @@ export const RunEvent = z.discriminatedUnion("type", [
       blocks: z.array(SubagentBlock),
     }),
   }),
+  /** Manager runs: the agent's reply text of one finished turn; projected into the task chat (`role: "manager"`). */
+  z.object({ ...base, type: z.literal("manager.reply"), payload: z.object({ text: z.string() }) }),
+  /** Manager runs: inbox items up to task message `upToSeq` went into a turn; the server stops re-sending them. */
+  z.object({ ...base, type: z.literal("manager.consumed"), payload: z.object({ upToSeq: z.number().int().min(0) }) }),
 ]);
 export type RunEvent = z.infer<typeof RunEvent>;
 export type RunEventType = RunEvent["type"];

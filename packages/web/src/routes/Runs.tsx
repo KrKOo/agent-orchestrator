@@ -1,5 +1,5 @@
 // Runs list: status tabs + search kept in the URL query, infinite pages, and every row links to its run.
-import { RUNS_PAGE_SIZE, runsCursor } from "@orch/protocol";
+import { isBuiltinFlowId, RUNS_PAGE_SIZE, runsCursor } from "@orch/protocol";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Play } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -63,6 +63,8 @@ export function Runs() {
       api.listRuns({
         flowId: filter.flowId,
         status: statuses.length ? statuses : undefined,
+        // The "Needs you" tab excludes runs whose requests the task's manager answers.
+        handler: filter.tab === "attention" ? "user" : undefined,
         q: filter.q.trim() || undefined,
         before: pageParam,
       }),
@@ -200,10 +202,21 @@ export function Runs() {
                       </div>
                     )}
                     <div className="cell-sub small">
-                      <Link to={`/flows/${r.flowId}`} className="cell-flow">
-                        {r.flowName}
-                      </Link>{" "}
+                      {/* Built-in flows (a task's manager, resolve-conflicts) have no flow page. */}
+                      {isBuiltinFlowId(r.flowId) ? (
+                        <span className="cell-flow">{r.flowName}</span>
+                      ) : (
+                        <Link to={`/flows/${r.flowId}`} className="cell-flow">
+                          {r.flowName}
+                        </Link>
+                      )}{" "}
                       <span className="muted">v{r.flowVersion}</span>
+                      {r.taskId && (
+                        <Link to={`/tasks/${r.taskId}`} className="cell-task" title="Part of a task — its manager started this run">
+                          {" "}
+                          · task
+                        </Link>
+                      )}
                     </div>
                     {r.error && (
                       <div className="cell-error small" title={r.error}>

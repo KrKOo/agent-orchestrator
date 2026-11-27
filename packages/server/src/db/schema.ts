@@ -1,4 +1,18 @@
-import type { FlowDefinition, RunGitHubInfo, RunnerCapabilities, RunStatus, StepStatus, WorkspaceInfo } from "@orch/protocol";
+import type {
+  FlowDefinition,
+  FlowOrigin,
+  InterventionChoice,
+  RunGitHubInfo,
+  RunnerCapabilities,
+  RunOverrides,
+  RunStatus,
+  StepStatus,
+  TaskEventKind,
+  TaskIntegration,
+  TaskSettings,
+  TaskStatus,
+  WorkspaceInfo,
+} from "@orch/protocol";
 import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const flows = sqliteTable("flows", {
@@ -8,6 +22,9 @@ export const flows = sqliteTable("flows", {
   version: integer("version").notNull(),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
+  /** Task whose manager created the flow; cleared when the user promotes it to a regular flow. */
+  taskId: text("task_id"),
+  origin: text("origin").$type<FlowOrigin>().notNull().default("user"),
 });
 
 export const runs = sqliteTable(
@@ -42,8 +59,19 @@ export const runs = sqliteTable(
     resumeRunnerId: text("resume_runner_id"),
     /** Host workspace (path/branch/repo) reported by the runner once the run starts. */
     workspace: text("workspace", { mode: "json" }).$type<WorkspaceInfo>(),
+    /** Task the run belongs to (its manager run or a child run the manager started). */
+    taskId: text("task_id"),
+    role: text("role").$type<"manager" | "worker">(),
+    /** Task child runs: who answers interventions and permission requests ("Take over" sets `user`). */
+    interventionHandler: text("intervention_handler").$type<"user" | "manager">(),
+    /** Task child runs: workspace/push overrides sent with `job.assign`. */
+    overrides: text("overrides", { mode: "json" }).$type<RunOverrides>(),
   },
-  (t) => [index("runs_status_idx").on(t.status, t.createdAt), index("runs_flow_idx").on(t.flowId, t.createdAt)],
+  (t) => [
+    index("runs_status_idx").on(t.status, t.createdAt),
+    index("runs_flow_idx").on(t.flowId, t.createdAt),
+    index("runs_task_idx").on(t.taskId, t.createdAt),
+  ],
 );
 
 export const runSteps = sqliteTable(
@@ -112,3 +140,36 @@ export const webhookDeliveries = sqliteTable("webhook_deliveries", {
   id: text("id").primaryKey(),
   receivedAt: integer("received_at").notNull(),
 });
+
+export const tasks = sqliteTable("tasks", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  status: text("status").$type<TaskStatus>().notNull(),
+  createdBy: text("created_by"),
+  settings: text("settings", { mode: "json" }).$type<TaskSettings>().notNull(),
+  /** Per repo: integration branch once created, final PR once opened. */
+  integration: text("integration", { mode: "json" }).$type<TaskIntegration>().notNull(),
+  /** Highest `task_messages.seq` the manager consumed (`manager.consumed`); later user/event rows are its inbox. */
+  inboxAckedSeq: integer("inbox_acked_seq").notNull().default(0),
+  /** Current (or last) manager run. */
+  managerRunId: text("manager_run_id"),
+  createdAt: integer("created_at").notNull(),
+  updatedAt: integer("updated_at").notNull(),
+});
+
+export const taskMessages = sqliteTable(
+  "task_messages",
+  {
+    taskId: text("task_id").notNull(),
+    seq: integer("seq").notNull(),
+    role: text("role").$type<"user" | "manager" | "event">().notNull(),
+    text: text("text").notNull(),
+    ts: integer("ts").notNull(),
+    runId: text("run_id"),
+    event: text("event").$type<TaskEventKind>(),
+    choices: text("choices", { mode: "json" }).$type<InterventionChoice[]>(),
+    choice: text("choice"),
+    answerTo: integer("answer_to"),
+  },
+  (t) => [primaryKey({ columns: [t.taskId, t.seq] })],
+);

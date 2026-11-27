@@ -4,6 +4,7 @@
   "runnerId": "<runnerId printed by runner-token create>",
   "labels": ["pr-checker"],
   "maxConcurrentJobs": 2,
+  "maxManagers": 1,
   "acceptUntrusted": true,
   "allowedRoots": [],
   "dataDir": "/var/lib/orch/runner",

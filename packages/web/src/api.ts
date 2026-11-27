@@ -2,19 +2,26 @@ import type {
   ApiError,
   Catalog,
   CreateRunnerTokenResponse,
+  CreateTaskBody,
   ElicitationAction,
   FlowDefinitionInput,
   FlowRow,
   FsListResult,
   InterventionAction,
   MeResponse,
+  PostTaskMessageInput,
   RunDetail,
   RunEvent,
   RunnerRow,
   RunRow,
   RunStatus,
+  SetRunHandlerBody,
   SetRunModelsBody,
+  TaskDetail,
+  TaskMessage,
+  TaskRow,
   ThemesResponse,
+  UpdateTaskBody,
 } from "@orch/protocol";
 
 export const LOGIN_PATH = "/auth/login";
@@ -76,12 +83,14 @@ export const api = {
     request<RunRow>("POST", `/api/flows/${enc(flowId)}/runs`, { inputs, ...opts }),
 
   /** One page of runs, newest first (`RUNS_PAGE_SIZE` max); `before` is the previous page's `runsCursor`. */
-  listRuns: (query: { flowId?: string; status?: readonly RunStatus[]; q?: string; before?: string } = {}) => {
+  listRuns: (query: { flowId?: string; status?: readonly RunStatus[]; q?: string; before?: string; taskId?: string; handler?: "user" | "manager" } = {}) => {
     const params = new URLSearchParams();
     if (query.flowId) params.set("flowId", query.flowId);
     if (query.status?.length) params.set("status", query.status.join(","));
     if (query.q) params.set("q", query.q);
     if (query.before) params.set("before", query.before);
+    if (query.taskId) params.set("taskId", query.taskId);
+    if (query.handler) params.set("handler", query.handler);
     const qs = params.toString();
     return request<RunRow[]>("GET", `/api/runs${qs ? `?${qs}` : ""}`);
   },
@@ -106,6 +115,22 @@ export const api = {
     requestId: string,
     body: { stepId: string; action: InterventionAction; session?: string; text?: string; choice?: string },
   ) => request<{ ok: true }>("POST", `/api/runs/${enc(runId)}/interventions/${enc(requestId)}`, body),
+
+  /** "Take over" (or hand back) a task child run's interventions and permission requests. */
+  setRunHandler: (id: string, body: SetRunHandlerBody) => request<RunRow>("PUT", `/api/runs/${enc(id)}/handler`, body),
+
+  /** Promotes a manager-created flow to a user flow: it keeps working once the task is gone. */
+  promoteFlow: (id: string) => request<FlowRow>("POST", `/api/flows/${enc(id)}/promote`),
+
+  listTasks: (archived = false) => request<TaskRow[]>("GET", `/api/tasks${archived ? "?archived=1" : ""}`),
+  getTask: (id: string) => request<TaskDetail>("GET", `/api/tasks/${enc(id)}`),
+  createTask: (body: CreateTaskBody) => request<TaskRow>("POST", "/api/tasks", body),
+  updateTask: (id: string, body: UpdateTaskBody) => request<TaskRow>("PATCH", `/api/tasks/${enc(id)}`, body),
+  postTaskMessage: (id: string, body: PostTaskMessageInput) =>
+    request<TaskMessage>("POST", `/api/tasks/${enc(id)}/messages`, body),
+  getTaskMessages: (id: string, afterSeq: number) =>
+    request<TaskMessage[]>("GET", `/api/tasks/${enc(id)}/messages?afterSeq=${afterSeq}`),
+  getTaskRuns: (id: string) => request<RunRow[]>("GET", `/api/tasks/${enc(id)}/runs`),
 
   listRunners: () => request<RunnerRow[]>("GET", "/api/runners"),
   createRunnerToken: (name: string, labels: string[]) =>

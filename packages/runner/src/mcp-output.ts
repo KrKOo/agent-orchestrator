@@ -1,7 +1,14 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { Finding, StructuredOutput } from "@orch/protocol";
+import {
+  type Finding,
+  MANAGER_TOOL_ARGS,
+  MANAGER_TOOL_DESCRIPTIONS,
+  MANAGER_TOOL_NAMES,
+  ManagerToolCall,
+  type StructuredOutput,
+} from "@orch/protocol";
 import { z } from "zod";
 import type { RunnerConfig } from "./config";
 
@@ -16,12 +23,40 @@ export interface McpRunSink {
   /** Returns error text (e.g. "No active step") or null on success. */
   submitOutput(value: unknown): string | null;
   reportFinding(f: Finding): string | null;
+  /** Manager runs only: one scoped orchestrator tool call, forwarded to the server as `manager.tool`. */
+  managerTool?(call: ManagerToolCall): Promise<unknown>;
 }
 
 const toolText = (text: string, isError = false) => ({ content: [{ type: "text" as const, text }], isError });
 
 function buildServer(sink: McpRunSink, spec?: StructuredOutput): McpServer {
   const server = new McpServer({ name: "orchestrator", version: "0.1.0" });
+  // Manager runs (`sink.managerTool` present) have no step output: they get only the scoped manager
+  // tools, each forwarded to the server as one validated `manager.tool` RPC. Step runs get
+  // submit_output/report_finding only (their schemas follow the step); the mutual exclusion is how
+  // the agent learns which kind of run it is in.
+  const managerTool = sink.managerTool?.bind(sink);
+  if (managerTool) {
+    for (const name of MANAGER_TOOL_NAMES) {
+      const shape = MANAGER_TOOL_ARGS[name].shape as Record<string, z.ZodType>;
+      server.registerTool(
+        name,
+        { description: MANAGER_TOOL_DESCRIPTIONS[name], inputSchema: shape },
+        async (args) => {
+          try {
+            // Re-validated here (the MCP layer checked the same schema): this is also what types the
+            // discriminated union member handed to the sink.
+            const call = ManagerToolCall.parse({ name, args });
+            const result = await managerTool(call);
+            return toolText(JSON.stringify(result, null, 2));
+          } catch (err) {
+            return toolText(err instanceof Error ? err.message : String(err), true);
+          }
+        },
+      );
+    }
+    return server;
+  }
   const outputField =
     spec === undefined
       ? z.any().describe("Any JSON value")

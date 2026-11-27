@@ -278,6 +278,16 @@ describe("RunnerSession", () => {
     expect(seen).toMatchObject([{ seq: 1, type: "run.status", payload: { status: "failed", error: "Unknown harness: x" } }]);
   });
 
+  test("a retryable job.rejected (no slot yet) puts the run back in the queue instead of failing it", async () => {
+    const { deps, session } = setup();
+    const runId = addRun(deps, { status: "assigned", runnerId: "r1" });
+    const seen: RunEvent[] = [];
+    deps.hub.subscribe(runId, (e) => seen.push(e));
+    await session.handle(JSON.stringify({ t: "job.rejected", runId, reason: "Runner at capacity", retryable: true }));
+    expect(deps.runs.get(runId)).toMatchObject({ status: "queued", runnerId: null, error: null });
+    expect(seen).toEqual([]);
+  });
+
   test("no job.assign before replayed; replayed rows of a run since retried are acked but not stored", async () => {
     const { deps, link, session } = setup();
     const runId = addRun(deps, { status: "failed", runnerId: "r1" });

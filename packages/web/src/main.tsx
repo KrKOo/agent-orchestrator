@@ -1,7 +1,7 @@
 import "./styles.css";
 
 import { QueryClient, QueryClientProvider, useMutation, useQuery } from "@tanstack/react-query";
-import { CircleUserRound, Compass, LogOut, Menu, Play, Server, Settings2, Workflow, X } from "lucide-react";
+import { CircleUserRound, Compass, LogOut, Menu, MessagesSquare, Play, Server, Settings2, Workflow, X } from "lucide-react";
 import { type ReactNode, StrictMode, useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, Link, Navigate, NavLink, Outlet, RouterProvider, useLocation } from "react-router";
@@ -12,6 +12,8 @@ import { Flows } from "./routes/Flows";
 import { Runners } from "./routes/Runners";
 import { Runs } from "./routes/Runs";
 import { RunView } from "./routes/RunView";
+import { Tasks } from "./routes/Tasks";
+import { TaskView } from "./routes/TaskView";
 import { ATTENTION_STATUSES, runsFilterSearch } from "./runsFilter";
 import { currentTheme, setTheme } from "./theme";
 import { EmptyState, Popover, setAttentionTitleCount, Skeleton, useDismiss, usePageTitle } from "./ui";
@@ -48,11 +50,11 @@ function ThemePicker() {
   );
 }
 
-/** Runs in `awaiting_input`/`awaiting_approval`; mirrored into the tab title as `(n)`. */
+/** Runs in `awaiting_input`/`awaiting_approval` whose requests the user answers; mirrored into the tab title as `(n)`. */
 function useAttentionCount(enabled: boolean): number {
   const runs = useQuery({
     queryKey: ["runs", "attention"],
-    queryFn: () => api.listRuns({ status: ATTENTION_STATUSES }),
+    queryFn: () => api.listRuns({ status: ATTENTION_STATUSES, handler: "user" }),
     refetchInterval: ATTENTION_POLL_MS,
     enabled,
   });
@@ -61,11 +63,33 @@ function useAttentionCount(enabled: boolean): number {
   return count;
 }
 
+/** Tasks in `needs_input`: the manager asked the user something or stopped. */
+function useTaskBadgeCount(enabled: boolean): number {
+  const tasks = useQuery({
+    queryKey: ["tasks"],
+    queryFn: () => api.listTasks(),
+    refetchInterval: ATTENTION_POLL_MS,
+    enabled,
+  });
+  return (tasks.data ?? []).filter((t) => t.status === "needs_input").length;
+}
+
 function AttentionBadge({ count }: { count: number }) {
   if (count === 0) return null;
   const label = `${count} run${count === 1 ? "" : "s"} waiting for you`;
   return (
     <Link className="attention-badge" to={`/runs${runsFilterSearch({ tab: "attention", q: "" })}`} aria-label={label} title={label}>
+      {count}
+    </Link>
+  );
+}
+
+/** `needs_input` tasks: the manager asked something or stopped; links to the task list. */
+function TaskBadge({ count }: { count: number }) {
+  if (count === 0) return null;
+  const label = `${count} task${count === 1 ? "" : "s"} waiting for you`;
+  return (
+    <Link className="attention-badge" to="/tasks" aria-label={label} title={label}>
       {count}
     </Link>
   );
@@ -132,6 +156,7 @@ function Layout() {
   }, [loginRequired]);
   const ready = !!me.data && !loginRequired;
   const attention = useAttentionCount(ready);
+  const taskBadge = useTaskBadgeCount(ready);
 
   // Below 640px the sidebar is a drawer: closed by navigation, Escape, or a click outside it.
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -152,6 +177,9 @@ function Layout() {
         </Link>
         <nav className="sidebar-nav" aria-label="Main">
           <NavItem to="/flows" icon={<Workflow size={18} aria-hidden />} label="Flows" />
+          <NavItem to="/tasks" icon={<MessagesSquare size={18} aria-hidden />} label="Tasks">
+            <TaskBadge count={taskBadge} />
+          </NavItem>
           <NavItem to="/runs" icon={<Play size={18} aria-hidden />} label="Runs">
             <AttentionBadge count={attention} />
           </NavItem>
@@ -224,6 +252,8 @@ const router = createBrowserRouter([
       { index: true, element: <Navigate to="/flows" replace /> },
       { path: "flows", element: <Flows /> },
       { path: "flows/:id", element: <FlowEditor /> },
+      { path: "tasks", element: <Tasks /> },
+      { path: "tasks/:id", element: <TaskView /> },
       { path: "runs", element: <Runs /> },
       { path: "runs/:id", element: <RunView /> },
       { path: "runners", element: <Runners /> },

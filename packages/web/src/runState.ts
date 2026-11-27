@@ -585,6 +585,10 @@ export function applyRunEvent(state: RunViewState, ev: RunEvent): RunViewState {
           subagents: st.subagents.map((a) => (a === existing ? applySubagentMessage(a, ev.payload) : a)),
         };
       });
+    // Manager-run turns are projected into the task chat (server-side), not into a run view.
+    case "manager.reply":
+    case "manager.consumed":
+      return s;
   }
 }
 

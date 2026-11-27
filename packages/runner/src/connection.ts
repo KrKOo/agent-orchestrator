@@ -1,7 +1,7 @@
 import { ServerMessage, type RunnerMessage } from "@orch/protocol";
 import { ulid } from "ulid";
 
-export type RunnerRpcMethod = "github.token" | "github.createPullRequest" | "github.createComment";
+export type RunnerRpcMethod = "github.token" | "github.createPullRequest" | "github.createComment" | "manager.tool";
 
 export interface ConnectionOptions {
   url: string;

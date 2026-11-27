@@ -13,6 +13,8 @@
  * - `probe`: first calls `tools/list` on the orchestrator MCP server and streams the raw JSON result
  *   as an extra chunk (prefixed `probe: `); used to assert the per-step tool schema.
  * - `submit-array <json>` / `submit-null`: call `submit_output` with an array / null and stream the result.
+ * - `tool <name> <json>`: calls the orchestrator MCP tool <name> with the JSON arguments and streams
+ *   the tool's text result as an extra chunk (prefixed `tool: `); used to exercise manager tools.
  * - `show-model`: streams the session's current main model as an extra chunk (`model: <id>`).
  * - `show-history`: streams how many prompts the session had before this one (`history: <n>`).
  *
@@ -203,6 +205,11 @@ const app = acp
     }
     if (text.includes("submit-null") && session.mcpUrl && session.mcpSecret) {
       await chunk(`\n${await submitOutput(session.mcpUrl, session.mcpSecret, null)}`);
+    }
+    const toolCall = /\btool (\S+) (\{.*\})/s.exec(text);
+    if (toolCall && session.mcpUrl && session.mcpSecret) {
+      const r = await callTool(session.mcpUrl, session.mcpSecret, "tools/call", { name: toolCall[1], arguments: JSON.parse(toolCall[2]!) });
+      await chunk(`\ntool: ${r.isError ? "error: " : ""}${r.text}`);
     }
     if (text.includes("show-model")) await chunk(`\nmodel: ${session.model}`);
     if (text.includes("show-history")) await chunk(`\nhistory: ${prior}`);

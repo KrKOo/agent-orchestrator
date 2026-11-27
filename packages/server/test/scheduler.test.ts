@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { and, eq } from "drizzle-orm";
 import { isEligible, isUnderRoot, RUNNER_LOST_MS, Scheduler, type RunnerState } from "../src/scheduler";
 import { schema } from "../src/db";
-import { addRun, addRunner, caps, connectRunner, flowDef, testDeps } from "./helpers";
+import { addRun, addRunner, addTask, caps, connectRunner, flowDef, testDeps } from "./helpers";
 
 const NOW = 1_000_000_000;
 
@@ -16,11 +16,12 @@ function runner(over: Partial<RunnerState> = {}): RunnerState {
     connected: true,
     replayed: true,
     running: 0,
+    managers: 0,
     ...over,
   };
 }
 
-const ownerRun = { trust: "owner" as const, createdBy: null, definition: flowDef() };
+const ownerRun = { trust: "owner" as const, createdBy: null, definition: flowDef(), role: null };
 
 describe("isEligible", () => {
   test("baseline runner is eligible", () => {
@@ -73,6 +74,19 @@ describe("isEligible", () => {
     const run = { ...ownerRun, trust: "untrusted" as const };
     expect(isEligible(run, runner(), NOW)).toBe(false);
     expect(isEligible(run, runner({ capabilities: caps({ acceptUntrusted: true }) }), NOW)).toBe(true);
+  });
+
+  test("a manager run needs a free manager slot, not a maxConcurrentJobs one", () => {
+    const managerRun = { ...ownerRun, role: "manager" as const };
+    // A full worker pool (running counts every held run) still takes a manager…
+    expect(isEligible(managerRun, runner({ running: 2, managers: 0, capabilities: caps({ maxConcurrentJobs: 2 }) }), NOW)).toBe(true);
+    // …but the second manager waits when maxManagers is reached.
+    expect(isEligible(managerRun, runner({ managers: 1, capabilities: caps({ maxManagers: 1 }) }), NOW)).toBe(false);
+    expect(isEligible(managerRun, runner({ managers: 1, capabilities: caps({ maxManagers: 2 }) }), NOW)).toBe(true);
+    // maxManagers: 0 never takes managers.
+    expect(isEligible(managerRun, runner({ managers: 0, capabilities: caps({ maxManagers: 0 }) }), NOW)).toBe(false);
+    // A worker on a runner at its manager cap is still eligible (the caps are independent).
+    expect(isEligible(ownerRun, runner({ managers: 1, running: 1, capabilities: caps({ maxConcurrentJobs: 2 }) }), NOW)).toBe(true);
   });
 });
 
@@ -337,5 +351,81 @@ describe("Scheduler.kick", () => {
     const run = addRun(deps, { status: "assigned", runnerId: "r1" });
     new Scheduler(deps.runs, () => now).kick();
     expect(deps.runs.get(run)!.status).toBe("assigned");
+  });
+
+  test("a manager run does not consume a maxConcurrentJobs slot: a worker is still assigned on a 1-slot runner", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps({ maxConcurrentJobs: 1 }));
+    const task = addTask(deps);
+    deps.scheduler.managerContext = () => ({ taskId: task, title: "Test task", brief: "brief" });
+    const manager = addRun(deps, { taskId: task, role: "manager", createdAt: 1, definition: flowDef() });
+    const worker = addRun(deps, { taskId: task, role: "worker", createdAt: 2 });
+
+    deps.scheduler.kick();
+
+    // Both are assigned to the single-slot runner: the manager held no worker slot.
+    expect(deps.runs.get(manager)).toMatchObject({ status: "assigned", runnerId: "r1" });
+    expect(deps.runs.get(worker)).toMatchObject({ status: "assigned", runnerId: "r1" });
+    const assignments = link.of("job.assign");
+    expect(assignments).toHaveLength(2);
+    const managerAssign = assignments.find((m) => m.run.runId === manager)!;
+    const workerAssign = assignments.find((m) => m.run.runId === worker)!;
+    expect(managerAssign.run.manager).toEqual({ taskId: task, context: { taskId: task, title: "Test task", brief: expect.any(String) } });
+    expect(workerAssign.run.manager).toBeUndefined();
+    expect(deps.scheduler.runnerStates()[0]).toMatchObject({ running: 2, managers: 1 });
+  });
+
+  test("a manager assignment carries the hook's context and is failed when the hook returns null", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const task = addTask(deps);
+    deps.scheduler.managerContext = (id) => (id === task ? { taskId: task, title: "Test task", brief: "the brief" } : null);
+
+    addRun(deps, { taskId: task, role: "manager", createdAt: 1 });
+    addRun(deps, { taskId: "gone", role: "manager", createdAt: 2 });
+    deps.scheduler.kick();
+
+    const assigned = link.of("job.assign")[0]!.run;
+    expect(assigned.manager).toEqual({ taskId: task, context: { taskId: task, title: "Test task", brief: "the brief" } });
+    const orphan = deps.db.select().from(schema.runs).all().find((r) => r.taskId === "gone")!;
+    expect(orphan).toMatchObject({ status: "failed", error: "task not found" });
+    expect(link.of("job.assign")).toHaveLength(1);
+  });
+
+  test("maxManagers is enforced: a second manager stays queued; maxManagers 0 never takes managers", () => {
+    const deps = testDeps();
+    connectRunner(deps, "r1", caps({ maxManagers: 1 }));
+    const task = addTask(deps);
+    deps.scheduler.managerContext = () => ({ taskId: task, title: "Test task", brief: "brief" });
+    const m1 = addRun(deps, { taskId: task, role: "manager", createdAt: 1 });
+    const m2 = addRun(deps, { taskId: task, role: "manager", createdAt: 2 });
+    deps.scheduler.kick();
+    expect(deps.runs.get(m1)).toMatchObject({ status: "assigned", runnerId: "r1" });
+    expect(deps.runs.get(m2)).toMatchObject({ status: "queued", runnerId: null });
+
+    // A different task's manager is capped the same way (the count is per runner).
+    const other = addRun(deps, { taskId: addTask(deps), role: "manager", createdAt: 3 });
+    deps.scheduler.kick();
+    expect(deps.runs.get(other)).toMatchObject({ status: "queued" });
+
+    // With the cap at 0 nothing is assigned.
+    connectRunner(deps, "r2", caps({ maxManagers: 0 }));
+    deps.scheduler.kick();
+    expect(deps.runs.get(m2)).toMatchObject({ status: "queued", runnerId: null });
+    expect(deps.runs.get(other)).toMatchObject({ status: "queued", runnerId: null });
+  });
+
+  test("a worker run with stored overrides carries them in job.assign; plain runs carry none", () => {
+    const deps = testDeps();
+    const link = connectRunner(deps, "r1", caps());
+    const task = addTask(deps);
+    const overrides = { baseBranch: "orch/task-x", pushBranch: "orch/task-x", forcePush: true };
+    const withOverrides = addRun(deps, { taskId: task, role: "worker", overrides, createdAt: 1 });
+    const plain = addRun(deps, { createdAt: 2 });
+
+    deps.scheduler.kick();
+
+    expect(link.of("job.assign").find((m) => m.run.runId === withOverrides)!.run.overrides).toEqual(overrides);
+    expect(link.of("job.assign").find((m) => m.run.runId === plain)!.run.overrides).toBeUndefined();
   });
 });

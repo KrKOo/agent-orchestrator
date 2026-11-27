@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { RunEvent, RunStatus } from "./events";
 import { FlowDefinition, HarnessModels, InterventionAction } from "./flow";
+import { ManagerContext, ManagerToolCall, RunOverrides, TaskMessage } from "./task";
 
 /**
  * 2: runners send `replayed` after the welcome replay; the server assigns no jobs before it.
@@ -8,8 +9,10 @@ import { FlowDefinition, HarnessModels, InterventionAction } from "./flow";
  * 4: loop steps, `loop.repeat`, skipped steps (and the `repeat` intervention action).
  * 5: condition steps, intervention choices (`intervention.respond.choice`).
  * 6: server→runner RPCs are a union (`job.setModels` switches a live run's models), `run.models` events.
+ * 7: tasks: manager runs (`AssignedRun.manager`, `manager.inbox`, `manager.tool` RPC, `manager.*` events),
+ *    per-run `overrides`, `maxManagers` capability.
  */
-export const WIRE_PROTOCOL = 6;
+export const WIRE_PROTOCOL = 7;
 
 export const CatalogEntry = z.object({ name: z.string(), description: z.string() });
 export type CatalogEntry = z.infer<typeof CatalogEntry>;
@@ -20,7 +23,13 @@ export type ModelEntry = z.infer<typeof ModelEntry>;
 
 export const RunnerCapabilities = z.object({
   labels: z.array(z.string()),
+  /** Non-manager runs at once; manager runs (tasks) do not count against it (see `maxManagers`). */
   maxConcurrentJobs: z.number().int().min(1),
+  /**
+   * Manager runs at once. Separate from `maxConcurrentJobs`: a manager waits on child runs for its whole
+   * life, so on a one-slot runner sharing the cap would deadlock it against its own children.
+   */
+  maxManagers: z.number().int().min(0).default(1),
   allowedRoots: z.array(z.string()),
   harnesses: z.array(z.object({ id: z.string(), version: z.string() })),
   /** Optional on the wire (defaults empty) so pre-model runners still parse; runners advertise it in hello. */
@@ -61,6 +70,10 @@ export const AssignedRun = z.object({
    * Stripped by older runners' zod schemas; a failed naming attempt never fails the run.
    */
   namePrompt: z.string().min(1).optional(),
+  /** Present on manager runs: the runner runs the manager loop (see `ManagerContext`) instead of the steps. */
+  manager: z.object({ taskId: z.string(), context: ManagerContext }).optional(),
+  /** Workspace and push overrides of task child runs (see `RunOverrides`). */
+  overrides: RunOverrides.optional(),
 });
 export type AssignedRun = z.infer<typeof AssignedRun>;
 
@@ -133,6 +146,13 @@ const RpcResult = z.union([
 ]);
 export type RpcResult = z.infer<typeof RpcResult>;
 
+/**
+ * A manager agent's tool call, forwarded by the runner holding manager run `runId`. The server authorizes it
+ * against the run's task; the result is the tool's JSON result (the runner hands it to the agent as text).
+ */
+export const ManagerToolParams = z.object({ runId: z.string(), call: ManagerToolCall });
+export type ManagerToolParams = z.infer<typeof ManagerToolParams>;
+
 // ---- Runner → server -----------------------------------------------------------
 
 export const RunnerRpcCall = z.discriminatedUnion("method", [
@@ -144,6 +164,7 @@ export const RunnerRpcCall = z.discriminatedUnion("method", [
     params: CreatePullRequestParams,
   }),
   z.object({ t: z.literal("rpc.call"), rpcId: z.string(), method: z.literal("github.createComment"), params: CreateCommentParams }),
+  z.object({ t: z.literal("rpc.call"), rpcId: z.string(), method: z.literal("manager.tool"), params: ManagerToolParams }),
 ]);
 export type RunnerRpcCall = z.infer<typeof RunnerRpcCall>;
 
@@ -156,7 +177,16 @@ export const RunnerMessage = z.union([
     capabilities: RunnerCapabilities,
   }),
   z.object({ t: z.literal("job.accepted"), runId: z.string() }),
-  z.object({ t: z.literal("job.rejected"), runId: z.string(), reason: z.string() }),
+  z.object({
+    t: z.literal("job.rejected"),
+    runId: z.string(),
+    reason: z.string(),
+    /**
+     * The run itself is fine, the runner just has no slot yet (e.g. a job the server already ended is still
+     * winding down): the server re-queues it instead of failing it.
+     */
+    retryable: z.boolean().optional(),
+  }),
   z.object({ t: z.literal("job.events"), runId: z.string(), events: z.array(RunEvent) }),
   z.object({ t: z.literal("job.finished"), runId: z.string(), status: RunStatus, error: z.string().optional() }),
   /**
@@ -214,6 +244,11 @@ export const ServerMessage = z.union([
     /** `continue` on a gate with choices: the picked choice id. */
     choice: z.string().optional(),
   }),
+  /**
+   * Unconsumed inbox items (user and event messages) of manager run `runId`'s task. At-least-once: re-sent on
+   * reconnect and on manager start until the runner reports `manager.consumed`; the runner dedupes by `seq`.
+   */
+  z.object({ t: z.literal("manager.inbox"), runId: z.string(), items: z.array(TaskMessage) }),
   z.object({ t: z.literal("pong") }),
 ]);
 export type ServerMessage = z.infer<typeof ServerMessage>;
