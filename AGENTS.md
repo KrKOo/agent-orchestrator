@@ -13,6 +13,9 @@ Glossary:
 - **loop**: step (`kind: "loop"`) that jumps back to an earlier step `to`, repeating the body up to `maxIterations` (stop: fixed count, a body value, or ask).
 - **condition**: step (`kind: "condition"`, "If…") that compares a template path (`ref`) and runs its then-block (through `thenEnd`) or its optional else-block (through `elseEnd`); the other branch is `skipped`.
 - **trust**: `owner` vs untrusted (e.g. fork PRs).
+- **task**: a chat with a long-lived **manager agent** (`tasks`, `task_messages`); the manager plans work and drives **child runs** (`runs.taskId`, `role: "worker"`) but never implements: its workspace is read-only and every write goes through the manager tools.
+- **manager run**: the run behind a task (`runs.role = "manager"`, flow id `builtin:manager`); it idles out after 30 min and is respawned on the next inbox item.
+- **integration branch**: `orch/task-<task id, lowercased>` per task and repo; worker PRs target it, the manager squash-merges them and opens one final PR to the default branch.
 
 ## Architecture & Data Flow
 
@@ -20,12 +23,12 @@ Bun monorepo with four workspaces: `@orch/protocol`, `@orch/server`, `@orch/runn
 
 ```mermaid
 flowchart LR
-  Web[web: React SPA] -- REST /api/* + WS /api/runs/:id/stream --> Server
+  Web[web: React SPA] -- REST /api/* + WS /api/runs/:id/stream, /api/tasks/:id/stream --> Server
   GH[GitHub webhooks] --> Server
-  Server[server: Hono + SQLite] -- WS /runner/ws job.assign / rpc.call --> Runner
-  Runner -- job.* events via outbox, RPC github.* --> Server
+  Server[server: Hono + SQLite] -- WS /runner/ws job.assign / manager.inbox / rpc.call --> Runner
+  Runner -- job.* events via outbox, RPC github.* / manager.tool --> Server
   Runner --> Sandbox[Docker sandbox: omp acp]
-  Sandbox -- MCP submit_output/report_finding --> Runner
+  Sandbox -- MCP submit_output/report_finding, manager tools --> Runner
   Sandbox -- only route out --> Egress[squid egress per run]
   Server -- check runs / comments --> GH
 ```
@@ -33,18 +36,24 @@ flowchart LR
 - **Run lifecycle**:
   1. Flow stored in `flows` (JSON `definition`).
   2. `createRun.ts:insertRun` creates the run and its pending `runSteps`.
-  3. `scheduler.ts` (`kick()` every 5s + on demand) assigns queued runs, oldest first, to the least-loaded eligible runner. Eligibility checks: labels, `maxConcurrentJobs`, `maxConcurrentPerRepo`, trust, and `allowedRoots` containment.
+  3. `scheduler.ts` (`kick()` every 5s + on demand) assigns queued runs, oldest first, to the least-loaded eligible runner. Eligibility checks: labels, `maxConcurrentJobs` (manager runs count against `maxManagers` instead, so a manager never blocks its own children), `maxConcurrentPerRepo`, trust, and `allowedRoots` containment.
   4. The runner streams `job.events`.
   5. `RunService.ingest` (`runs.ts`) persists into `run_events` and projects into `runs`/`run_steps`/`findings`.
   6. `Hub` (`hub.ts`) fans out to browser subscribers.
   - `runs.definition` is the run's own copy of the flow; `PUT /api/runs/:id/models` rewrites its `harness` models even while the run is live. For a live run the holding runner switches first (`job.setModels`); its `run.models` event is projected into `runs.definition` too, so the stored models follow the runner even when the API call timed out.
-- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 6`):
-  - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`).
+- **Wire protocol** (`protocol/src/wire.ts`, `WIRE_PROTOCOL = 7`):
+  - Handshake: `hello` → `welcome {lastAckedSeq}` → runner replays its outbox → `replayed`. The server assigns no jobs before `replayed` (`hub.setReplayed`). On `welcome` the runner reconciles (`JobManager.reconcileHeld`): runs listed that it has no job for (it restarted) are reported as `job.rejected` `runner_restarted`, so they end with a `run.status` event instead of staying live; local jobs the server no longer lists (it ended them) are silenced and aborted, freeing their slot.
   - Events are at-least-once, deduped by `(runId, seq)`, and acked via `job.ack`.
   - The runner re-sends `hello` when capabilities change (skills/commands rescan, gateway models).
 - **RPC**:
-  - runner→server: `github.token`, `github.createPullRequest`, `github.createComment`. Authorization lives in `server/src/ws/runner.ts:handleRunnerRpc`. Comment targets are resolved server-side, never taken from the runner.
+  - runner→server: `github.token`, `github.createPullRequest`, `github.createComment`, `manager.tool`. Authorization lives in `server/src/ws/runner.ts:handleRunnerRpc` (`manager.tool`: `manager-tools.ts`). Comment targets are resolved server-side, never taken from the runner.
   - server→runner: `fs.list` and `job.setModels` (`Hub.rpc`, typed by `ServerRpcMethods`). `DELETE /api/runners/:id` sends `job.cancel` for held runs, deletes the row (revoking the token) and closes the link with 4401 (`Hub.disconnectRunner`).
+- **Tasks** (`protocol/src/task.ts`, `server/src/tasks.ts`, `manager.ts`, `manager-tools.ts`, `runner/src/manager-loop.ts`):
+  - `task_messages` is both the chat log and the manager's inbox: `user`/`event` rows with `seq > tasks.inboxAckedSeq` are unconsumed. `TaskService.deliverInbox` sends all of them as `manager.inbox` to the runner holding the live manager run (or starts one); a new manager gets them right behind its `job.assign` (`Scheduler.managerAssigned`), and they are re-sent on the manager's `running` and on runner `replayed` until the runner reports `manager.consumed` (runner dedupes by seq).
+  - The manager run gets a server-rendered brief (`ManagerContext`: settings, child-run ledger, consumed chat history) in `job.assign`; agent sessions never resume, so that is how a respawned manager rehydrates. Each turn ends with `manager.reply` (projected into the chat) and `manager.consumed`.
+  - `ManagerService` (on `hub.onEvent`, like `CheckReporter`) turns child runs' terminal status, interventions and permission requests (when `runs.interventionHandler = "manager"`) into `event` messages; "Take over" (`PUT /api/runs/:id/handler`) hands them to the user, and handing a run back re-delivers its still-open requests (`ManagerService.onHandlerChanged`).
+  - Manager tools (`MANAGER_TOOL_ARGS`) are MCP tools in the sandbox, forwarded as `manager.tool` and authorized against the task (archived or done tasks take none): own child runs only, task repos only, flows inside task repo paths, `merge_pr`/`resolve_conflicts` only on the task's own PRs (opened by its worker runs, or its final PR) with `orch/*` heads, merges into the integration branch (into the default branch only with `autoMergeFinal`).
+  - Child runs carry `RunOverrides` (`job.assign.overrides`): `workspaceRoot` (the task repo; the runner rejects a realpathed workspace outside it — the server only checks the path text and rejects `..`); the runner fetches remote branches on the host into `refs/orch/remote/<branch>` (never `refs/remotes/*`), starts the worktree from `baseBranch`, pushes to `pushBranch` (`--force-with-lease` only for `orch/*`) and opens PRs into `prBase`. The built-in resolve-conflicts flow (`builtin-flows.ts`) rebases a PR branch this way.
 - **Runner job** (`runner/src/job.ts:runJob`):
   - Re-validates trust runner-side (`rejectReason`), then loops over steps with a `TemplateContext` (`{{inputs.x}}`, `{{steps.<id>.output}}` via `renderTemplate`).
   - Agent steps run `omp acp` over ACP (`acp-session.ts`). Output and findings come back through the per-run MCP server (`mcp-output.ts`, `/mcp/<runId>`, bearer secret).
@@ -59,7 +68,7 @@ flowchart LR
 
 | Path | Purpose |
 |---|---|
-| `packages/protocol/src` | Pure zod schemas shared by everything: `flow.ts` (Step union, Workspace/Sandbox/Trigger), `events.ts` (`RunEvent`, `RUN_STATUSES`), `wire.ts`, `api.ts` (REST DTOs), `template.ts` |
+| `packages/protocol/src` | Pure zod schemas shared by everything: `flow.ts` (Step union, Workspace/Sandbox/Trigger), `events.ts` (`RunEvent`, `RUN_STATUSES`), `wire.ts`, `api.ts` (REST DTOs), `task.ts` (tasks, manager tools, run overrides), `template.ts` |
 | `packages/server/src` | `api/` REST routes, `ws/` runner + browser sockets, `github/` (webhook, credentials, checks, report, sanitize), `auth/` (HMAC cookie session, OAuth), `db/` (drizzle schema + migrator) |
 | `packages/server/drizzle/` | Generated SQL migrations `0000_init.sql`…; applied automatically at startup |
 | `packages/runner/src` | `connection.ts` (WS + backoff + RPC), `outbox.ts` (durable seq'd events), `job.ts`, `acp-session.ts`, `harness/omp.ts`, `sandbox/`, `gateway.ts` (supervises `omp auth-broker`/`auth-gateway`), `mcp-output.ts`, `workspace.ts`, `git.ts`, `fs-rpc.ts`, `library.ts` (skills/commands scan) |

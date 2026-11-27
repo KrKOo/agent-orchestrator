@@ -150,6 +150,7 @@ function harnessDeps(sandboxes: SandboxProvider) {
     mcp,
     sandboxes,
     emit: (draft) => events.push(draft),
+    flushEvents: () => {},
     seedOutbox: () => {},
     send: (msg) => sent.push(msg),
     rpc: () => Promise.reject(new Error("no rpc in tests")),
@@ -188,6 +189,7 @@ beforeAll(() => {
     runnerId: "test-runner",
     labels: [],
     maxConcurrentJobs: 2,
+    maxManagers: 1,
     allowedRoots: [root],
     acceptUntrusted: false,
     dataDir: join(root, "data"),
@@ -310,6 +312,17 @@ describe("runJob", () => {
     expect(ofType(events, "run.name")).toHaveLength(0);
     expect(sent[1]).toEqual({ t: "job.finished", runId: run.runId, status: "succeeded" });
     expect(ofType(events, "step.finished")).toHaveLength(1);
+  });
+
+  test("the run's events are flushed after the last one and before job.finished, which bypasses the outbox", async () => {
+    const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+    const flushes: Array<{ events: number; sent: number }> = [];
+    deps.flushEvents = () => flushes.push({ events: events.length, sent: sent.length });
+    const run = assigned({ steps: [{ kind: "prompt", id: "hello", name: "Hello", prompt: "Say hello" }] });
+    await runJob(run, deps, new AbortController().signal);
+
+    expect(sent.at(-1)).toMatchObject({ t: "job.finished" });
+    expect(flushes.at(-1)).toEqual({ events: events.length, sent: sent.length - 1 });
   });
 
   test("prompt step: output is the concatenated chunks", async () => {
@@ -1945,6 +1958,45 @@ describe("runJob", () => {
       expect(ofType(later, "step.started").map((e) => e.stepId)).toEqual(["fix"]);
       expect(ofType(later, "step.finished").map((e) => [e.stepId, e.payload.status])).toEqual([["fix", "succeeded"]]);
       expect(ofType(later, "run.status").map((e) => e.payload.status)).not.toContain("cancelled");
+    });
+
+    test("a retry cancelled while waiting for the superseded attempt reports its end as a run.status event", async () => {
+      const { deps, events, sent } = harnessDeps(new FakeSandboxProvider());
+      const order: string[] = [];
+      const gateOpen = Promise.withResolvers<void>();
+      const retryDone = Promise.withResolvers<void>();
+      deps.emit = (draft) => {
+        events.push(draft);
+        if (draft.type === "intervention.request") gateOpen.resolve();
+        if (draft.type === "run.status" && draft.payload.status === "cancelled") order.push("cancelled event");
+      };
+      deps.send = (msg) => {
+        sent.push(msg);
+        if (msg.t === "job.finished") {
+          order.push("finished");
+          retryDone.resolve();
+        }
+      };
+      deps.seedOutbox = () => order.push("seed");
+      const manager = new JobManager(deps);
+      const first = assigned({ steps: [{ kind: "intervention", id: "gate", name: "Gate" }] });
+      manager.assign(first);
+      await gateOpen.promise;
+
+      const retry = resumed({ steps: [{ kind: "prompt", id: "fix", name: "Fix", prompt: "x" }] }, "fix");
+      retry.runId = first.runId;
+      manager.assign(retry);
+      // Cancelled before attempt 1 has wound down: the retry never starts.
+      manager.cancel(retry.runId);
+      await retryDone.promise;
+
+      // The superseded attempt stays silent; the retry's end is an outbox event (seeded seq) before job.finished.
+      expect(order).toEqual(["seed", "cancelled event", "finished"]);
+      expect(sent.filter((m) => m.t === "job.finished")).toEqual([{ t: "job.finished", runId: first.runId, status: "cancelled" }]);
+      // A cancel for a run this process has no job for sends nothing: no event-less end on the server.
+      const sentBefore = sent.length;
+      manager.cancel("not-here");
+      expect(sent.length).toBe(sentBefore);
     });
   });
 });

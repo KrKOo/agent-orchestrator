@@ -56,5 +56,16 @@ export function flowRoutes(deps: AppDeps): Hono {
     return deleted.length ? c.body(null, 204) : c.json({ error: "Flow not found" }, 404);
   });
 
+  /** `POST /:id/promote`: a flow the manager created becomes a normal user flow (no task scope). */
+  app.post("/:id/promote", (c) => {
+    const id = c.req.param("id");
+    const row = db.select().from(flows).where(eq(flows.id, id)).get();
+    if (!row) return c.json({ error: "Flow not found" }, 404);
+    if (row.origin === "user") return c.json({ error: "Flow is already a user flow" }, 409);
+    if (row.origin === "builtin") return c.json({ error: "Built-in flows cannot be promoted" }, 409);
+    const updated = db.update(flows).set({ origin: "user", taskId: null }).where(eq(flows.id, id)).returning().get();
+    return c.json(flowRow(updated ?? row));
+  });
+
   return app;
 }

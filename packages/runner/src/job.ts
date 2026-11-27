@@ -30,6 +30,8 @@ import {
   isTruthyValue,
   type LoopStep,
   loopRanges,
+  ORCH_BRANCH_PREFIX,
+  hasBranchOverrides,
   renderTemplate,
   resolveRef,
   TemplateError,
@@ -37,6 +39,8 @@ import {
   type StructuredOutput,
   validateFlow,
   type HarnessModels,
+  type ManagerToolCall,
+  type TaskMessage,
   harnessModelErrors,
   type JobSetModelsResult,
   type ModelEntry,
@@ -51,13 +55,14 @@ import { harnessRoleModels, harnesses } from "./harness/omp";
 import { modelProvider } from "./harness/types";
 import type { Library } from "./library";
 import type { McpOutputServer, McpRunSink } from "./mcp-output";
+import { ManagerInbox, MANAGER_IDLE_MS, runManagerLoop } from "./manager-loop";
 import { HarnessModelState, sameModels } from "./model-switch";
 import { OmpJsonTranslator } from "./omp-json";
 import { TRUNCATED_MARK } from "./outbox";
 import type { Mount, Sandbox, SandboxProcess, SandboxProvider } from "./sandbox/types";
 import { SubagentTail } from "./subagent-tail";
 import { ToolUpdateCompactor } from "./tool-updates";
-import { checkoutDir, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveAllowedPath } from "./workspace";
+import { checkoutDir, forcePushLease, GITHUB_GIT_URL, type PreparedWorkspace, prepareWorkspace, resolveWorkspacePath } from "./workspace";
 
 export interface JobDeps {
   config: RunnerConfig;
@@ -70,6 +75,12 @@ export interface JobDeps {
   seedOutbox(runId: string, seqFrom: number): void;
   /** → outbox.append */
   emit(draft: RunEventDraft): void;
+  /**
+   * → outbox.flush: sends the queued events now. Called right before `job.finished`, which bypasses the outbox:
+   * otherwise the end could reach the server up to a flush interval ahead of the run's last events, and a
+   * manager's final `manager.consumed` arriving after its end would let a new manager redo the acked batch.
+   */
+  flushEvents(): void;
   /** job.accepted / job.rejected / job.finished */
   send(msg: RunnerMessage): void;
   rpc<T>(method: RunnerRpcMethod, params: unknown): Promise<T>;
@@ -77,6 +88,13 @@ export interface JobDeps {
   githubGitUrl?: string;
   /** Budget for the agent-naming call; defaults to `NAME_TIMEOUT_MS` (tests shorten it). */
   nameTimeoutMs?: number;
+  /** Manager runs: idle exit timeout; defaults to `MANAGER_IDLE_MS` (tests shorten it). */
+  managerIdleMs?: number;
+  /**
+   * Manager runs: the run's inbox, shared with `JobManager.deliverInbox` so items delivered before the
+   * loop starts are buffered. Absent (e.g. direct `runJob` calls): the loop starts with an empty one.
+   */
+  inbox?: ManagerInbox;
 }
 
 /** Time a user has to answer a permission or elicitation request. */
@@ -328,8 +346,33 @@ async function rejectReason(run: AssignedRun, deps: JobDeps): Promise<string | n
   } else if (def.workspace.kind === "github_checkout") {
     return "github_checkout requires a pull request run";
   }
+  // Manager runs: owner trust only, a read-only direct mount, and exactly one prompt step — the manager
+  // never implements anything; every change goes through the manager tools. `direct` matters: a worktree
+  // mounts the worktree and the shared `.git` writable whatever `access` says.
+  if (run.manager) {
+    if (run.trust !== "owner") return "Manager runs require owner trust";
+    if (def.workspace.kind !== "local_path" || def.workspace.isolation !== "direct" || def.workspace.access !== "ro") {
+      return "Manager runs need a read-only workspace";
+    }
+    if (def.steps.length !== 1 || def.steps[0]!.kind !== "prompt" || def.steps[0]!.id !== "manager") {
+      return "Manager runs need exactly one prompt step named `manager`";
+    }
+  }
+  // Task child-run overrides widen what the run can push and where it starts: gate them to owner
+  // `local_path` runs (branch fields to worktrees), and force-pushing (which discards remote history) to the
+  // orchestrator's own branches.
+  if (run.overrides) {
+    if (run.trust !== "owner") return "Overrides require an owner run";
+    if (def.workspace.kind !== "local_path") return "Overrides require a local_path workspace";
+    if (hasBranchOverrides(run.overrides) && def.workspace.isolation !== "worktree") return "Overrides require a worktree workspace";
+    if (run.overrides.forcePush && (!run.overrides.pushBranch || !run.overrides.pushBranch.startsWith(ORCH_BRANCH_PREFIX))) {
+      return "forcePush requires an orch/* pushBranch";
+    }
+  }
   try {
-    if (def.workspace.kind === "local_path") await resolveAllowedPath(def.workspace.path, deps.config.allowedRoots);
+    if (def.workspace.kind === "local_path") {
+      await resolveWorkspacePath(def.workspace.path, deps.config.allowedRoots, run.overrides?.workspaceRoot);
+    }
     const lookupAll = () => {
       for (const step of def.steps) {
         if (step.kind === "skill") deps.library.getSkill(step.skill);
@@ -567,6 +610,16 @@ export async function runJob(
       emit({ type: "finding", payload: f }, activeStep.id);
       return null;
     },
+    // Manager runs only: every scoped orchestrator tool call goes to the server as `manager.tool`
+    // RPC, which authorizes it against the run's task. Errors surface as tool errors to the agent.
+    ...(run.manager
+      ? {
+          managerTool: (call: ManagerToolCall) =>
+            deps.rpc<unknown>("manager.tool", { runId, call }).catch((err: unknown) => {
+              throw new Error(errorText(err));
+            }),
+        }
+      : {}),
   };
 
   const onPermission = async (req: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> => {
@@ -949,9 +1002,14 @@ export async function runJob(
     if (step.kind === "git_push") {
       const params: GitHubTokenParams = { runId, repo, access: "write" };
       const { token } = await rejectWhenAborted(deps.rpc<GitHubTokenResult>("github.token", params), abort);
-      await pushBranch(ws.hostPath, ws.repo, ws.branch, token, abort);
+      // Task overrides: push to `pushBranch` instead of the worktree branch; `forcePush` refuses to
+      // overwrite remote work this run has not seen (lease against the push target as this run found it, kept
+      // host-only in the run dir, or an empty expected value when it recorded none = the branch must not exist).
+      const target = run.overrides?.pushBranch ?? ws.branch;
+      const lease = run.overrides?.forcePush ? await forcePushLease(runDir) : undefined;
+      await pushBranch(ws.hostPath, ws.repo, target, token, abort, lease);
       pushed = true;
-      return { status: "succeeded", output: ws.branch };
+      return { status: "succeeded", output: target };
     }
     if (!pushed) throw new Error("github_pr requires an earlier git_push");
     const title = firstLine(plainText(resolveFromRef(step.titleFrom, ctx)));
@@ -959,8 +1017,8 @@ export async function runJob(
     const params: CreatePullRequestParams = {
       runId,
       repo,
-      head: ws.branch,
-      base: step.base ?? null,
+      head: run.overrides?.pushBranch ?? ws.branch,
+      base: run.overrides?.prBase ?? step.base ?? null,
       title,
       body: resolveFromRef(step.bodyFrom, ctx),
       draft: step.draft,
@@ -1157,6 +1215,8 @@ export async function runJob(
         await rejectWhenAborted(started, signal);
       }
 
+      /** The normal step loop; manager runs replace it with the manager loop below. */
+      const runStepLoop = async (): Promise<void> => {
       /** Loop step indexes whose body `[start, end)` contains `idx`, innermost first (nested bodies end earlier). */
       const enclosingLoops = (idx: number): number[] =>
         [...ranges]
@@ -1298,6 +1358,37 @@ export async function runJob(
         iterations.delete(loop.id);
         i = stopIdx + 1;
       }
+      };
+
+      // Manager runs replace the step loop: every turn reuses `agentTurn` (model switches, cancel
+      // handling and transcript streaming keep working), driven by inbox batches instead of steps.
+      if (run.manager) {
+        const managerStep = def.steps[0]!;
+        if (managerStep.kind !== "prompt") throw new Error("Manager run has no `manager` prompt step");
+        currentStepId = managerStep.id;
+        // JobManager.deliverInbox feeds the same inbox: items delivered before the loop starts are
+        // buffered and drained into the first turn. Direct `runJob` calls start with an empty one.
+        const outcome = await runManagerLoop(
+          renderTemplate(managerStep.prompt, ctx),
+          run.manager.context.brief,
+          deps.inbox ?? new ManagerInbox(),
+          {
+            emit: (body) => emit(body as EventBody, managerStep.id),
+            // A failed turn (agent error, not a cancel) fails the run: the server keeps its items unconsumed.
+            turn: async (text) => {
+              const o = await agentTurn(text, managerStep.id, managerStep.id, signal);
+              if (o.status === "failed") throw new Error(o.error ?? "Manager turn failed");
+              return { text: o.output ?? "", cancelled: o.status === "cancelled" };
+            },
+            signal,
+          },
+          deps.managerIdleMs ?? MANAGER_IDLE_MS,
+        );
+        if (outcome.status === "failed") throw new Error(outcome.error);
+        status = outcome.status;
+      } else {
+        await runStepLoop();
+      }
     } catch (err) {
       status = signal.aborted ? "cancelled" : "failed";
       error = signal.aborted ? undefined : errorText(err);
@@ -1308,6 +1399,7 @@ export async function runJob(
       await tail.poll();
     }
     emit({ type: "run.status", payload: { status, ...(error !== undefined ? { error } : {}) } });
+    deps.flushEvents();
     deps.send({ t: "job.finished", runId, status, ...(error !== undefined ? { error } : {}) });
   } finally {
     signal.removeEventListener("abort", onCancel);
@@ -1326,11 +1418,33 @@ export async function runJob(
 }
 
 export class JobManager {
-  /** `superseded`: a retry of the same run took over; the job's emits, messages and rpcs are dropped. */
+  /**
+   * `superseded`: the job's emits, messages and rpcs are dropped: a retry of the same run took over, or the
+   * server already ended the run (`reconcileHeld`).
+   */
   private readonly jobs = new Map<
     string,
-    { abort: AbortController; pending: PendingRequests; models: JobModels; superseded: boolean; done: Promise<void> }
+    {
+      abort: AbortController;
+      pending: PendingRequests;
+      models: JobModels;
+      superseded: boolean;
+      done: Promise<void>;
+      manager: boolean;
+      /** `job.finished`/`job.rejected` was sent: only sandbox cleanup is left, so the job no longer takes a slot. */
+      reported: boolean;
+    }
   >();
+  /** Manager runs' inboxes by runId, alive from `assign` until the job leaves the map. */
+  private readonly inboxes = new Map<string, ManagerInbox>();
+  /** Items delivered before `assign` (assignment/replay race), drained into the job's inbox on assign. */
+  private readonly preInbox = new Map<string, TaskMessage[]>();
+  /**
+   * Runs `assign` refused for lack of a slot. The server sends a manager's inbox right behind its `job.assign`, so
+   * those items would otherwise sit in `preInbox` for good; they are dropped instead (the server re-queues the run
+   * and sends the inbox again behind its next `job.assign`). Cleared on every `welcome` (`reconcileHeld`).
+   */
+  private readonly refused = new Set<string>();
 
   constructor(private readonly deps: JobDeps) {}
 
@@ -1342,8 +1456,18 @@ export class JobManager {
    */
   assign(run: AssignedRun): void {
     const previous = this.jobs.get(run.runId);
-    if (!previous && this.jobs.size >= this.deps.config.maxConcurrentJobs) {
-      this.deps.send({ t: "job.rejected", runId: run.runId, reason: "Runner at capacity" });
+    this.refused.delete(run.runId);
+    // Manager runs count against `maxManagers`, everything else against `maxConcurrentJobs`: a manager
+    // waits on its child runs for its whole life and would deadlock on a shared one-slot cap. Jobs that already
+    // reported their end only clean up: the server counts the slot free (and may respawn a manager into it) as
+    // soon as it sees the terminal status, so they must not count here either.
+    const used = [...this.jobs.values()].filter((j) => !j.reported && j.manager === !!run.manager).length;
+    const cap = run.manager ? this.deps.config.maxManagers : this.deps.config.maxConcurrentJobs;
+    if (!previous && used >= cap) {
+      this.preInbox.delete(run.runId);
+      this.refused.add(run.runId);
+      // Retryable: the server may count a slot free that a job it already ended still holds while winding down.
+      this.deps.send({ t: "job.rejected", runId: run.runId, reason: "Runner at capacity", retryable: true });
       return;
     }
     if (previous) {
@@ -1353,13 +1477,27 @@ export class JobManager {
     const abort = new AbortController();
     const pending = new PendingRequests();
     const models = new JobModels(run.definition.harness);
-    const job = { abort, pending, models, superseded: false, done: Promise.resolve() };
+    // Manager runs: items delivered before the loop starts buffer here, then drain in the first turn.
+    const inbox = run.manager ? new ManagerInbox() : undefined;
+    if (inbox) {
+      this.inboxes.set(run.runId, inbox);
+      const early = this.preInbox.get(run.runId);
+      if (early) {
+        inbox.push(early);
+        this.preInbox.delete(run.runId);
+      }
+    }
+    const job = { abort, pending, models, superseded: false, done: Promise.resolve(), manager: !!run.manager, reported: false };
     const deps: JobDeps = {
       ...this.deps,
+      ...(inbox ? { inbox } : {}),
       emit: (draft) => {
         if (!job.superseded) this.deps.emit(draft);
       },
       send: (msg) => {
+        // Before sending: from the moment the server can see the end, a respawn into this slot must be accepted.
+        // Set even for a superseded job: its slot is the retry's now, and only its cleanup remains.
+        if (msg.t === "job.finished" || msg.t === "job.rejected") job.reported = true;
         if (!job.superseded) this.deps.send(msg);
       },
       rpc: <T>(method: RunnerRpcMethod, params: unknown) =>
@@ -1367,30 +1505,86 @@ export class JobManager {
     };
     const start = async () => {
       await previous?.done;
-      // Cancelled while waiting for the previous attempt: never started, let the server close it.
+      if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
       if (abort.signal.aborted) {
+        // Cancelled while waiting for the previous attempt: never started. Its end still goes through the outbox
+        // like any run's, as a `run.status` event: `job.finished` alone only flips the server's row, and the
+        // task layer, run view and task stream learn about a run's end from its events.
+        deps.emit({ runId: run.runId, ts: Date.now(), type: "run.status", payload: { status: "cancelled" } });
+        deps.flushEvents();
         deps.send({ t: "job.finished", runId: run.runId, status: "cancelled" });
         return;
       }
-      if (run.seqFrom !== undefined) this.deps.seedOutbox(run.runId, run.seqFrom);
       await runJob(run, deps, abort.signal, pending, models);
     };
     job.done = start()
       .catch((err) => console.error(`[job ${run.runId}] crashed: ${errorText(err)}`))
       .finally(() => {
         if (this.jobs.get(run.runId) === job) this.jobs.delete(run.runId);
+        if (this.inboxes.get(run.runId) === inbox) this.inboxes.delete(run.runId);
       });
     this.jobs.set(run.runId, job);
   }
 
   cancel(runId: string): void {
+    this.preInbox.delete(runId);
     const job = this.jobs.get(runId);
     if (job) {
       job.abort.abort();
       return;
     }
-    // Not running here (e.g. runner restarted): let the server close the run.
-    this.deps.send({ t: "job.finished", runId, status: "cancelled" });
+    // No job here: either it already ended (its terminal `run.status` is in the durable outbox) or this process
+    // never had it (restarted; the `welcome` reconcile reports it). A bare `job.finished` would end the run on the
+    // server without any event; the server's cancel grace timeout closes it with one if nothing else does.
+  }
+
+  /**
+   * `welcome`: `heldRunIds` are the runs the server still has on this runner; both directions are reconciled.
+   * - Held here without a job: lost (the runner process restarted: jobs are in-memory, agent sessions never
+   *   resume), and a runner back within `RUNNER_LOST_MS` never trips the server's lost-runner timeout. Each is
+   *   reported as `job.rejected`: unlike `job.finished` (no event, the runner's final events may still be in
+   *   flight), the server ends it with a `run.status` event, which the task layer sees (a lost manager makes room
+   *   for a new one, a lost child is a `run_finished` for its manager). Items buffered for it are dropped.
+   * - A job here the server no longer holds (it ended the run: `runner_lost` after a long disconnect, the cancel
+   *   grace timeout) that has not reported its end: an orphan. It is silenced (its events would land on a finished
+   *   run), aborted, and its slot freed at once, so a replacement (e.g. the task's next manager) is accepted.
+   *   No assignment can be on this connection yet (the server assigns only after `replayed`), so every job here
+   *   predates the server's list.
+   */
+  reconcileHeld(heldRunIds: string[]): void {
+    const held = new Set(heldRunIds);
+    for (const runId of held) {
+      if (this.jobs.has(runId)) continue;
+      this.deps.send({ t: "job.rejected", runId, reason: "runner_restarted" });
+    }
+    // Items buffered for runs that never became a job here are stale: the server sends the inbox again behind
+    // every `job.assign`, and the runs above are ended.
+    for (const runId of this.preInbox.keys()) if (!this.jobs.has(runId)) this.preInbox.delete(runId);
+    this.refused.clear();
+    for (const [runId, job] of this.jobs) {
+      if (held.has(runId) || job.reported) continue;
+      console.warn(`[job ${runId}] the server no longer holds this run; aborting it`);
+      job.superseded = true;
+      job.reported = true;
+      job.abort.abort();
+    }
+  }
+
+  /**
+   * `manager.inbox`: queues items for manager run `runId`. Items arriving before the run is assigned
+   * here (assignment and replay race) are buffered and handed to the loop when it is; items for runs
+   * that are not manager runs are dropped (a retry replays the unacked inbox from the server anyway).
+   */
+  deliverInbox(runId: string, items: TaskMessage[]): void {
+    if (this.refused.has(runId)) return;
+    const live = this.inboxes.get(runId);
+    if (live) {
+      live.push(items);
+      return;
+    }
+    const buffered = this.preInbox.get(runId) ?? [];
+    buffered.push(...items);
+    this.preInbox.set(runId, buffered);
   }
 
   /**

@@ -1,6 +1,6 @@
-import { type HarnessModels, isAgentStep, loopRanges, RETRYABLE_STATUSES, type RunStatus, TERMINAL_STATUSES, type Finding, type RunDetail, type WorkspaceInfo } from "@orch/protocol";
+import { type HarnessModels, isAgentStep, isBuiltinFlowId, loopRanges, RETRYABLE_STATUSES, type RunStatus, TERMINAL_STATUSES, type Finding, type RunDetail, type WorkspaceInfo } from "@orch/protocol";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ellipsis, ListOrdered, PanelRight, RotateCcw, X } from "lucide-react";
+import { Ellipsis, ListOrdered, PanelRight, RotateCcw, UserRound, X } from "lucide-react";
 import { type RefObject, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import { api, errorMessage } from "../api";
@@ -100,6 +100,20 @@ function RunViewInner({ runId }: { runId: string }) {
     },
     onError: (err) => toast(errorMessage(err), { kind: "error" }),
   });
+  // "Take over" (or hand back) a task child run's requests: the row changes, the stream shows it.
+  const takeover = useMutation({
+    mutationFn: (handler: "user" | "manager") => api.setRunHandler(runId, { handler }),
+    onSuccess: () => void detail.refetch(),
+    onError: (err) => toast(errorMessage(err), { kind: "error" }),
+  });
+  /** Title of the task this run belongs to (for the banner); the row's id when the task is gone. */
+  // From `detail` directly: `run` is declared further down, and hooks must run before any early return.
+  const taskId = detail.data?.run.taskId ?? null;
+  const taskTitle = useQuery({
+    queryKey: ["task", taskId ?? ""],
+    queryFn: () => api.getTask(taskId!),
+    enabled: taskId !== null,
+  }).data?.task.title;
 
   // Pick up the final error/timestamps once the stream reports a terminal status.
   useEffect(() => {
@@ -246,7 +260,8 @@ function RunViewInner({ runId }: { runId: string }) {
 
   const runStatus = status ?? run.status;
   const runTerminal = TERMINAL_STATUSES.includes(runStatus);
-  const retryable = RETRYABLE_STATUSES.includes(runStatus);
+  // A task's manager is never retried (the server refuses): the task respawns its manager on the next message.
+  const retryable = RETRYABLE_STATUSES.includes(runStatus) && run.role !== "manager";
   const error = state.error ?? run.error ?? undefined;
   const showError = error !== undefined && error !== dismissedError;
   const detailData = detail.data!;
@@ -353,7 +368,8 @@ function RunViewInner({ runId }: { runId: string }) {
         <div className="run-header-row">
           <StatusChip status={runStatus} />
           <h2 className="run-title">
-            <Link to={`/flows/${run.flowId}`}>{run.flowName}</Link>
+            {/* Built-in flows (a task's manager, resolve-conflicts) have no flow page; the task banner links the task. */}
+            {isBuiltinFlowId(run.flowId) ? run.flowName : <Link to={`/flows/${run.flowId}`}>{run.flowName}</Link>}
           </h2>
           {(() => {
             // The REST row is authoritative (manual names, first-write-wins); live events only fill a gap.
@@ -447,6 +463,44 @@ function RunViewInner({ runId }: { runId: string }) {
           <span className="error-callout-text pre-wrap">{error}</span>
           <button type="button" className="icon-btn" aria-label="Dismiss error" onClick={() => setDismissedError(error!)}>
             <X size={14} aria-hidden />
+          </button>
+        </div>
+      )}
+      {run.taskId && (
+        <div className="task-banner small">
+          Part of task{" "}
+          <Link to={`/tasks/${run.taskId}`}>
+            <strong>{taskTitle ?? run.taskId.slice(0, 10)}</strong>
+          </Link>
+        </div>
+      )}
+      {run.taskId && run.role === "worker" && run.interventionHandler === "manager" && (
+        <div className="task-banner small">
+          <UserRound size={14} aria-hidden />
+          The manager is handling this run's requests; you can still answer below.
+          <button
+            type="button"
+            className="btn small"
+            disabled={takeover.isPending}
+            title="Answer this run's interventions and permissions yourself"
+            onClick={() => takeover.mutate("user")}
+          >
+            Take over
+          </button>
+        </div>
+      )}
+      {run.taskId && run.role === "worker" && run.interventionHandler === "user" && (
+        <div className="task-banner small">
+          <UserRound size={14} aria-hidden />
+          You are handling this run's requests.
+          <button
+            type="button"
+            className="btn small"
+            disabled={takeover.isPending}
+            title="Let the manager answer this run's interventions and permissions again, including the open ones"
+            onClick={() => takeover.mutate("manager")}
+          >
+            Hand back to manager
           </button>
         </div>
       )}

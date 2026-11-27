@@ -1,4 +1,4 @@
-import type { FlowDefinition, RunnerCapabilities } from "@orch/protocol";
+import type { FlowDefinition, ManagerContext, RunnerCapabilities } from "@orch/protocol";
 import { and, asc, eq, inArray, isNotNull, lt, sql } from "drizzle-orm";
 import { posix } from "node:path";
 import { runNamePrompt } from "./createRun";
@@ -27,12 +27,16 @@ export interface RunnerState {
   replayed: boolean;
   /** Runs currently `assigned`/`running` on this runner. */
   running: number;
+  /** Manager runs (`runs.role = "manager"`) of the non-terminal runs above. */
+  managers: number;
 }
 
 export interface SchedulableRun {
   trust: "owner" | "untrusted";
   createdBy: string | null;
   definition: FlowDefinition;
+  /** `runs.role`; a manager run is capped by `maxManagers` instead of `maxConcurrentJobs` (see `isEligible`). */
+  role: "manager" | "worker" | null;
 }
 
 export function isOnline(r: Pick<RunnerState, "connected" | "lastSeenAt">, now: number): boolean {
@@ -49,7 +53,15 @@ export function isUnderRoot(path: string, root: string): boolean {
 export function isEligible(run: SchedulableRun, r: RunnerState, now: number): boolean {
   const caps = r.capabilities;
   if (!caps || !isOnline(r, now) || !r.replayed) return false;
-  if (r.running >= caps.maxConcurrentJobs) return false;
+  // A manager waits on its child runs for its whole life: it does not take a `maxConcurrentJobs` slot
+  // (a one-slot runner would deadlock it against its own children) but counts against `maxManagers`
+  // instead. `running` counts every held run (the runners API reports it), so the worker check strips
+  // the manager runs back out. A missing stored `maxManagers` parses as the default 1.
+  if (run.role === "manager") {
+    if (r.managers >= (caps.maxManagers ?? 1)) return false;
+  } else if (r.running - r.managers >= caps.maxConcurrentJobs) {
+    return false;
+  }
   if (!run.definition.runnerLabels.every((l) => r.labels.includes(l))) return false;
   if (run.trust === "owner" ? r.ownerUserId !== run.createdBy : !caps.acceptUntrusted) return false;
   const ws = run.definition.workspace;
@@ -66,6 +78,17 @@ export class Scheduler {
   private readonly startedAt: number;
   private timer: Timer | null = null;
   private kicking = false;
+
+  /**
+   * Task lookup the manager assignments need (`null` until the tasks service exists): the `ManagerContext`
+   * for `run.taskId`, or null when the task is gone — the run fails instead of starting an orphan manager.
+   */
+  managerContext: ((taskId: string) => ManagerContext | null) | null = null;
+  /**
+   * Called once a manager run's `job.assign` went out: sends the task's unconsumed inbox right behind it (same
+   * ordered link), so the first turn has the items instead of waiting for the server to see `running`.
+   */
+  managerAssigned: ((runId: string) => void) | null = null;
 
   constructor(
     private readonly runService: RunService,
@@ -95,6 +118,15 @@ export class Scheduler {
         .all()
         .map((c) => [c.runnerId!, c.n]),
     );
+    const managers = new Map(
+      db
+        .select({ runnerId: runs.runnerId, n: sql<number>`count(*)` })
+        .from(runs)
+        .where(and(isNotNull(runs.runnerId), eq(runs.role, "manager"), inArray(runs.status, [...ACTIVE_STATUSES])))
+        .groupBy(runs.runnerId)
+        .all()
+        .map((c) => [c.runnerId!, c.n]),
+    );
     return db
       .select()
       .from(runners)
@@ -109,6 +141,7 @@ export class Scheduler {
         connected: hub.isConnected(r.id),
         replayed: hub.isReplayed(r.id),
         running: counts.get(r.id) ?? 0,
+        managers: managers.get(r.id) ?? 0,
       }));
   }
 
@@ -138,7 +171,7 @@ export class Scheduler {
     const { db } = this.runService;
     const byId = new Map(states.map((s) => [s.id, s]));
     const held = db
-      .select({ id: runs.id, runnerId: runs.runnerId })
+      .select({ id: runs.id, runnerId: runs.runnerId, role: runs.role })
       .from(runs)
       .where(and(isNotNull(runs.runnerId), inArray(runs.status, [...ACTIVE_STATUSES])))
       .all();
@@ -147,7 +180,11 @@ export class Scheduler {
       if (!this.isLost(r, now)) continue;
       console.warn(`[scheduler] run ${run.id}: runner ${run.runnerId} lost`);
       this.runService.terminate(run.id, "failed", "runner_lost");
-      if (r) r.running = Math.max(0, r.running - 1);
+      if (r) {
+        r.running = Math.max(0, r.running - 1);
+        // `running` counts every held run; a lost manager also frees its manager slot within this kick.
+        if (run.role === "manager") r.managers = Math.max(0, r.managers - 1);
+      }
     }
     // A retry pinned to the runner holding its worktree cannot run elsewhere; retrying from step 1 unpins it.
     const pinned = db
@@ -177,8 +214,20 @@ export class Scheduler {
     for (const run of queued) {
       const repo = run.github?.repo;
       if (repo !== undefined && (perRepo.get(repo) ?? 0) >= this.opts.maxConcurrentPerRepo) continue;
+      // Only a live task can get a manager run; workers (and plain runs) need no context.
+      const context = run.role === "manager" && run.taskId !== null ? this.managerContext?.(run.taskId) ?? null : null;
+      if (run.role === "manager" && context === null) {
+        // The task vanished (or no task service is wired): a manager without its task cannot run.
+        console.warn(`[scheduler] manager run ${run.id}: task ${String(run.taskId)} not found`);
+        this.runService.terminate(run.id, "failed", "task not found");
+        continue;
+      }
       const target = states
-        .filter((r) => (run.resumeRunnerId === null || r.id === run.resumeRunnerId) && isEligible(run, r, now))
+        .filter(
+          (r) =>
+            (run.resumeRunnerId === null || r.id === run.resumeRunnerId) &&
+            isEligible({ trust: run.trust, createdBy: run.createdBy, definition: run.definition, role: run.role }, r, now),
+        )
         .sort((a, b) => a.running - b.running || a.id.localeCompare(b.id))[0];
       if (!target) continue;
       const claimed = db
@@ -217,6 +266,8 @@ export class Scheduler {
           ...(gh ? { github: { repo: gh.repo, number: gh.number, headSha: gh.headSha, baseSha: gh.baseSha } } : {}),
           ...(prior !== undefined ? { resume: { fromStepIdx: run.resumeFrom!, prior } } : {}),
           ...(prior !== undefined ? { seqFrom: this.runService.maxSeq(run.id) + 1 } : {}),
+          ...(run.role === "manager" && run.taskId !== null && context !== null ? { manager: { taskId: run.taskId, context } } : {}),
+          ...(run.role === "worker" && run.overrides !== null ? { overrides: run.overrides } : {}),
           // Agent naming happens on the runner (it owns the model gateway) before step 1; retried
           // runs re-include it only while the name is still missing — first `run.name` wins.
           ...(run.autoName && run.name === null ? { namePrompt: runNamePrompt(run.definition, run.inputs) } : {}),
@@ -227,9 +278,13 @@ export class Scheduler {
         target.connected = false;
         continue;
       }
+      // `running` counts every held run (as `runnerStates` does); a manager also takes a `managers` slot,
+      // which `isEligible` subtracts back out of the worker check.
       target.running++;
+      if (run.role === "manager") target.managers++;
       if (repo !== undefined) perRepo.set(repo, (perRepo.get(repo) ?? 0) + 1);
       console.log(`[scheduler] run ${run.id} assigned to runner ${target.id}`);
+      if (run.role === "manager") this.managerAssigned?.(run.id);
     }
   }
 }

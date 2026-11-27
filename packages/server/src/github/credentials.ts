@@ -7,8 +7,9 @@ import { GitHubError } from "./api";
  * - `read`/`write`: contents + pull requests (+ issues read), for runners (checkout, push, PR creation).
  * - `report`: checks + pull requests write, for the server's own check-run reporting and pull request comments.
  * - `comment`: issues write, for `github_comment` steps on issues.
+ * - `status`: read-only pull requests, checks and statuses, for PR status reads (`getPullStatus`).
  */
-export type TokenAccess = "read" | "write" | "report" | "comment";
+export type TokenAccess = "read" | "write" | "report" | "comment" | "status";
 
 export interface GitHubCredentials {
   /** True when `tokenFor` can produce a token. */
@@ -41,6 +42,7 @@ const PERMISSIONS: Record<TokenAccess, Record<string, "read" | "write">> = {
   write: { contents: "write", pull_requests: "write", issues: "read" },
   report: { checks: "write", pull_requests: "write" },
   comment: { issues: "write" },
+  status: { pull_requests: "read", checks: "read", statuses: "read" },
 };
 
 /** Tokens are reused until this long before `expires_at`. */

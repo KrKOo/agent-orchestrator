@@ -25,7 +25,12 @@ export async function git(cwd: string, args: string[], opts: GitOptions = {}): P
 
 export async function gitOk(cwd: string, args: string[], opts: GitOptions = {}): Promise<string> {
   const res = await git(cwd, args, opts);
-  if (res.code !== 0) throw new Error(`git ${args[0]} failed: ${res.stderr.trim() || res.stdout.trim() || `exit ${res.code}`}`);
+  if (res.code !== 0) {
+    // Name the subcommand, not a leading `-c <key=value>` config pair.
+    let i = 0;
+    while (args[i] === "-c") i += 2;
+    throw new Error(`git ${args[i] ?? args[0]} failed: ${res.stderr.trim() || res.stdout.trim() || `exit ${res.code}`}`);
+  }
   return res.stdout.trim();
 }
 
@@ -71,17 +76,31 @@ function tokenEnv(token: string): Record<string, string> {
   };
 }
 
-/** Pushes HEAD to `branch` on GitHub, authenticated with `token` (see `tokenEnv`). */
+/** Pushes HEAD to `branch` on GitHub, authenticated with `token` (see `tokenEnv`).
+ * `leaseSha` (or `null` for "ref must not exist") turns the push into `--force-with-lease`, refusing
+ * to overwrite remote work the runner has not seen. `baseUrl` defaults to `https://github.com`
+ * (tests point it at a local `file://` dir, like the PR checkout's `gitUrl`). */
 export async function pushBranch(
   worktree: string,
   repo: { owner: string; name: string },
   branch: string,
   token: string,
   signal?: AbortSignal,
+  leaseSha?: string | null,
+  baseUrl: string = "https://github.com",
 ): Promise<void> {
   await gitOk(
     worktree,
-    ["-c", "credential.helper=", "push", `https://github.com/${repo.owner}/${repo.name}.git`, `HEAD:refs/heads/${branch}`],
+    [
+      "-c",
+      "credential.helper=",
+      "push",
+      // `--force-with-lease=<ref>:<expect>`: expect the remote ref to still be at `leaseSha`
+      // (an empty expect means the remote ref must not exist). Plain `--force` would clobber it.
+      ...(leaseSha !== undefined ? [`--force-with-lease=refs/heads/${branch}:${leaseSha ?? ""}`] : []),
+      `${baseUrl}/${repo.owner}/${repo.name}.git`,
+      `HEAD:refs/heads/${branch}`,
+    ],
     { signal, env: tokenEnv(token) },
   );
 }
@@ -92,4 +111,32 @@ export async function fetchShas(dir: string, url: string, shas: string[], token:
     signal,
     env: tokenEnv(token),
   });
+}
+
+/**
+ * Fetches remote branches `branches` into local refs `refs/orch/remote/<branch>` in the repo at `dir`,
+ * authenticated with `token` (see `tokenEnv`). Deliberately not `+refs/heads/*`: the user's
+ * remote-tracking refs (`refs/remotes/*`) stay untouched, and stale orchestrator refs are overwritten.
+ */
+export async function fetchBranches(dir: string, url: string, branches: string[], token: string, signal?: AbortSignal): Promise<void> {
+  await gitOk(
+    dir,
+    ["-c", "credential.helper=", "fetch", "--quiet", "--no-tags", url, ...branches.map((b) => `+refs/heads/${b}:refs/orch/remote/${b}`)],
+    { signal, env: tokenEnv(token) },
+  );
+}
+
+/**
+ * The sha of `branch` on the remote at `url`, or null when it does not exist; read from the remote itself
+ * (`ls-remote`), never from local refs, which a sandbox mounting the repo's git dir can rewrite.
+ */
+export async function remoteBranchSha(dir: string, url: string, branch: string, token: string, signal?: AbortSignal): Promise<string | null> {
+  const out = await gitOk(dir, ["-c", "credential.helper=", "ls-remote", "--heads", url, `refs/heads/${branch}`], {
+    signal,
+    env: tokenEnv(token),
+  });
+  // The pattern also matches longer refs ending in it (`refs/heads/x/refs/heads/<branch>`): compare the ref exactly.
+  const ref = `refs/heads/${branch}`;
+  const line = out.split("\n").find((l) => l.split("\t")[1] === ref);
+  return line ? line.split("\t")[0]! : null;
 }

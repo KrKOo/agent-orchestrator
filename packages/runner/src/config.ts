@@ -9,6 +9,11 @@ export interface RunnerConfig {
   runnerId: string;
   labels: string[];
   maxConcurrentJobs: number;
+  /**
+   * Manager (task) runs at once; separate from `maxConcurrentJobs`, because a manager waits on its
+   * child runs for its whole life and would deadlock on a one-slot runner if it shared the cap.
+   */
+  maxManagers: number;
   /** Absolute, realpath'd at load; missing roots are dropped with a warning. */
   allowedRoots: string[];
   acceptUntrusted: boolean;
@@ -34,6 +39,7 @@ const RawConfig = z.object({
   runnerId: z.string().min(1),
   labels: z.array(z.string()).default([]),
   maxConcurrentJobs: z.number().int().min(1).default(2),
+  maxManagers: z.number().int().min(0).default(1),
   allowedRoots: z.array(z.string()).default([]),
   acceptUntrusted: z.boolean().default(false),
   dataDir: z.string().default("~/.agent-orchestrator/runner"),
@@ -102,6 +108,7 @@ export async function loadConfig(path?: string): Promise<RunnerConfig> {
     runnerId: raw.runnerId,
     labels: raw.labels,
     maxConcurrentJobs: raw.maxConcurrentJobs,
+    maxManagers: raw.maxManagers,
     allowedRoots,
     acceptUntrusted: raw.acceptUntrusted,
     dataDir,

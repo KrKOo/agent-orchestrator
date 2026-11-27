@@ -932,3 +932,23 @@ export type InterventionAction = z.infer<typeof InterventionAction>;
  * `repeat` jumps back to the start of the loop body, only on gates whose request offers it (`ask` loops).
  */
 export const InterventionAction = z.enum(["message", "continue", "repeat", "cancel"]);
+
+/** Answer to an intervention request: the REST body, and the manager's `respond_intervention` (plus run and request ids). */
+export const InterventionAnswer = z.object({
+  stepId: z.string().min(1),
+  action: InterventionAction,
+  session: z.string().min(1).optional(),
+  text: z.string().optional(),
+  /** `continue` on a gate with choices: the picked choice id. */
+  choice: z.string().min(1).optional(),
+});
+export type InterventionAnswer = z.infer<typeof InterventionAnswer>;
+
+/**
+ * `message` needs a session and non-empty text: the runner refuses anything else and asks again. Every schema built
+ * on `InterventionAnswer` refines with it: `.refine(interventionMessageValid, INTERVENTION_MESSAGE_ISSUE)`.
+ */
+export function interventionMessageValid(answer: InterventionAnswer): boolean {
+  return answer.action !== "message" || (answer.session !== undefined && (answer.text ?? "").trim() !== "");
+}
+export const INTERVENTION_MESSAGE_ISSUE = { message: "message: pick a session and write a message", path: ["text"] };

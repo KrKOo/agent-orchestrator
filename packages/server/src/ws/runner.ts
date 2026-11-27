@@ -10,6 +10,7 @@ import { upgradeWebSocket } from "hono/bun";
 import { createHash } from "node:crypto";
 import { schema } from "../db";
 import type { AppDeps } from "../deps";
+import { dispatchManagerTool, ManagerToolError } from "../manager-tools";
 import { neutralizeMentions } from "../github/sanitize";
 import type { RunnerLink } from "../hub";
 import { isTerminal } from "../runs";
@@ -36,7 +37,11 @@ export function authenticateRunner(deps: Pick<AppDeps, "db">, authorization: str
  * Answers a runner-initiated RPC; only the runner holding the (non-terminal) run may call.
  * - `github.token` `read`: owner runs, or untrusted runs for their own PR repository.
  * - `github.token` `write` and `github.createPullRequest`: owner runs only.
+ * - Task runs (`runs.taskId`): `github.token` and `github.createPullRequest` only for the task's repos. The runner
+ *   derives the repo from the clone's `origin`, so a workspace that is some other clone inside a task repo path
+ *   must not reach outside the task (and around the manager's merge rules).
  * - `github.createComment`: a `github_comment` step of the run; the target issue/PR comes from the run's stored inputs.
+ * - `manager.tool`: a manager run's tool call, authorized and dispatched by `manager-tools.ts`.
  * Everything else gets `forbidden`.
  */
 export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: RunnerRpcCall): Promise<RpcResult> {
@@ -45,19 +50,33 @@ export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: Run
   const run = deps.runs.get(call.params.runId);
   if (!run || run.runnerId !== runnerId || isTerminal(run.status)) return forbidden;
   const gh = run.github;
+  // Null for runs outside any task; a task that is gone leaves no repo allowed.
+  const taskRepos =
+    run.taskId === null ? null : (deps.tasks.get(run.taskId)?.settings.repos.map((r) => r.github.toLowerCase()) ?? []);
+  const repoAllowed = (repo: string) => taskRepos === null || taskRepos.includes(repo.toLowerCase());
   try {
     switch (call.method) {
+      case "manager.tool": {
+        try {
+          const result = await dispatchManagerTool(deps, call.params.runId, call.params.call);
+          return { t: "rpc.result", rpcId, ok: true, result };
+        } catch (err) {
+          if (!(err instanceof ManagerToolError)) throw err;
+          return { t: "rpc.result", rpcId, ok: false, error: err.message };
+        }
+      }
       case "github.token": {
         const { repo, access } = call.params;
         const ownRepo = gh !== null && repo.toLowerCase() === gh.repo.toLowerCase();
         const allowed = run.trust === "owner" || (access === "read" && ownRepo);
-        if (!allowed) return forbidden;
+        if (!allowed || !repoAllowed(repo)) return forbidden;
         const token = await deps.credentials.tokenFor(repo, access, ownRepo ? gh?.installationId : undefined);
         return { t: "rpc.result", rpcId, ok: true, result: { token } };
       }
       case "github.createPullRequest": {
         if (run.trust !== "owner") return forbidden;
         const { repo, head, base, title, body, draft } = call.params;
+        if (!repoAllowed(repo)) return forbidden;
         const token = await deps.credentials.tokenFor(repo, "write");
         const result = await deps.github.createPullRequest(token, { repo, head, base, title, body, draft });
         return { t: "rpc.result", rpcId, ok: true, result };
@@ -68,6 +87,7 @@ export async function handleRunnerRpc(deps: AppDeps, runnerId: string, call: Run
         const def = run.definition.inputs.find((i) => i.key === step.target);
         const target = run.inputs[step.target] as { repo: string; number: number } | null | undefined;
         if (!def || !target) throw new Error(`Input "${step.target}" has no issue or pull request`);
+        if (!repoAllowed(target.repo)) return forbidden;
         const ownRepo = gh !== null && target.repo.toLowerCase() === gh.repo.toLowerCase();
         // PR conversations take pull_requests write (the reporting token); issues need issues write.
         const access = def.type === "github_pull_request" ? "report" : "comment";
@@ -162,6 +182,8 @@ export class RunnerSession {
       case "replayed":
         if (!this.attached) return;
         deps.hub.setReplayed(this.link, true);
+        // Re-send the unacked inbox of every manager run this runner holds (at-least-once delivery).
+        deps.manager.onRunnerReplayed(this.runnerId);
         deps.scheduler.kick();
         return;
       case "ping":
@@ -174,6 +196,18 @@ export class RunnerSession {
       case "job.rejected": {
         if (!this.holds(msg.runId)) return;
         console.warn(`[runner ${this.runnerId}] rejected run ${msg.runId}: ${msg.reason}`);
+        if (msg.retryable) {
+          // No slot on the runner yet (a job the server already ended is still winding down there): back to the
+          // queue, not failed. No kick: the periodic one (or the runner's `job.finished` freeing the slot) retries,
+          // so a busy runner is not asked again in a tight loop.
+          const requeued = deps.db
+            .update(runs)
+            .set({ status: "queued", runnerId: null })
+            .where(and(eq(runs.id, msg.runId), eq(runs.runnerId, this.runnerId), eq(runs.status, "assigned")))
+            .returning({ id: runs.id })
+            .all();
+          if (requeued.length > 0) return;
+        }
         deps.runs.terminate(msg.runId, "failed", msg.reason);
         deps.scheduler.kick();
         return;
@@ -182,10 +216,12 @@ export class RunnerSession {
         const events = msg.events.filter((e) => e.runId === msg.runId);
         if (events.length === 0) return;
         // Events for runs this runner does not hold are acked (so the outbox drains) but not stored.
-        const seq = this.holds(msg.runId)
-          ? deps.runs.ingest(msg.runId, events)
-          : events.reduce((m, e) => Math.max(m, e.seq), 0);
-        this.send({ t: "job.ack", runId: msg.runId, seq });
+        if (!this.holds(msg.runId)) {
+          this.send({ t: "job.ack", runId: msg.runId, seq: events.reduce((m, e) => Math.max(m, e.seq), 0) });
+          return;
+        }
+        deps.manager.ackConsumed(msg.runId, events);
+        this.send({ t: "job.ack", runId: msg.runId, seq: deps.runs.ingest(msg.runId, events) });
         return;
       }
       case "job.finished": {

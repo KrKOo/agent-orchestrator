@@ -572,6 +572,15 @@
   .chip-skipped {
     background: color-mix(in srgb, var(--tone) 14%, transparent);
   }
+  /* Tasks: manager stopped (`needs_input`, warn), archived and done read as muted; active is info. */
+  .chip-needs_input {
+    --tone: var(--warn);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
+  }
+  .chip-active {
+    --tone: var(--info);
+    background: color-mix(in srgb, var(--tone) 14%, transparent);
+  }
   .tag {
     --tone: var(--muted);
     display: inline-block;
@@ -1061,6 +1070,12 @@
     color: var(--muted);
   }
   .cell-sub .cell-flow:hover {
+    color: var(--text);
+  }
+  .cell-sub .cell-task {
+    color: var(--muted);
+  }
+  .cell-sub .cell-task:hover {
     color: var(--text);
   }
   .cell-error {
@@ -2641,5 +2656,237 @@
     gap: 8px;
     align-items: center;
     margin-bottom: 6px;
+  }
+
+  /* Tasks (#34): the list uses the shared list-grid; the chat view reuses run-view's column layout. */
+  .tasks-grid {
+    grid-template-columns: 130px minmax(0, 1fr) minmax(0, 1fr) 120px;
+  }
+  .task-banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--info) 10%, transparent);
+  }
+  .task-view {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+  .task-header {
+    flex: none;
+    padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .task-header .page-header {
+    margin: 0;
+  }
+  .task-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+  }
+  .task-chat {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .task-log {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: var(--space-3) var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    max-width: 980px;
+  }
+  .task-msg {
+    max-width: 80%;
+  }
+  .task-msg-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+  .task-msg-role {
+    text-transform: uppercase;
+    font-size: var(--text-xs);
+    letter-spacing: 0.04em;
+  }
+  .task-msg-manager {
+    align-self: flex-start;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px 12px 12px 2px;
+    padding: 8px 12px;
+  }
+  .task-msg-user {
+    align-self: flex-end;
+    background: var(--user-bubble);
+    border-radius: 12px 12px 2px 12px;
+    padding: 8px 12px;
+    white-space: pre-wrap;
+  }
+  /* An event: its collapsible notice, then the run link beside the summary button (never inside it). */
+  .task-msg-event {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+  .task-msg-event > .collapsible {
+    min-width: 0;
+  }
+  .task-msg-event .collapsible-summary {
+    width: auto;
+    font-size: var(--text-sm);
+    color: var(--muted);
+  }
+  .task-msg-text {
+    white-space: pre-wrap;
+  }
+  .task-msg-manager .task-msg-text {
+    white-space: normal;
+  }
+  .task-msg-manager .markdown > :first-child {
+    margin-top: 0;
+  }
+  .task-msg-manager .markdown > :last-child {
+    margin-bottom: 0;
+  }
+  .task-choices {
+    margin-top: var(--space-2);
+    align-self: flex-start;
+  }
+  .task-working {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+    color: var(--muted);
+  }
+  .task-working .dot {
+    align-self: center;
+  }
+  .task-working-tail {
+    min-width: 0;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+  }
+  .task-working-link {
+    flex: none;
+  }
+  .task-composer {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .task-composer textarea {
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+  }
+  /* Side pane: child runs, settings and actions; a right column ≥1024px, stacked below. */
+  .task-side {
+    flex: none;
+    width: 320px;
+    min-height: 0;
+    overflow: auto;
+    padding: var(--space-3);
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+  }
+  .task-side h4 {
+    margin: 0 0 var(--space-2);
+  }
+  .task-run-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .task-run-list a {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    min-width: 0;
+  }
+  .task-facts {
+    margin: 0;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 2px var(--space-3);
+  }
+  .task-facts dt {
+    color: var(--muted);
+  }
+  .task-facts dd {
+    margin: 0;
+    min-width: 0;
+  }
+  /* New-task form: the modal-less page variant shares the flow editor's field styles. */
+  .task-new {
+    max-width: 720px;
+  }
+  .task-new form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  @media (max-width: 1023px) {
+    .task-body {
+      flex-direction: column;
+      overflow: auto;
+    }
+    .task-side {
+      width: auto;
+      border-left: none;
+      border-top: 1px solid var(--border);
+    }
+  }
+  @media (max-width: 639px) {
+    .tasks-grid.list-head {
+      display: none;
+    }
+    .tasks-grid {
+      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-areas:
+        "status created"
+        "name name"
+        "repos repos";
+      row-gap: 3px;
+    }
+    .tasks-grid .cell-status {
+      grid-area: status;
+    }
+    .tasks-grid .cell-name {
+      grid-area: name;
+    }
+    .tasks-grid .cell-meta {
+      grid-area: repos;
+    }
+    .tasks-grid .cell-created {
+      grid-area: created;
+      justify-self: end;
+    }
+    .task-msg {
+      max-width: 95%;
+    }
   }
 }

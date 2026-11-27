@@ -1,7 +1,10 @@
 // Runs list filter <-> URL query (`/runs?status=a,b&q=…&flowId=…`). Pure, so it is unit-tested.
 import { RUN_STATUSES, type RunStatus, TERMINAL_STATUSES } from "@orch/protocol";
 
-/** Runs waiting for a human: the sidebar badge count and the "Needs you" tab. */
+/**
+ * Runs waiting for a human: the sidebar badge count and the "Needs you" tab. Task child runs whose
+ * requests the manager answers are excluded server-side (`handler=user` filters them out).
+ */
 export const ATTENTION_STATUSES: readonly RunStatus[] = ["awaiting_input", "awaiting_approval"];
 
 export type RunsTab = "all" | "active" | "attention" | "failed" | "succeeded";

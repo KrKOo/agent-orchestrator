@@ -50,6 +50,7 @@ export function caps(over: Partial<RunnerCapabilities> = {}): RunnerCapabilities
   return {
     labels: [],
     maxConcurrentJobs: 2,
+    maxManagers: 1,
     allowedRoots: ["/Users/me/Documents"],
     harnesses: [{ id: "omp", version: "18.10.3" }],
     models: [],
@@ -121,6 +122,37 @@ export function addRun(
   deps.db
     .insert(schema.runSteps)
     .values(definition.steps.map((s, idx) => ({ runId: id, stepId: s.id, idx, status: "pending" as const })))
+    .run();
+  return id;
+}
+
+/** Inserts a task row (defaults for every required column); returns the task id. */
+export function addTask(deps: AppDeps, over: Partial<typeof schema.tasks.$inferInsert> = {}): string {
+  const id = over.id ?? ulid();
+  const now = Date.now();
+  deps.db
+    .insert(schema.tasks)
+    .values({
+      id,
+      title: "Test task",
+      status: "active",
+      createdBy: null,
+      settings: {
+        repos: [{ github: "acme/app", localPath: "/Users/me/Documents/repo" }],
+        interventions: "manager",
+        merge: "auto",
+        autoMergeFinal: false,
+        managerModels: { model: "anthropic/claude-sonnet-4-5" },
+        allowNetworkModes: ["gateway_only", "allowlist"],
+        maxParallelRuns: 3,
+      },
+      integration: {},
+      inboxAckedSeq: 0,
+      managerRunId: null,
+      createdAt: now,
+      updatedAt: now,
+      ...over,
+    })
     .run();
   return id;
 }

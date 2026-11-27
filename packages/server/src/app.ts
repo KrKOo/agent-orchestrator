@@ -7,6 +7,7 @@ import { getCookie } from "hono/cookie";
 import { flowRoutes } from "./api/flows";
 import { runnerRoutes } from "./api/runners";
 import { runRoutes } from "./api/runs";
+import { taskRoutes } from "./api/tasks";
 import { oauthRoutes } from "./auth/github-oauth";
 import { requireSession, sessionUser } from "./auth/session";
 import { DEFAULT_MAX_CONCURRENT_PER_REPO, type ServerConfig } from "./config";
@@ -17,11 +18,15 @@ import { CheckReporter } from "./github/checks";
 import { credentialsFromConfig, type GitHubCredentials } from "./github/credentials";
 import { handleWebhook } from "./github/webhook";
 import { Hub } from "./hub";
+import { ManagerService } from "./manager";
 import { RunService } from "./runs";
 import { Scheduler } from "./scheduler";
+import { managerContext, startManagerRun, TaskService } from "./tasks";
+import { cancelRun } from "./run-ops";
 import { ThemeStore } from "./themes";
 import { registerBrowserWs } from "./ws/browser";
 import { registerRunnerWs } from "./ws/runner";
+import { registerTaskStream } from "./ws/task-stream";
 
 export const DEFAULT_WEB_DIST = join(import.meta.dir, "../../web/dist");
 export const DEFAULT_THEMES_DIR = join(import.meta.dir, "../../web/themes");
@@ -36,30 +41,50 @@ export interface DepsOptions {
 
 /**
  * Wires the default dependency graph; tests override pieces (e.g. an in-memory DB, a fake GitHub).
- * The check reporter is attached to the hub, so GitHub-triggered runs report as soon as events flow.
+ * The check reporter is attached to the hub, so GitHub-triggered runs report as soon as events flow;
+ * the manager service is attached too, so task projections and inbox delivery run on every event.
  */
 export function createDeps(config: ServerConfig, opts: DepsOptions = {}): AppDeps {
   const db = opts.db ?? createDb(join(config.dataDir, "orch.sqlite"));
   const hub = new Hub();
   const runs = new RunService(db, hub);
   const gh = config.github;
-  const deps: Omit<AppDeps, "checks"> = {
-    config,
-    db,
-    hub,
-    runs,
-    scheduler: new Scheduler(runs, Date.now, {
-      maxConcurrentPerRepo: gh?.maxConcurrentPerRepo ?? DEFAULT_MAX_CONCURRENT_PER_REPO,
-    }),
-    credentials: opts.credentials ?? credentialsFromConfig(gh),
-    github: opts.github ?? (gh ? new GitHubApi(fetch, gh.apiBaseUrl, gh.webBaseUrl) : new GitHubApi()),
-    webhooks: gh?.kind === "app" ? new Webhooks({ secret: gh.webhookSecret }) : null,
-    webDist: opts.webDist ?? DEFAULT_WEB_DIST,
-    themes: new ThemeStore(opts.builtinThemesDir ?? DEFAULT_THEMES_DIR, config.ui.themesDir),
+  // The task service starts manager runs through the whole deps object, which does not exist yet at
+  // construction time; the closure reads it lazily on the first call.
+  const deps = {} as AppDeps;
+  const tasks = new TaskService({ db, hub, startManagerRun: (task) => startManagerRun(deps, task) });
+  const manager = new ManagerService(tasks);
+  deps.config = config;
+  deps.db = db;
+  deps.hub = hub;
+  deps.runs = runs;
+  deps.scheduler = new Scheduler(runs, Date.now, {
+    maxConcurrentPerRepo: gh?.maxConcurrentPerRepo ?? DEFAULT_MAX_CONCURRENT_PER_REPO,
+  });
+  deps.credentials = opts.credentials ?? credentialsFromConfig(gh);
+  deps.github = opts.github ?? (gh ? new GitHubApi(fetch, gh.apiBaseUrl, gh.webBaseUrl) : new GitHubApi());
+  deps.webhooks = gh?.kind === "app" ? new Webhooks({ secret: gh.webhookSecret }) : null;
+  deps.webDist = opts.webDist ?? DEFAULT_WEB_DIST;
+  deps.themes = new ThemeStore(opts.builtinThemesDir ?? DEFAULT_THEMES_DIR, config.ui.themesDir);
+  deps.tasks = tasks;
+  deps.manager = manager;
+  // The scheduler resolves each manager run's context at assign time (`ManagerContext` brief).
+  deps.scheduler.managerContext = (taskId) => {
+    const task = deps.tasks.get(taskId);
+    if (!task) return null;
+    return managerContext(db, task);
   };
-  const checks = new CheckReporter(deps);
-  checks.attach();
-  return { ...deps, checks };
+  deps.scheduler.managerAssigned = (runId) => manager.onManagerAssigned(runId);
+  deps.checks = new CheckReporter(deps);
+  deps.checks.attach();
+  manager.attach();
+  tasks.setCancelRun((runId) => {
+    const out = cancelRun(deps, runId);
+    if (!out.ok) {
+      console.warn(`[tasks] cancel of manager run ${runId} failed: ${"error" in out.body ? out.body.error : out.body.errors.join("; ")}`);
+    }
+  });
+  return deps;
 }
 
 function serveWeb(webDist: string, path: string): Response {
@@ -114,10 +139,12 @@ export function createApp(deps: AppDeps): Hono {
     return c.json({ error: err instanceof Error ? err.message : "Internal error" }, 500);
   });
 
-  // WebSocket routes are registered before the REST sub-apps so `/api/runs/:id/stream` is not shadowed;
-  // they authenticate themselves (runner token / session cookie) and close with 4401.
+  // WebSocket routes are registered before the REST sub-apps so `/api/runs/:id/stream` and
+  // `/api/tasks/:id/stream` are not shadowed; they authenticate themselves (runner token / session
+  // cookie) and close with 4401.
   registerBrowserWs(app, deps);
   registerRunnerWs(app, deps);
+  registerTaskStream(app, deps);
 
   app.get("/api/me", (c) => {
     const me: MeResponse = { authMode: deps.config.auth.mode, user: sessionUser(deps, c) };
@@ -139,6 +166,7 @@ export function createApp(deps: AppDeps): Hono {
   app.route("/api/flows", flowRoutes(deps));
   app.route("/api/flows", runs.flowRuns);
   app.route("/api/runs", runs.runs);
+  app.route("/api/tasks", taskRoutes(deps));
   app.route("/api/runners", runners.runners);
   app.route("/api/catalog", runners.catalog);
   app.all("/api/*", (c) => c.json({ error: "Not found" }, 404));

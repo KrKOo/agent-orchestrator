@@ -57,6 +57,13 @@
       "when": 1794942136380,
       "tag": "0007_compact_run_events",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1795519200000,
+      "tag": "0008_tasks",
+      "breakpoints": true
     }
   ]
 }

@@ -5,9 +5,11 @@ import type { GitHubApi } from "./github/api";
 import type { CheckReporter } from "./github/checks";
 import type { GitHubCredentials } from "./github/credentials";
 import type { Hub } from "./hub";
+import type { ManagerService } from "./manager";
 import type { RunService } from "./runs";
 import type { Scheduler } from "./scheduler";
 import type { ThemeStore } from "./themes";
+import type { TaskService } from "./tasks";
 
 /** Everything route and WebSocket handlers need; tests build it around an in-memory DB. */
 export interface AppDeps {
@@ -26,4 +28,8 @@ export interface AppDeps {
   webDist: string;
   /** Built-in and admin (`ui.themesDir`) theme stylesheets. */
   themes: ThemeStore;
+  /** Task chat + manager bookkeeping (issue #34). */
+  tasks: TaskService;
+  /** Task projections and inbox delivery; attached to the hub by `createDeps`. */
+  manager: ManagerService;
 }

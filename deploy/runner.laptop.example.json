@@ -3,5 +3,7 @@
   "token": "<token from: runner-token create --name laptop --owner <your login>>",
   "runnerId": "<runnerId printed by runner-token create>",
   "labels": [],
+  "maxConcurrentJobs": 2,
+  "maxManagers": 1,
   "allowedRoots": ["~/Documents"]
 }

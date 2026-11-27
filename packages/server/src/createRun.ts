@@ -6,6 +6,7 @@ import {
   wrapUntrustedText,
   type FlowDefinition,
   type PullRequestInput,
+  type RunOverrides,
   type RunStatus,
   type Trigger,
 } from "@orch/protocol";
@@ -25,6 +26,13 @@ export interface RunOrigin {
   dedupeKey?: string;
   /** Initial run status; `awaiting_approval` for fork PRs under `require_approval`. */
   status?: RunStatus;
+  /** Task runs only: the owning task, the run's role in it, and the child-run handler/overrides. */
+  taskId?: string;
+  role?: "manager" | "worker";
+  /** Task child runs: who answers interventions and permission requests. */
+  interventionHandler?: "user" | "manager";
+  /** Task child runs: workspace/push overrides sent with `job.assign`. */
+  overrides?: RunOverrides;
 }
 
 /**
@@ -145,6 +153,10 @@ export function insertRun(
         createdAt: Date.now(),
         name: name.name ?? null,
         autoName: name.autoName ?? false,
+        ...(origin.taskId !== undefined ? { taskId: origin.taskId } : {}),
+        ...(origin.role !== undefined ? { role: origin.role } : {}),
+        ...(origin.interventionHandler !== undefined ? { interventionHandler: origin.interventionHandler } : {}),
+        ...(origin.overrides !== undefined ? { overrides: origin.overrides } : {}),
       })
       .onConflictDoNothing()
       .returning({ id: runs.id })

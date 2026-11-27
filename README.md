@@ -158,6 +158,38 @@ webhook events and manual starts alike (default `require_approval`; approve them
 start). Flows with a manual trigger have no policy. With `postChecks` (default `true`), runs of PR-triggered flows — webhook
 or manual — publish a check run on the PR head with progress and finding annotations.
 
+## Tasks (manager agent)
+
+The **Tasks** page is a chat with a long-lived **manager agent**. Describe what you want; the manager plans it, creates
+GitHub issues, starts child runs of your flows (or flows it creates for the task), answers their interventions, merges
+their pull requests and finally opens one pull request for you to review. It never implements anything itself: it runs in
+the normal sandbox with the first task repository mounted **read-only**, has no git/shell steps, and every change goes
+through a fixed set of manager tools the server authorizes against the task (its own child runs, the task's repositories,
+flows whose workspace lies inside a task repository).
+
+Task settings (New task form, or `PATCH /api/tasks/:id`):
+
+- `repos`: `{github: "owner/name", localPath}` pairs; `localPath` is the clone on your runner (under its `allowedRoots`).
+- `interventions`: who answers child runs' interventions and permission requests by default, `manager` or `user`. A run
+  the manager handles shows "The manager is handling this run's requests" with a **Take over** button; the "Needs you"
+  count only includes runs you handle.
+- `merge`: `auto` (default: code runs use the integration branch unless the manager picks the default branch for a
+  single-change task), `integration`, or `direct` (worker PRs go straight to the default branch).
+- `autoMergeFinal` (default off): let the manager merge into the default branch. Off, you merge the final PR.
+- `managerModels`, `allowNetworkModes` (network modes of flows the manager creates), `maxParallelRuns` (default 3).
+
+**Merging.** Each task gets an integration branch `orch/task-<id>` per repository. Code runs (writable worktree flows)
+start from it and open their PRs into it (per-run overrides; flow definitions stay unchanged). The manager squash-merges
+those PRs one at a time; a conflicting PR goes to the built-in **resolve-conflicts** run, which rebases the PR branch onto
+its base, resolves the conflicts, runs the checks and pushes with `--force-with-lease` (only `orch/*` branches are ever
+force-pushed or merged). Finally the manager opens one PR from the integration branch to the default branch with a
+`Closes #n` line per issue — merges into a non-default branch close no issues.
+
+**Lifecycle.** The manager is a run of its own (`builtin:manager`); it stops after 30 minutes without messages and is
+restarted on the next one with a summary of the task, its child runs and the chat so far. If it fails, the task shows
+"needs input" and your next message restarts it. Manager runs count against the runner's `maxManagers` (default 1), not
+`maxConcurrentJobs`, so a one-slot runner can still run the manager's children.
+
 ## Loops
 
 A flow is a flat list of steps; a **`loop` step** ("Repeat from…") ends a loop body that starts at an earlier step `to`.
